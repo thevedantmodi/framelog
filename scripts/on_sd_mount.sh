@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BACKUP_PATH="${BACKUP_PATH:-/Volumes/BackupDrive}"
+FRAMELOG_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+notify() {
+    osascript -e "display notification \"$1\" with title \"Framelog\""
+}
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*"
+}
+
+# Find SD card: removable volume with DCIM folder
+SD_PATH=""
+for vol in /Volumes/*/; do
+    if diskutil info "$vol" 2>/dev/null | grep -q "Removable Media:.*Removable"; then
+        if [ -d "${vol}DCIM" ]; then
+            SD_PATH="$vol"
+            break
+        fi
+    fi
+done
+
+if [ -z "$SD_PATH" ]; then
+    log "No SD card found"
+    exit 0
+fi
+
+log "SD card: $SD_PATH"
+
+# Check backup drive
+if [ ! -d "$BACKUP_PATH" ]; then
+    notify "Backup drive not mounted — connect it and re-insert SD card"
+    log "Backup drive not found at $BACKUP_PATH"
+    exit 1
+fi
+
+# Sync SD → backup in background while ingest runs
+rclone sync "${SD_PATH}DCIM/" "${BACKUP_PATH}/Photos/raw_sd/" --progress &
+RCLONE_PID=$!
+
+# Run ingest
+cd "$FRAMELOG_DIR"
+uv run python ingest.py
+
+# Wait for rclone
+wait $RCLONE_PID
+
+notify "Import complete — SD card ready to eject"
+log "Done"
