@@ -31,22 +31,26 @@ fi
 log "SD card: $SD_PATH"
 
 # Check backup drive
-if [ ! -d "$BACKUP_PATH" ]; then
-    notify "Backup drive not mounted — connect it and re-insert SD card"
-    log "Backup drive not found at $BACKUP_PATH"
-    exit 1
-fi
+# if [ ! -d "$BACKUP_PATH" ]; then
+#     notify "Backup drive not mounted — connect it and re-insert SD card"
+#     log "Backup drive not found at $BACKUP_PATH"
+#     exit 1
+# fi
 
 # Sync SD → backup in background while ingest runs
-rclone sync "${SD_PATH}DCIM/" "${BACKUP_PATH}/Photos/raw_sd/" --progress &
-RCLONE_PID=$!
+# rclone sync "${SD_PATH}DCIM/" "${BACKUP_PATH}/Photos/raw_sd/" --progress &
+# RCLONE_PID=$!
+
+# Copy SD card photos to inbox
+log "Copying from ${SD_PATH}DCIM/ to inbox"
+cp -rn "${SD_PATH}DCIM/"* ~/Photos/inbox/ 2>/dev/null || true
 
 # Run ingest
 cd "$FRAMELOG_DIR"
-uv run python ingest.py
+/Users/vedantmodi/.local/bin/uv run python ingest.py
 
 # Wait for rclone
-wait $RCLONE_PID
+# wait $RCLONE_PID
 
 notify "Import complete — SD card ready to eject"
 log "Done"

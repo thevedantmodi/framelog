@@ -14,7 +14,8 @@ from git import git_commit, git_push
 logging.basicConfig(
     filename=Path("~/Photos/framelog.log").expanduser(),
     level=logging.INFO,
-    format="%(asctime)s %(message)s",
+    format="%(asctime)s [WATCHER] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 
 LIGHTROOM_PROCESS = "Adobe Lightroom Classic"
@@ -43,7 +44,7 @@ class XMPHandler(FileSystemEventHandler):
         """Accumulate changed XMP paths and reset the debounce timer on each event."""
         if event.is_directory:
             return
-        if not event.src_path.endswith(".xmp"):
+        if not any(event.src_path.lower().endswith(ext) for ext in (".xmp", ".jpg", ".jpeg", ".heic")):
             return
         with self._lock:
             self._changed.add(event.src_path)

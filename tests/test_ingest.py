@@ -91,7 +91,7 @@ def test_iphone_source_device(dirs, monkeypatch):
     import sqlite3
     with sqlite3.connect(dirs["db"]) as conn:
         row = conn.execute("SELECT source_device FROM photos").fetchone()
-    assert row[0] == "iPhone"
+    assert row[0] == "iPhone 15 Pro"
 
 
 def test_run_ingest_skips_unsupported(dirs, monkeypatch):

@@ -2,7 +2,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-from config import DB_PATH, INBOX, ORIGINALS, SUPPORTED_EXTENSIONS
+from config import DB_PATH, INBOX, ORIGINALS, SUPPORTED_EXTENSIONS, log
 from db import hash_exists, init_db, insert_photo
 from exif import read_exif
 from git import git_commit, git_push
@@ -23,7 +23,7 @@ def import_file(path: Path, batch_id: str, db_path: Path = DB_PATH) -> str:
     try:
         exif = read_exif(path)
         camera_model = exif["camera_model"]
-        source_device = "iPhone" if "iphone" in (camera_model or "").lower() else "Fuji"
+        source_device = camera_model or "unknown"
 
         capture_date = exif["capture_date"]
         dt = datetime.strptime(capture_date, "%Y:%m:%d %H:%M:%S")
@@ -55,7 +55,7 @@ def import_file(path: Path, batch_id: str, db_path: Path = DB_PATH) -> str:
         return "imported"
 
     except Exception as exc:
-        print(f"  FAILED {path.name}: {exc}")
+        log("INGEST", f"FAILED {path.name}: {exc}")
         return "failed"
 
 
@@ -78,7 +78,7 @@ def run_ingest(inbox: Path = INBOX, db_path: Path = DB_PATH) -> dict:
         else:
             failed += 1
 
-    print(f"Done: {imported} imported, {skipped} skipped, {failed} failed")
+    log("INGEST", f"Done: {imported} imported, {skipped} skipped, {failed} failed")
     msg = f"ingest: {batch_id[:10]} ({imported} photos)"
     if git_commit(msg):
         git_push()

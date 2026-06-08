@@ -11,7 +11,7 @@ def organize_file(path: Path) -> str:
     try:
         exif = read_exif(path)
         dt = datetime.strptime(exif["capture_date"], "%Y:%m:%d %H:%M:%S")
-        dest_dir = path.parent / f"{dt.year:04d}" / f"{dt.month:02d}"
+        dest_dir = PROCESSED / f"{dt.year:04d}" / f"{dt.month:02d}"
         dest = dest_dir / path.name
         if dest.exists():
             return "skipped"
