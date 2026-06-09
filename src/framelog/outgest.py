@@ -2,8 +2,8 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-from config import PROCESSED, SUPPORTED_EXTENSIONS
-from exif import read_exif
+from framelog.config import PROCESSED, SUPPORTED_EXTENSIONS
+from framelog.exif import read_exif
 
 
 def organize_file(path: Path) -> str:

@@ -2,7 +2,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from git import git_commit, git_push
+from framelog.git import git_commit, git_push
 
 
 def _run(stdout="", returncode=0):

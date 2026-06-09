@@ -1,7 +1,26 @@
 import json
+import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
+
+_EXIFTOOL_CANDIDATES = [
+    "/opt/homebrew/bin/exiftool",   # Homebrew Apple Silicon
+    "/usr/local/bin/exiftool",      # Homebrew Intel
+    "/usr/bin/exiftool",            # system
+]
+
+
+def _find_exiftool() -> str:
+    for candidate in _EXIFTOOL_CANDIDATES:
+        if Path(candidate).exists():
+            return candidate
+    found = shutil.which("exiftool")
+    if found:
+        return found
+    raise RuntimeError(
+        "exiftool not found. Install it with: brew install exiftool"
+    )
 
 
 def read_exif(path: Path) -> dict[str, str | float | None]:
@@ -11,7 +30,7 @@ def read_exif(path: Path) -> dict[str, str | float | None]:
     Falls back to file mtime if DateTimeOriginal is absent.
     """
     result = subprocess.run(
-        ["/opt/homebrew/bin/exiftool", "-json", str(path)],
+        [_find_exiftool(), "-json", str(path)],
         capture_output=True, text=True, check=False,
     )
     if result.returncode != 0:

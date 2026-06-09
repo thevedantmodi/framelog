@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from db import hash_exists, init_db, insert_photo, update_status
+from framelog.db import hash_exists, init_db, insert_photo, update_status
 
 _RECORD = {
     "hash": "abc123",

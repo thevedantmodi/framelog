@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from watcher import XMPHandler, _is_lightroom_running, _on_ac_power
+from framelog.menubar import XMPHandler, _is_lightroom_running, _on_ac_power
 
 
 def test_is_lightroom_running_true():
@@ -40,9 +40,9 @@ def test_xmp_handler_debounce(tmp_path):
     event.is_directory = False
     event.src_path = str(tmp_path / "photo.xmp")
 
-    with patch("watcher.git_commit", return_value=True) as mock_commit, \
-         patch("watcher.git_push") as mock_push, \
-         patch("watcher._on_ac_power", return_value=False):
+    with patch("framelog.menubar.git_commit", return_value=True) as mock_commit, \
+         patch("framelog.menubar.git_push") as mock_push, \
+         patch("framelog.menubar._on_ac_power", return_value=False):
         handler.on_modified(event)
         handler.on_modified(event)  # second event resets timer
         # flush immediately instead of waiting for debounce
@@ -78,9 +78,9 @@ def test_flush_pushes_on_ac(tmp_path):
     handler = XMPHandler()
     handler._changed.add(str(tmp_path / "photo.xmp"))
 
-    with patch("watcher.git_commit", return_value=True), \
-         patch("watcher.git_push") as mock_push, \
-         patch("watcher._on_ac_power", return_value=True):
+    with patch("framelog.menubar.git_commit", return_value=True), \
+         patch("framelog.menubar.git_push") as mock_push, \
+         patch("framelog.menubar._on_ac_power", return_value=True):
         handler.flush()
 
     mock_push.assert_called_once()
@@ -90,9 +90,9 @@ def test_flush_no_push_on_battery(tmp_path):
     handler = XMPHandler()
     handler._changed.add(str(tmp_path / "photo.xmp"))
 
-    with patch("watcher.git_commit", return_value=True), \
-         patch("watcher.git_push") as mock_push, \
-         patch("watcher._on_ac_power", return_value=False):
+    with patch("framelog.menubar.git_commit", return_value=True), \
+         patch("framelog.menubar.git_push") as mock_push, \
+         patch("framelog.menubar._on_ac_power", return_value=False):
         handler.flush()
 
     mock_push.assert_not_called()

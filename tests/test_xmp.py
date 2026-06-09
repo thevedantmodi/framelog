@@ -1,7 +1,7 @@
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from xmp import write_xmp
+from framelog.xmp import write_xmp
 
 _RDF = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}"
 _DC  = "{http://purl.org/dc/elements/1.1/}"

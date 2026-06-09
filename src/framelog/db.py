@@ -1,7 +1,7 @@
 import sqlite3
 from pathlib import Path
 
-from config import DB_PATH
+from framelog.config import DB_PATH
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS photos (

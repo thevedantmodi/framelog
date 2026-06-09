@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from exif import read_exif
+from framelog.exif import read_exif
 
 
 def _mock_result(data: dict, returncode: int = 0, stderr: str = "") -> MagicMock:

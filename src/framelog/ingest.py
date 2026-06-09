@@ -2,12 +2,12 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-from config import DB_PATH, INBOX, ORIGINALS, SUPPORTED_EXTENSIONS, log
-from db import hash_exists, init_db, insert_photo
-from exif import read_exif
-from git import git_commit, git_push
-from hasher import hash_file
-from xmp import write_xmp
+from framelog.config import DB_PATH, INBOX, ORIGINALS, SUPPORTED_EXTENSIONS, log
+from framelog.db import hash_exists, init_db, insert_photo
+from framelog.exif import read_exif
+from framelog.git import git_commit, git_push
+from framelog.hasher import hash_file
+from framelog.xmp import write_xmp
 
 
 def import_file(path: Path, batch_id: str, db_path: Path = DB_PATH) -> str:

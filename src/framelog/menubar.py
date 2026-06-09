@@ -10,10 +10,11 @@ import rumps
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-from config import DB_PATH, DEBOUNCE_SECONDS, ORIGINALS, PROCESSED, SUPPORTED_EXTENSIONS
-from git import git_commit, git_push
-from ingest import run_ingest
-from outgest import run_outgest
+from framelog.config import DB_PATH, DEBOUNCE_SECONDS, ORIGINALS, PROCESSED, SUPPORTED_EXTENSIONS
+from framelog.firstrun import run_setup, setup_needed
+from framelog.git import git_commit, git_push
+from framelog.ingest import run_ingest
+from framelog.outgest import run_outgest
 
 LOG_PATH = Path("~/Photos/framelog.log").expanduser()
 INGEST_TRIGGER = Path("~/Photos/.ingest_trigger").expanduser()
@@ -24,13 +25,7 @@ LIGHTROOM_PROCESS = "Adobe Lightroom Classic"
 
 
 def _notify(title: str, message: str) -> None:
-    subprocess.run(
-        [
-            "osascript",
-            "-e",
-            f'display notification "{message}" with title "{title}"',
-        ]
-    )
+    rumps.notification(title, "", message)
 
 
 def _photo_count() -> int:
@@ -198,6 +193,8 @@ class FramelogApp(rumps.App):
         self._ingest_running = False
         self._build_menu()
         self._start_background_threads()
+        if setup_needed():
+            threading.Thread(target=self._first_run_setup, daemon=True).start()
 
     def _build_menu(self):
         self.menu = [
@@ -208,9 +205,17 @@ class FramelogApp(rumps.App):
             None,
             rumps.MenuItem("Open Log File", callback=self.open_log),
             None,
+            rumps.MenuItem("Run Setup", callback=self.run_setup),
             rumps.MenuItem("Quit Framelog", callback=rumps.quit_application),
         ]
         self._refresh_status()
+
+    def _first_run_setup(self) -> None:
+        try:
+            run_setup()
+            _notify("Framelog", "Setup complete — ready to import photos.")
+        except Exception as exc:
+            _notify("Framelog — Setup failed", str(exc))
 
     def _start_background_threads(self):
         for target in (_run_xmp_watcher, _run_outgest_watcher):
@@ -269,6 +274,9 @@ class FramelogApp(rumps.App):
 
     def open_log(self, _):
         subprocess.run(["open", str(LOG_PATH)])
+
+    def run_setup(self, _):
+        threading.Thread(target=self._first_run_setup, daemon=True).start()
 
 
 if __name__ == "__main__":

@@ -5,8 +5,18 @@ INBOX = Path("~/Photos/inbox").expanduser()
 ORIGINALS = Path("~/Photos/originals").expanduser()
 PROCESSED = Path("~/Photos/processed").expanduser()
 DB_PATH = Path("~/Photos/catalog.db").expanduser()
-SUPPORTED_EXTENSIONS = {".raf", ".cr3", ".dng", ".heic", ".jpg", ".jpeg", ".mp4", ".mov"}
+SUPPORTED_EXTENSIONS = {
+    ".raf",
+    ".cr3",
+    ".dng",
+    ".heic",
+    ".jpg",
+    ".jpeg",
+    ".mp4",
+    ".mov",
+}
 DEBOUNCE_SECONDS = 10
+LOG_FILE = Path("~/Photos/framelog.log").expanduser()
 
 
 def log(prefix: str, msg: str) -> None:

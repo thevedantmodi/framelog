@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from hasher import hash_file
+from framelog.hasher import hash_file
 
 
 def _sha256(data: bytes) -> str:

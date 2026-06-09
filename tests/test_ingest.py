@@ -4,8 +4,8 @@ from unittest.mock import patch
 
 import pytest
 
-from db import init_db
-from ingest import import_file, run_ingest
+from framelog.db import init_db
+from framelog.ingest import import_file, run_ingest
 
 _EXIF = {
     "capture_date": "2026:05:28 12:00:00",
@@ -40,9 +40,9 @@ def _make_photo(inbox: Path, name: str = "DSF0001.RAF") -> Path:
 
 
 def test_import_copies_to_dest(dirs, monkeypatch):
-    monkeypatch.setattr("ingest.ORIGINALS", dirs["originals"])
+    monkeypatch.setattr("framelog.ingest.ORIGINALS", dirs["originals"])
     photo = _make_photo(dirs["inbox"])
-    with patch("ingest.read_exif", return_value=_EXIF):
+    with patch("framelog.ingest.read_exif", return_value=_EXIF):
         result = import_file(photo, "batch-1", db_path=dirs["db"])
     assert result == "imported"
     matches = list(dirs["originals"].rglob("*.raf"))
@@ -53,47 +53,47 @@ def test_import_copies_to_dest(dirs, monkeypatch):
 
 
 def test_import_deletes_source(dirs, monkeypatch):
-    monkeypatch.setattr("ingest.ORIGINALS", dirs["originals"])
+    monkeypatch.setattr("framelog.ingest.ORIGINALS", dirs["originals"])
     photo = _make_photo(dirs["inbox"])
-    with patch("ingest.read_exif", return_value=_EXIF):
+    with patch("framelog.ingest.read_exif", return_value=_EXIF):
         import_file(photo, "batch-1", db_path=dirs["db"])
     assert not photo.exists()
 
 
 def test_import_skips_duplicate(dirs, monkeypatch):
-    monkeypatch.setattr("ingest.ORIGINALS", dirs["originals"])
+    monkeypatch.setattr("framelog.ingest.ORIGINALS", dirs["originals"])
     photo = _make_photo(dirs["inbox"])
-    with patch("ingest.read_exif", return_value=_EXIF):
+    with patch("framelog.ingest.read_exif", return_value=_EXIF):
         import_file(photo, "batch-1", db_path=dirs["db"])
     # re-create source with same content (same hash)
     photo2 = _make_photo(dirs["inbox"], "DSF0002.RAF")
     photo2.write_bytes(b"fake raw data")
-    with patch("ingest.read_exif", return_value=_EXIF):
+    with patch("framelog.ingest.read_exif", return_value=_EXIF):
         result = import_file(photo2, "batch-1", db_path=dirs["db"])
     assert result == "skipped"
 
 
 def test_import_fails_gracefully(dirs, monkeypatch):
-    monkeypatch.setattr("ingest.ORIGINALS", dirs["originals"])
+    monkeypatch.setattr("framelog.ingest.ORIGINALS", dirs["originals"])
     photo = _make_photo(dirs["inbox"])
-    with patch("ingest.read_exif", side_effect=RuntimeError("exiftool failed")):
+    with patch("framelog.ingest.read_exif", side_effect=RuntimeError("exiftool failed")):
         result = import_file(photo, "batch-1", db_path=dirs["db"])
     assert result == "failed"
     assert photo.exists()  # source untouched
 
     photo.write_bytes(b"fake heic data")
-    with patch("ingest.read_exif", return_value=_EXIF_IPHONE):
+    with patch("framelog.ingest.read_exif", return_value=_EXIF_IPHONE):
         import_file(photo, "batch-1", db_path=dirs["db"])
 
 
 def test_run_ingest_skips_unsupported(dirs, monkeypatch):
-    monkeypatch.setattr("ingest.ORIGINALS", dirs["originals"])
-    monkeypatch.setattr("ingest.INBOX", dirs["inbox"])
+    monkeypatch.setattr("framelog.ingest.ORIGINALS", dirs["originals"])
+    monkeypatch.setattr("framelog.ingest.INBOX", dirs["inbox"])
     (dirs["inbox"] / "notes.txt").write_text("not a photo")
     _make_photo(dirs["inbox"])
     with (
-        patch("ingest.read_exif", return_value=_EXIF),
-        patch("ingest.git_commit", return_value=False),
+        patch("framelog.ingest.read_exif", return_value=_EXIF),
+        patch("framelog.ingest.git_commit", return_value=False),
     ):
         counts = run_ingest(inbox=dirs["inbox"], db_path=dirs["db"])
     assert counts["imported"] == 1
@@ -101,14 +101,14 @@ def test_run_ingest_skips_unsupported(dirs, monkeypatch):
 
 
 def test_run_ingest_counts(dirs, monkeypatch):
-    monkeypatch.setattr("ingest.ORIGINALS", dirs["originals"])
+    monkeypatch.setattr("framelog.ingest.ORIGINALS", dirs["originals"])
     for i in range(3):
         _make_photo(dirs["inbox"], f"DSF{i:04d}.RAF").write_bytes(
             f"unique {i}".encode()
         )
     with (
-        patch("ingest.read_exif", return_value=_EXIF),
-        patch("ingest.git_commit", return_value=False),
+        patch("framelog.ingest.read_exif", return_value=_EXIF),
+        patch("framelog.ingest.git_commit", return_value=False),
     ):
         counts = run_ingest(inbox=dirs["inbox"], db_path=dirs["db"])
     assert counts["imported"] == 3
