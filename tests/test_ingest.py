@@ -81,17 +81,9 @@ def test_import_fails_gracefully(dirs, monkeypatch):
     assert result == "failed"
     assert photo.exists()  # source untouched
 
-
-def test_iphone_source_device(dirs, monkeypatch):
-    monkeypatch.setattr("ingest.ORIGINALS", dirs["originals"])
-    photo = _make_photo(dirs["inbox"], "IMG_0001.HEIC")
     photo.write_bytes(b"fake heic data")
     with patch("ingest.read_exif", return_value=_EXIF_IPHONE):
         import_file(photo, "batch-1", db_path=dirs["db"])
-    import sqlite3
-    with sqlite3.connect(dirs["db"]) as conn:
-        row = conn.execute("SELECT source_device FROM photos").fetchone()
-    assert row[0] == "iPhone 15 Pro"
 
 
 def test_run_ingest_skips_unsupported(dirs, monkeypatch):
@@ -99,7 +91,10 @@ def test_run_ingest_skips_unsupported(dirs, monkeypatch):
     monkeypatch.setattr("ingest.INBOX", dirs["inbox"])
     (dirs["inbox"] / "notes.txt").write_text("not a photo")
     _make_photo(dirs["inbox"])
-    with patch("ingest.read_exif", return_value=_EXIF), patch("ingest.git_commit", return_value=False):
+    with (
+        patch("ingest.read_exif", return_value=_EXIF),
+        patch("ingest.git_commit", return_value=False),
+    ):
         counts = run_ingest(inbox=dirs["inbox"], db_path=dirs["db"])
     assert counts["imported"] == 1
     assert counts["failed"] == 0
@@ -108,8 +103,13 @@ def test_run_ingest_skips_unsupported(dirs, monkeypatch):
 def test_run_ingest_counts(dirs, monkeypatch):
     monkeypatch.setattr("ingest.ORIGINALS", dirs["originals"])
     for i in range(3):
-        _make_photo(dirs["inbox"], f"DSF{i:04d}.RAF").write_bytes(f"unique {i}".encode())
-    with patch("ingest.read_exif", return_value=_EXIF), patch("ingest.git_commit", return_value=False):
+        _make_photo(dirs["inbox"], f"DSF{i:04d}.RAF").write_bytes(
+            f"unique {i}".encode()
+        )
+    with (
+        patch("ingest.read_exif", return_value=_EXIF),
+        patch("ingest.git_commit", return_value=False),
+    ):
         counts = run_ingest(inbox=dirs["inbox"], db_path=dirs["db"])
     assert counts["imported"] == 3
     assert counts["skipped"] == 0

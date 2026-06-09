@@ -10,7 +10,6 @@ _RECORD = {
     "original_filename": "DSF0001.RAF",
     "imported_path": "/Photos/originals/2026/05/28/20260528_120000_abc123.raf",
     "camera_model": "X-T5",
-    "source_device": "Fuji",
     "capture_date": "2026:05:28 12:00:00",
     "import_timestamp": "2026-05-28T12:00:00",
 }

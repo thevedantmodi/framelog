@@ -10,8 +10,8 @@ def organize_file(path: Path) -> str:
     """Move a flat export into processed/YYYY/MM/. Returns 'moved' or 'failed'."""
     try:
         exif = read_exif(path)
-        dt = datetime.strptime(exif["capture_date"], "%Y:%m:%d %H:%M:%S")
-        dest_dir = PROCESSED / f"{dt.year:04d}" / f"{dt.month:02d}"
+        dt = datetime.strptime(str(exif["capture_date"]), "%Y:%m:%d %H:%M:%S")
+        dest_dir = path.parent / f"{dt.year:04d}" / f"{dt.month:02d}"
         dest = dest_dir / path.name
         if dest.exists():
             return "skipped"
@@ -23,7 +23,7 @@ def organize_file(path: Path) -> str:
         return "failed"
 
 
-def run_outgest(processed: Path = PROCESSED) -> dict:
+def run_outgest(processed: Path = PROCESSED) -> dict[str, int]:
     """Move flat exports in processed/ into YYYY/MM/ subdirectories. Returns counts dict."""
     moved = skipped = failed = 0
     for path in sorted(processed.iterdir()):

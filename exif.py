@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-def read_exif(path: Path) -> dict:
+def read_exif(path: Path) -> dict[str, str | float | None]:
     """Extract metadata from a photo via exiftool. Raises RuntimeError if exiftool fails.
 
     Returns keys: capture_date (str), camera_model (str|None), gps_lat (float|None), gps_lon (float|None).
@@ -16,13 +16,13 @@ def read_exif(path: Path) -> dict:
     )
     if result.returncode != 0:
         raise RuntimeError(f"exiftool failed: {result.stderr.strip()}")
-    data = json.loads(result.stdout)[0]
-    capture_date = data.get("DateTimeOriginal") or _mtime_str(path)
+    data: dict[str, object] = json.loads(result.stdout)[0]
+    capture_date = str(data.get("DateTimeOriginal") or _mtime_str(path))
     return {
         "capture_date": capture_date,
-        "camera_model": data.get("Model"),
-        "gps_lat": data.get("GPSLatitude"),
-        "gps_lon": data.get("GPSLongitude"),
+        "camera_model": str(data["Model"]) if "Model" in data else None,
+        "gps_lat": float(data["GPSLatitude"]) if "GPSLatitude" in data else None,  # pyright: ignore[reportArgumentType]
+        "gps_lon": float(data["GPSLongitude"]) if "GPSLongitude" in data else None,  # pyright: ignore[reportArgumentType]
     }
 
 

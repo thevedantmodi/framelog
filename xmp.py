@@ -18,7 +18,6 @@ _DC  = "{http://purl.org/dc/elements/1.1/}"
 
 def write_xmp(
     image_path: Path,
-    source_device: str,
     batch_id: str,
     camera_model: str | None,
 ) -> Path:
@@ -35,7 +34,6 @@ def write_xmp(
     bag = ET.SubElement(subject, f"{_RDF}Bag")
 
     tags = [
-        f"source:{source_device}",
         f"batch:{batch_id}",
         f"camera:{camera_model or 'unknown'}",
     ]

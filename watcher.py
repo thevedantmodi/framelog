@@ -40,14 +40,15 @@ class XMPHandler(FileSystemEventHandler):
         self._timer: threading.Timer | None = None
         self._lock = threading.Lock()
 
-    def on_modified(self, event):
+    def on_modified(self, event):  # type: ignore[override]
         """Accumulate changed XMP paths and reset the debounce timer on each event."""
         if event.is_directory:
             return
-        if not any(event.src_path.lower().endswith(ext) for ext in (".xmp", ".jpg", ".jpeg", ".heic")):
+        src = event.src_path if isinstance(event.src_path, str) else event.src_path.decode()
+        if not any(src.lower().endswith(ext) for ext in (".xmp", ".jpg", ".jpeg", ".heic")):
             return
         with self._lock:
-            self._changed.add(event.src_path)
+            self._changed.add(src)
             if self._timer:
                 self._timer.cancel()
             self._timer = threading.Timer(DEBOUNCE_SECONDS, self._commit)

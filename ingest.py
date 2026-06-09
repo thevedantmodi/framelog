@@ -22,10 +22,11 @@ def import_file(path: Path, batch_id: str, db_path: Path = DB_PATH) -> str:
 
     try:
         exif = read_exif(path)
-        camera_model = exif["camera_model"]
-        source_device = camera_model or "unknown"
+        camera_model = (
+            str(exif["camera_model"]) if exif["camera_model"] is not None else None
+        )
 
-        capture_date = exif["capture_date"]
+        capture_date = str(exif["capture_date"])
         dt = datetime.strptime(capture_date, "%Y:%m:%d %H:%M:%S")
         dest = (
             ORIGINALS
@@ -37,14 +38,13 @@ def import_file(path: Path, batch_id: str, db_path: Path = DB_PATH) -> str:
         dest.parent.mkdir(parents=True, exist_ok=True)
 
         shutil.copy2(path, dest)
-        write_xmp(dest, source_device, batch_id, camera_model)
+        write_xmp(dest, batch_id, camera_model)
         insert_photo(
             {
                 "hash": file_hash,
                 "original_filename": path.name,
                 "imported_path": str(dest),
                 "camera_model": camera_model,
-                "source_device": source_device,
                 "capture_date": capture_date,
                 "import_timestamp": datetime.now().isoformat(),
                 "status": "raw",
@@ -59,7 +59,7 @@ def import_file(path: Path, batch_id: str, db_path: Path = DB_PATH) -> str:
         return "failed"
 
 
-def run_ingest(inbox: Path = INBOX, db_path: Path = DB_PATH) -> dict:
+def run_ingest(inbox: Path = INBOX, db_path: Path = DB_PATH) -> dict[str, int]:
     """Scan inbox for supported photos, import each, then git commit. Returns counts dict."""
     init_db(db_path=db_path)
     batch_id = datetime.now().isoformat()

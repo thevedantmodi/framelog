@@ -45,12 +45,6 @@ log "SD card: $SD_PATH"
 log "Copying from ${SD_PATH}DCIM/ to inbox"
 cp -rn "${SD_PATH}DCIM/"* ~/Photos/inbox/ 2>/dev/null || true
 
-# Run ingest
-cd "$FRAMELOG_DIR"
-/Users/vedantmodi/.local/bin/uv run python ingest.py
-
-# Wait for rclone
-# wait $RCLONE_PID
-
-notify "Import complete — SD card ready to eject"
-log "Done"
+# Signal app to run ingest
+touch ~/Photos/.ingest_trigger
+log "Ingest trigger set"

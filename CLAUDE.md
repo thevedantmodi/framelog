@@ -127,7 +127,6 @@ CREATE TABLE IF NOT EXISTS photos (
     original_filename TEXT,
     imported_path TEXT,
     camera_model TEXT,
-    source_device TEXT,
     capture_date TEXT,
     import_timestamp TEXT,
     status TEXT DEFAULT 'raw'
