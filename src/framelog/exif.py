@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 import subprocess
 from datetime import datetime
@@ -40,10 +41,27 @@ def read_exif(path: Path) -> dict[str, str | float | None]:
     return {
         "capture_date": capture_date,
         "camera_model": str(data["Model"]) if "Model" in data else None,
-        "gps_lat": float(data["GPSLatitude"]) if "GPSLatitude" in data else None,  # pyright: ignore[reportArgumentType]
-        "gps_lon": float(data["GPSLongitude"]) if "GPSLongitude" in data else None,  # pyright: ignore[reportArgumentType]
+        "gps_lat": _parse_gps(data["GPSLatitude"]) if "GPSLatitude" in data else None,
+        "gps_lon": _parse_gps(data["GPSLongitude"]) if "GPSLongitude" in data else None,
     }
 
 
 def _mtime_str(path: Path) -> str:
     return datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y:%m:%d %H:%M:%S")
+
+
+def _parse_gps(value: object) -> float | None:
+    """Parse exiftool GPS value to decimal degrees. Handles both float and DMS strings."""
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        pass
+    # DMS format: "36 deg 37' 3.55\" N" or "120 deg 5' 10.00\" W"
+    m = re.match(r"(\d+)\s+deg\s+(\d+)'\s+([\d.]+)\"\s*([NSEW])", str(value))
+    if not m:
+        return None
+    deg, minutes, secs, direction = m.groups()
+    decimal = float(deg) + float(minutes) / 60 + float(secs) / 3600
+    if direction in ("S", "W"):
+        decimal = -decimal
+    return decimal

@@ -18,7 +18,9 @@ def _find_git() -> str:
     found = shutil.which("git")
     if found:
         return found
-    raise RuntimeError("git not found. Install Xcode Command Line Tools: xcode-select --install")
+    raise RuntimeError(
+        "git not found. Install Xcode Command Line Tools: xcode-select --install"
+    )
 
 
 def git_commit(message: str, originals: Path = ORIGINALS) -> bool:
@@ -27,7 +29,9 @@ def git_commit(message: str, originals: Path = ORIGINALS) -> bool:
     _ = subprocess.run([git, "-C", str(originals), "add", "-A"], check=True)
     status = subprocess.run(
         [git, "-C", str(originals), "status", "--porcelain"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     if not status.stdout.strip():
         return False
@@ -40,5 +44,11 @@ def git_push(originals: Path = ORIGINALS) -> bool:
     result = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True)
     if "AC Power" not in result.stdout:
         return False
-    _ = subprocess.run([_find_git(), "-C", str(originals), "push"], check=True)
+    git = _find_git()
+    result = subprocess.run(
+        [git, "-C", str(originals), "push", "--force-with-lease", "origin", "main"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git push failed: {result.stderr.strip()}")
     return True

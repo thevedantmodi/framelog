@@ -12,6 +12,12 @@ log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*"
 }
 
+# Respect pause flag
+if [ -f "$HOME/.framelog/sd_paused" ]; then
+    log "SD watcher paused — skipping import"
+    exit 0
+fi
+
 # Find SD card: removable volume with DCIM folder
 SD_PATH=""
 for vol in /Volumes/*/; do
@@ -46,5 +52,5 @@ log "Copying from ${SD_PATH}DCIM/ to inbox"
 cp -rn "${SD_PATH}DCIM/"* ~/Photos/inbox/ 2>/dev/null || true
 
 # Signal app to run ingest
-touch ~/Photos/.ingest_trigger
+touch ~/.framelog/ingest_trigger
 log "Ingest trigger set"

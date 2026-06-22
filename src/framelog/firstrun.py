@@ -1,13 +1,12 @@
-import os
 import stat
 import subprocess
 import sys
 from pathlib import Path
 
-from framelog.config import INBOX, ORIGINALS, PROCESSED
+from framelog.config import FRAMELOG_DIR, INBOX, ORIGINALS, PROCESSED
 
 LAUNCH_AGENTS = Path("~/Library/LaunchAgents").expanduser()
-SETUP_MARKER = Path("~/.framelog_setup_done").expanduser()
+SETUP_MARKER = FRAMELOG_DIR / "setup_done"
 
 
 def _bundle_dir() -> Path:
@@ -32,17 +31,82 @@ def setup_needed() -> bool:
 
 
 def run_setup() -> None:
-    """Create directories, install launchd agents, mark setup done."""
-    for d in (INBOX, ORIGINALS, PROCESSED):
+    """Create directories, install launchd agents, init git repo, mark setup done."""
+    for d in (FRAMELOG_DIR, INBOX, ORIGINALS, PROCESSED):
         d.mkdir(parents=True, exist_ok=True)
 
     _install_sdcard_plist()
+    _install_app_plist()
+    _init_git_repo()
     SETUP_MARKER.touch()
+
+
+def _init_git_repo() -> None:
+    if not (ORIGINALS / ".git").exists():
+        subprocess.run(["git", "-C", str(ORIGINALS), "init"], check=True)
+    gitignore = ORIGINALS / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text("*\n!*/\n!*.xmp\n!.gitignore\n", encoding="utf-8")
+
+
+def git_has_remote() -> bool:
+    result = subprocess.run(
+        ["git", "-C", str(ORIGINALS), "remote", "get-url", "origin"],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def set_git_remote(url: str) -> None:
+    if git_has_remote():
+        subprocess.run(
+            ["git", "-C", str(ORIGINALS), "remote", "set-url", "origin", url],
+            check=True,
+        )
+    else:
+        subprocess.run(
+            ["git", "-C", str(ORIGINALS), "remote", "add", "origin", url],
+            check=True,
+        )
+
+
+def _install_app_plist() -> None:
+    bundle = _app_bundle()
+    if bundle is None:
+        return  # running from source, skip
+    exe = str(bundle / "Contents" / "MacOS" / "Framelog")
+    log = str(FRAMELOG_DIR / "framelog.log")
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.framelog.app</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+</dict>
+</plist>
+"""
+    plist_path = LAUNCH_AGENTS / "com.framelog.app.plist"
+    LAUNCH_AGENTS.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(plist)
+    # Don't launchctl load — app is already running and RunAtLoad would spawn a second instance.
+    # The plist takes effect on next login.
 
 
 def _install_sdcard_plist() -> None:
     script_src = _bundle_dir() / "on_sd_mount.sh"
-    script_dst = Path("~/.framelog_on_sd_mount.sh").expanduser()
+    script_dst = FRAMELOG_DIR / "on_sd_mount.sh"
 
     script_dst.write_text(script_src.read_text(encoding="utf-8"), encoding="utf-8")
     script_dst.chmod(script_dst.stat().st_mode | stat.S_IEXEC)
@@ -57,7 +121,7 @@ def _install_sdcard_plist() -> None:
 
 
 def _sdcard_plist(script_path: str) -> str:
-    log = str(Path("~/Photos/framelog.log").expanduser())
+    log = str(FRAMELOG_DIR / "framelog.log")
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

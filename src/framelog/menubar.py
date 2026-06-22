@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 import subprocess
 import threading
@@ -10,14 +11,15 @@ import rumps
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-from framelog.config import DB_PATH, DEBOUNCE_SECONDS, ORIGINALS, PROCESSED, SUPPORTED_EXTENSIONS
-from framelog.firstrun import run_setup, setup_needed
+from framelog.config import DB_PATH, DEBOUNCE_SECONDS, INGEST_TRIGGER, LOG_FILE, ORIGINALS, PROCESSED, SD_PAUSE_FLAG, SUPPORTED_EXTENSIONS
+
+_log = logging.getLogger("framelog.menubar")
+from framelog.firstrun import git_has_remote, run_setup, set_git_remote, setup_needed
 from framelog.git import git_commit, git_push
 from framelog.ingest import run_ingest
 from framelog.outgest import run_outgest
 
-LOG_PATH = Path("~/Photos/framelog.log").expanduser()
-INGEST_TRIGGER = Path("~/Photos/.ingest_trigger").expanduser()
+LOG_PATH = LOG_FILE
 LIGHTROOM_PROCESS = "Adobe Lightroom Classic"
 
 
@@ -103,8 +105,17 @@ class XMPHandler(FileSystemEventHandler):
             return
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         msg = f"auto: xmp changes {now} ({len(files)} files)"
-        if git_commit(msg) and _on_ac_power():
-            git_push()
+        try:
+            committed = git_commit(msg)
+            if committed:
+                _log.info("committed: %s", msg)
+                if _on_ac_power():
+                    git_push()
+                    _log.info("pushed")
+            else:
+                _log.debug("nothing to commit")
+        except Exception:
+            _log.exception("git commit failed")
 
     def flush(self):
         with self._lock:
@@ -115,18 +126,34 @@ class XMPHandler(FileSystemEventHandler):
 
 
 def _run_xmp_watcher():
+    if not ORIGINALS.exists():
+        _log.warning("originals/ does not exist — XMP watcher not started")
+        return
+    _log.info("XMP watcher started on %s", ORIGINALS)
     handler = XMPHandler()
     observer = Observer()
     observer.schedule(handler, str(ORIGINALS), recursive=True)
     observer.start()
     was_running = False
-    while True:
-        running = _is_lightroom_running()
-        if not running and was_running:
-            handler.flush()
-            git_push()
-        was_running = running
-        time.sleep(5)
+    try:
+        while True:
+            running = _is_lightroom_running()
+            if running and not was_running:
+                _log.info("Lightroom opened")
+            if not running and was_running:
+                _log.info("Lightroom closed — flushing")
+                handler.flush()
+                try:
+                    git_push()
+                except Exception:
+                    _log.exception("git push failed after Lightroom close")
+            was_running = running
+            time.sleep(5)
+    except Exception:
+        _log.exception("XMP watcher crashed")
+    finally:
+        observer.stop()
+        observer.join()
 
 
 # --- outgest watcher ---------------------------------------------------------
@@ -156,9 +183,14 @@ class OutgestHandler(FileSystemEventHandler):
     def _run(self):
         with self._lock:
             self._timer = None
-        counts = run_outgest()
-        if counts["moved"] > 0:
-            _notify("Framelog — Outgest", f"{counts['moved']} files organized")
+        try:
+            counts = run_outgest()
+            _log.info("outgest: %s moved, %s skipped, %s failed",
+                      counts["moved"], counts["skipped"], counts["failed"])
+            if counts["moved"] > 0:
+                _notify("Framelog — Outgest", f"{counts['moved']} files organized")
+        except Exception:
+            _log.exception("outgest failed")
 
 
 def _run_outgest_watcher():
@@ -180,7 +212,8 @@ def _run_ingest_poller(app: "FramelogApp"):
                 INGEST_TRIGGER.unlink()
             except FileNotFoundError:
                 pass
-            app._do_ingest(triggered_by="sd_card")
+            if not SD_PAUSE_FLAG.exists():
+                app._do_ingest(triggered_by="sd_card")
         time.sleep(3)
 
 
@@ -197,14 +230,17 @@ class FramelogApp(rumps.App):
             threading.Thread(target=self._first_run_setup, daemon=True).start()
 
     def _build_menu(self):
+        self._sd_toggle = rumps.MenuItem(self._sd_toggle_label(), callback=self.toggle_sd_watcher)
         self.menu = [
             rumps.MenuItem("Status", callback=None),
             None,
             rumps.MenuItem("Run Ingest Now", callback=self.run_ingest),
             rumps.MenuItem("Run Outgest Now", callback=self.run_outgest),
+            self._sd_toggle,
             None,
             rumps.MenuItem("Open Log File", callback=self.open_log),
             None,
+            rumps.MenuItem("Set Git Remote…", callback=self.set_git_remote),
             rumps.MenuItem("Run Setup", callback=self.run_setup),
             rumps.MenuItem("Quit Framelog", callback=rumps.quit_application),
         ]
@@ -213,7 +249,10 @@ class FramelogApp(rumps.App):
     def _first_run_setup(self) -> None:
         try:
             run_setup()
-            _notify("Framelog", "Setup complete — ready to import photos.")
+            if git_has_remote():
+                _notify("Framelog", "Setup complete — ready to import photos.")
+            else:
+                _notify("Framelog", "Setup complete — add a Git remote via the menu to enable XMP versioning.")
         except Exception as exc:
             _notify("Framelog — Setup failed", str(exc))
 
@@ -253,6 +292,18 @@ class FramelogApp(rumps.App):
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _sd_toggle_label(self) -> str:
+        return "Resume SD Watcher" if SD_PAUSE_FLAG.exists() else "Pause SD Watcher"
+
+    def toggle_sd_watcher(self, _):
+        if SD_PAUSE_FLAG.exists():
+            SD_PAUSE_FLAG.unlink()
+            _notify("Framelog", "SD watcher resumed.")
+        else:
+            SD_PAUSE_FLAG.touch()
+            _notify("Framelog", "SD watcher paused — card inserts will be ignored.")
+        self._sd_toggle.title = self._sd_toggle_label()
+
     def run_ingest(self, _):
         if self._ingest_running:
             _notify("Framelog", "Ingest already running")
@@ -271,6 +322,33 @@ class FramelogApp(rumps.App):
                 _notify("Framelog — Outgest failed", str(exc))
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def set_git_remote(self, _):
+        current = ""
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(ORIGINALS), "remote", "get-url", "origin"],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                current = result.stdout.strip()
+        except Exception:
+            pass
+        window = rumps.Window(
+            message="GitHub SSH URL for XMP version history:",
+            title="Framelog — Git Remote",
+            default_text=current or "git@github.com:you/framelog-xmp.git",
+            ok="Save",
+            cancel="Cancel",
+            dimensions=(400, 20),
+        )
+        response = window.run()
+        if response.clicked and response.text.strip():
+            try:
+                set_git_remote(response.text.strip())
+                _notify("Framelog", "Git remote configured.")
+            except Exception as exc:
+                _notify("Framelog — Git setup failed", str(exc))
 
     def open_log(self, _):
         subprocess.run(["open", str(LOG_PATH)])

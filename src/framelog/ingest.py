@@ -2,7 +2,11 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
+import logging
+
 from framelog.config import DB_PATH, INBOX, ORIGINALS, SUPPORTED_EXTENSIONS, log
+
+_log = logging.getLogger("framelog.ingest")
 from framelog.db import hash_exists, init_db, insert_photo
 from framelog.exif import read_exif
 from framelog.git import git_commit, git_push
@@ -54,8 +58,8 @@ def import_file(path: Path, batch_id: str, db_path: Path = DB_PATH) -> str:
         path.unlink()
         return "imported"
 
-    except Exception as exc:
-        log("INGEST", f"FAILED {path.name}: {exc}")
+    except Exception:
+        _log.exception("FAILED %s", path.name)
         return "failed"
 
 

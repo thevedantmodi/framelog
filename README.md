@@ -1,229 +1,231 @@
 # Framelog
 
-Photo ingestion, versioning, and sync pipeline for Mac. Insert an SD card and photos are automatically imported, renamed, deduplicated, and versioned. Edits made in Lightroom Classic are committed to git via XMP sidecars.
+Framelog is a Mac menu bar app that automates the photo import pipeline from SD card and iPhone into a version-controlled archive. Insert a card and photos are copied to a dated folder structure, renamed by capture time, deduplicated by hash, and indexed in a local SQLite catalog. Edits made in Lightroom Classic are automatically committed to git via XMP sidecars — so your develop settings have a full history without touching the raw files.
 
-## How it works
+The app lives in the menu bar. It watches for SD cards in the background, tracks Lightroom for XMP changes, and organizes finished exports. You don't need to think about it.
 
-1. Insert SD card → launchd fires `on_sd_mount.sh`
-2. Photos copied to `~/Photos/inbox/`, then ingested to `originals/YYYY/MM/DD/YYYYMMDD_HHMMSS_<hash8>.ext`
-3. XMP sidecar written alongside each file, import recorded in `catalog.db`
-4. Lightroom picks up new files via Synchronize Folder
-5. Edits in Lightroom are auto-committed to git by the background watcher
-6. Export finished edits to `~/Photos/processed/` → outgest moves them to `YYYY/MM/` subfolders
+---
+
+## What it does
+
+**On SD card insert:**
+Photos are copied from the card's DCIM folder to `~/Photos/inbox/`, then ingested into `~/Photos/originals/YYYY/MM/DD/` with a canonical filename based on capture time and a SHA-256 hash prefix. Duplicates are silently skipped. A `.xmp` sidecar is written next to each file and the import is recorded in `catalog.db`.
+
+**While Lightroom is open:**
+The app watches `originals/` for XMP changes. When you hit Cmd+S or Lightroom flushes settings, the changed files are debounced and committed to git automatically. On AC power, commits are pushed to the remote.
+
+**After exporting:**
+Drop finished exports flat into `~/Photos/processed/`. The app detects new files and moves them into `YYYY/MM/` subfolders based on capture date.
+
+---
+
+## Photo library layout
+
+```
+~/Photos/
+├── inbox/                          ← temporary landing zone (cleared after import)
+├── originals/
+│   └── YYYY/MM/DD/
+│       ├── YYYYMMDD_HHMMSS_<hash8>.raf   ← canonical raw file
+│       └── YYYYMMDD_HHMMSS_<hash8>.xmp   ← XMP sidecar (git tracked)
+├── processed/
+│   └── YYYY/MM/                    ← outgest organizes exports here
+└── catalog.db                      ← SQLite index
+```
 
 ---
 
 ## Requirements
 
-- macOS (tested on Sequoia)
-- [Homebrew](https://brew.sh)
-- [uv](https://docs.astral.sh/uv/getting-started/installation/) — Python package manager
-- [exiftool](https://exiftool.org) — reads EXIF metadata
-- [Lightroom Classic](https://www.adobe.com/products/photoshop-lightroom-classic.html)
-- Git
+- macOS Sequoia or later
+- [exiftool](https://exiftool.org) — reads EXIF metadata from RAF, HEIC, JPG
+- Lightroom Classic (optional — XMP watcher only activates when it's running)
+- A GitHub repo for XMP version history (free, files are tiny)
 
 ---
 
 ## Installation
 
-### 1. System dependencies
+### 1. Install exiftool
 
 ```bash
-brew install exiftool git
+brew install exiftool
 ```
 
-Install uv:
+### 2. Build or download the app
+
+**From source:**
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-### 2. Clone the repo
-
-```bash
-git clone <your-repo-url> ~/dev/framelog
+git clone <repo-url> ~/dev/framelog
 cd ~/dev/framelog
+make release          # builds dist/Framelog.app and packages a DMG
 ```
 
-### 3. Install Python dependencies
+**From DMG:**
+Open `Framelog-1.0.0.dmg` and drag `Framelog.app` to Applications.
 
-```bash
-uv sync
-```
+### 3. Launch the app
 
-### 4. Create the photo library directories
+Open `Framelog.app`. On first launch it will:
+- Create `~/Photos/inbox/`, `originals/`, and `processed/`
+- Initialize a git repo in `originals/` with the correct `.gitignore`
+- Install and load a launchd agent so the app runs at login and stays running
+- Install and load the SD card trigger agent
+- Show a notification when setup is done
 
-```bash
-mkdir -p ~/Photos/inbox ~/Photos/originals ~/Photos/processed
-```
+The menu bar icon appears as 📷.
 
-### 5. Initialize the git repo for XMP versioning
+### 4. Set up XMP versioning (optional but recommended)
 
-```bash
-cd ~/Photos/originals
-git init
-git remote add origin git@github.com:you/framelog-xmp.git
-```
+Click **Set Git Remote…** in the menu bar and paste your GitHub SSH URL. That's it — the repo and `.gitignore` are already initialized.
 
-Create `~/Photos/originals/.gitignore` to track only XMP files:
-
-```gitignore
-*.raf
-*.RAF
-*.cr3
-*.CR3
-*.heic
-*.HEIC
-*.jpg
-*.jpeg
-*.JPG
-*.mp4
-*.mov
-!*.xmp
-```
-
-### 6. Edit the launchd plists
-
-The plists hardcode paths. Open each file in `launchd/` and replace `/Users/vedantmodi` with your home directory:
-
-```bash
-sed -i '' 's|/Users/vedantmodi|'"$HOME"'|g' launchd/*.plist scripts/on_sd_mount.sh
-```
-
-### 7. Load launchd jobs
-
-**SD card trigger** — fires `on_sd_mount.sh` when any volume mounts:
-
-```bash
-cp launchd/com.framelog.sdcard.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.framelog.sdcard.plist
-```
-
-**XMP watcher** — commits Lightroom edits to git while Lightroom is open:
-
-```bash
-cp launchd/com.framelog.watcher.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.framelog.watcher.plist
-```
-
-**Outgest** — organizes flat exports into `YYYY/MM/` subfolders:
-
-```bash
-cp launchd/com.framelog.outgest.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.framelog.outgest.plist
-```
-
-### 8. Verify jobs loaded
-
-```bash
-launchctl list | grep framelog
-```
-
-Expected output — exit code should be `0` for sdcard/outgest and a PID for watcher:
-
-```
--       0       com.framelog.sdcard
-10462   0       com.framelog.watcher
--       0       com.framelog.outgest
-```
+If you don't have a remote repo yet, create one at [github.com/new](https://github.com/new) (private, empty, no README).
 
 ---
 
 ## Lightroom Classic setup
 
-1. **Add originals as source**
+1. **Add originals as source folder**
    File → Add Folder to Catalog → `~/Photos/originals/`
 
-2. **Enable auto XMP writes** (required for watcher to work)
+2. **Enable auto XMP writes**
    Lightroom → Settings → Catalog Settings → Metadata tab
    Check **Automatically write changes into XMP**
 
 3. **Disable Lightroom's import dialog**
    Preferences → Import → uncheck **Show import dialog when a memory card is detected**
-   Never let Lightroom move or rename files — framelog owns all file operations.
+   Framelog owns all file operations — never let Lightroom move or rename files.
 
 4. **Sync folder after each ingest**
-   Right-click `originals/` in Library panel → **Synchronize Folder**
-   This makes Lightroom pick up newly imported files without re-importing them.
+   Right-click `originals/` in the Library panel → **Synchronize Folder**
+   This picks up newly imported files without triggering a full re-import.
 
-5. **Export path**
-   In the Export dialog, set Export Location to:
-   - Export To: Specific folder
-   - Folder: `~/Photos/processed/`
-   - Do not use subfolders — outgest handles YYYY/MM organization automatically
+5. **Set the export path**
+   Export Location → Specific folder → `~/Photos/processed/`
+   Do not use subfolders — outgest handles `YYYY/MM/` organization automatically.
 
-6. **End of edit session**
-   Hit **Cmd+S** before closing Lightroom to flush XMP to disk so the watcher commits everything.
+6. **End of each session**
+   Hit **Cmd+S** before closing Lightroom to flush XMP to disk before the watcher commits.
 
 ---
 
 ## Day-to-day workflow
 
-### Importing from SD card
+### Importing from an SD card
 
-1. Insert SD card — import runs automatically
-2. Watch progress: `tail -f ~/Photos/framelog.log`
-3. When done, open Lightroom and Synchronize Folder
+1. Insert the card — import starts automatically within a few seconds
+2. The menu bar icon changes to ⏳ while running
+3. A notification appears when done: `N imported · N skipped · N failed`
+4. In Lightroom, right-click `originals/` → **Synchronize Folder** to see new photos
 
-### Editing
+You can also trigger import manually from the menu bar: **Run Ingest Now**.
 
-1. Edit photos in Lightroom as normal
-2. The watcher commits XMP changes to git automatically (within ~10 seconds of Cmd+S)
-3. Check commits: `git -C ~/Photos/originals log --oneline -5`
+### Editing in Lightroom
 
-### Exporting
+Edit as normal. XMP changes are committed to git automatically — you don't need to do anything. The commit message includes the timestamp and file count.
 
-1. Export finished photos flat to `~/Photos/processed/`
-2. Outgest fires automatically and moves them to `~/Photos/processed/YYYY/MM/`
+To check recent commits:
+
+```bash
+git -C ~/Photos/originals log --oneline -10
+```
+
+### Exporting finished edits
+
+Export flat to `~/Photos/processed/`. Within a few seconds, outgest moves files into `~/Photos/processed/YYYY/MM/` and shows a notification.
+
+You can also trigger outgest manually: **Run Outgest Now**.
+
+### Checking status
+
+The **Status** item in the menu shows total photo count and last import time. For more detail, open the log:
+
+```
+~/Photos/framelog.log
+```
+
+Or live:
+
+```bash
+tail -f ~/Photos/framelog.log
+```
 
 ---
 
 ## Backup
 
-Backup via rclone is implemented in `on_sd_mount.sh` but disabled by default. To enable, uncomment the backup drive check and rclone sync blocks in `scripts/on_sd_mount.sh` and set your backup drive path:
+The SD card trigger script (`on_sd_mount.sh`) has commented-out blocks for rclone backup. To enable:
+
+1. Connect your backup drive
+2. Open `~/.framelog_on_sd_mount.sh`
+3. Set `BACKUP_PATH` to your drive's mount path and uncomment the backup drive check and rclone blocks
+
+Backup strategy:
+| Copy | Where | Method |
+|---|---|---|
+| Primary | Main machine | — |
+| Local backup | External drive | rclone on SD card insert |
+| XMP edit history | GitHub | auto-push on AC power |
+
+---
+
+## Troubleshooting
+
+**Import didn't start after inserting SD card**
+Check that the card has a `DCIM` folder and is recognized as removable media:
+```bash
+diskutil info /Volumes/<CardName> | grep "Removable Media"
+```
+Check the log: `tail -20 ~/Photos/framelog.log`
+
+**XMP changes not being committed**
+Verify Lightroom has "Automatically write changes into XMP" enabled. Check that the app is running (📷 icon in menu bar). Commits are debounced — changes appear in git ~10 seconds after the last Cmd+S.
+
+**Duplicate photos**
+Deduplication is by SHA-256 hash. If a photo was already imported it will be logged as `skipped` and the source file left untouched.
+
+---
+
+## Development
+
+### Running from source
 
 ```bash
-BACKUP_PATH="/Volumes/YourDriveName"
+uv run python -m framelog
 ```
 
----
-
-## Monitoring
-
-```bash
-# Live log
-tail -f ~/Photos/framelog.log
-
-# Check all jobs are running
-launchctl list | grep framelog
-
-# Recent imports
-sqlite3 ~/Photos/catalog.db "SELECT import_timestamp, COUNT(*) FROM photos GROUP BY date(import_timestamp) ORDER BY import_timestamp DESC LIMIT 10;"
-
-# Recent git commits
-git -C ~/Photos/originals log --oneline -10
-```
-
----
-
-## File structure
-
-```
-~/Photos/
-├── inbox/              ← temporary landing zone (cleared after import)
-├── originals/
-│   └── YYYY/MM/DD/
-│       └── YYYYMMDD_HHMMSS_<hash8>.ext   ← canonical filename
-│       └── YYYYMMDD_HHMMSS_<hash8>.xmp   ← XMP sidecar (git tracked)
-├── processed/          ← Lightroom exports
-│   └── YYYY/MM/
-└── catalog.db          ← SQLite index
-```
-
----
-
-## Running tests
+### Running tests
 
 ```bash
 uv run pytest tests/
+```
+
+### Building the app bundle
+
+```bash
+make build    # builds dist/Framelog.app
+make dmg      # signs and packages a DMG
+make release  # build + dmg in one step
+make clean    # remove build artifacts
+```
+
+The build uses py2app. A separate `.venv-build/` virtualenv is used for the build toolchain to avoid conflicts with the dev environment.
+
+### Project layout
+
+```
+src/framelog/
+├── __main__.py     ← entry point
+├── menubar.py      ← menu bar app, XMP watcher, outgest watcher, ingest poller
+├── ingest.py       ← import pipeline
+├── outgest.py      ← export organizer
+├── firstrun.py     ← first-launch setup, launchd agent install
+├── config.py       ← all paths and constants
+├── db.py           ← SQLite catalog
+├── exif.py         ← exiftool wrapper
+├── hasher.py       ← SHA-256 file hashing
+├── xmp.py          ← XMP sidecar writer
+├── git.py          ← git commit/push
+└── on_sd_mount.sh  ← SD card trigger script (bundled into app)
 ```

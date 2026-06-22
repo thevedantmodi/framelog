@@ -1,9 +1,12 @@
+import logging
 import shutil
 from datetime import datetime
 from pathlib import Path
 
 from framelog.config import PROCESSED, SUPPORTED_EXTENSIONS
 from framelog.exif import read_exif
+
+_log = logging.getLogger("framelog.outgest")
 
 
 def organize_file(path: Path) -> str:
@@ -18,8 +21,8 @@ def organize_file(path: Path) -> str:
         dest_dir.mkdir(parents=True, exist_ok=True)
         shutil.move(str(path), dest)
         return "moved"
-    except Exception as exc:
-        print(f"  FAILED {path.name}: {exc}")
+    except Exception:
+        _log.exception("FAILED %s", path.name)
         return "failed"
 
 
@@ -39,7 +42,6 @@ def run_outgest(processed: Path = PROCESSED) -> dict[str, int]:
         else:
             failed += 1
 
-    print(f"Done: {moved} moved, {skipped} skipped, {failed} failed")
     return {"moved": moved, "skipped": skipped, "failed": failed}
 
 

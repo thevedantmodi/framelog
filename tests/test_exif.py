@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from framelog.exif import read_exif
+from framelog.exif import _parse_gps, read_exif
 
 
 def _mock_result(data: dict, returncode: int = 0, stderr: str = "") -> MagicMock:
@@ -49,6 +49,37 @@ def test_gps_absent_returns_none(tmp_path: Path):
         result = read_exif(f)
     assert result["gps_lat"] is None
     assert result["gps_lon"] is None
+
+
+def test_gps_dms_string(tmp_path: Path):
+    f = tmp_path / "photo.heic"
+    f.write_bytes(b"fake")
+    exif_data = {
+        "DateTimeOriginal": "2026:06:04 14:57:09",
+        "Model": "iPhone 16 Pro",
+        "GPSLatitude": "36 deg 37' 3.55\" N",
+        "GPSLongitude": "121 deg 54' 22.10\" W",
+    }
+    with patch("subprocess.run", return_value=_mock_result(exif_data)):
+        result = read_exif(f)
+    assert result["gps_lat"] == pytest.approx(36.617652, rel=1e-4)
+    assert result["gps_lon"] == pytest.approx(-121.906139, rel=1e-4)
+
+
+def test_parse_gps_decimal():
+    assert _parse_gps(37.7749) == pytest.approx(37.7749)
+
+
+def test_parse_gps_dms_north():
+    assert _parse_gps("36 deg 37' 3.55\" N") == pytest.approx(36.617652, rel=1e-4)
+
+
+def test_parse_gps_dms_west():
+    assert _parse_gps("121 deg 54' 22.10\" W") == pytest.approx(-121.906139, rel=1e-4)
+
+
+def test_parse_gps_malformed():
+    assert _parse_gps("not a coordinate") is None
 
 
 def test_exiftool_failure_raises(tmp_path: Path):

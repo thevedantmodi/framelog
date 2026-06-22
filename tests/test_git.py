@@ -39,7 +39,7 @@ def test_push_on_ac_power(tmp_path):
     with patch("subprocess.run") as mock_run:
         mock_run.side_effect = [
             _run("Now drawing from 'AC Power'"), # pmset
-            _run(),                               # git push
+            _run(),                               # git push --force-with-lease
         ]
         result = git_push(originals=tmp_path)
     assert result is True
