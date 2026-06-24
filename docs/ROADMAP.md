@@ -141,36 +141,50 @@ add any, it belongs in Phase 2 instead.
 
 ---
 
-## Phase 5 — Migration & cutover
+## Phase 5 — Migration & cutover ✓ complete
 
 **Goal:** Move off the running Python app without losing photo history or breaking
 Lightroom's relationship to `originals/`.
 
-- **FL-501 — `catalog.db` compatibility check**
-  Confirm the new schema matches the existing database, or write a one-time migration.
-- **FL-502 — Side-by-side dry run**
-  Old app's launchd jobs unloaded, new core pointed at a *copy* of `~/Photos`, verify
-  identical ingest/outgest behavior against a real SD card before touching the real
-  library.
-- **FL-503 — Decommission old jobs**
-  Unload/remove `com.framelog.{sdcard,app}` (Python), delete `on_sd_mount.sh`, install the
-  new plist(s) from FL-303/FL-402.
-- **FL-504 — Rewrite `README.md` and `CLAUDE.md` against the real new architecture**
-  Do this *as part of* this ticket, not after the fact — that's exactly how the Python
-  version's docs drifted from its code. "Docs match the shipped architecture" goes in the
-  Definition of Done below, permanently.
+- **FL-501 ✓ — `catalog.db` compatibility check** — cold-start test verifies schema
+  creation; real-hardware ingest verified against SD card.
+- **FL-502 ✓ — Side-by-side dry run** — real-hardware SD card + Lightroom XMP pipeline
+  tested end-to-end. DNG XMP extraction, git commit on edit, outgest verified.
+- **FL-503 ✓ — Decommission old jobs** — Python version fully replaced. No
+  `com.framelog.sdcard`, no `menubar.py`, no `on_sd_mount.sh`.
+- **FL-504 ✓ — Docs rewritten** — `README.md`, `PROTOCOL.md`, `ROADMAP.md`, `CLAUDE.md`
+  all reflect the actual shipped architecture.
 
 ---
 
 ## Phase 6 — Polish & distribution
 
-- **FL-601 — Codesigning + notarization** for both the core binary and the app bundle.
-- **FL-602 — Confirm single version number end-to-end** (FL-002 in practice) — no repeat
-  of the `0.1.0` vs. `1.0.0` split found in the Python project's packaging config.
-- **FL-603 — Installer** — DMG, or one `.app` bundling the core as a helper executable
-  launched via `SMAppService`, if you want a true one-click install.
-- **FL-604 — Crash/restart policy** — confirm `KeepAlive` behavior on core crash, and make
-  sure `status` (FL-302) can report "core unreachable" cleanly in the menu bar.
+- **FL-601 — Codesigning + notarization** *(deferred — requires $99 Apple Developer
+  account)* — app runs unsigned for personal use; Homebrew users need `--no-quarantine`.
+  Revisit when distributing publicly.
+
+- **FL-602 ✓ — Single version number end-to-end** — root `VERSION` file drives both
+  `framelogd --version` (via `-ldflags "-X main.Version=$(cat VERSION)"`) and
+  `CFBundleShortVersionString` (via `xcodebuild MARKETING_VERSION=$(VERSION)`). Bump
+  `VERSION`, run `make release`, done.
+
+- **FL-603 ✓ — Installer** — `framelogd` bundled inside `Framelog.app/Contents/MacOS/`.
+  `make release` builds Go + Swift, copies binary into bundle, wraps in DMG.
+  "Install Core…" button in the menu bar runs the bundled `framelogd install`.
+  Distribution: GitHub Releases DMG + Homebrew tap (`homebrew/framelog.rb`).
+  Install: `brew tap thevedantmodi/framelog && brew install --cask --no-quarantine framelog`.
+
+- **FL-604 ✓ — Crash/restart policy** — `KeepAlive=true` in launchd plist; crash output
+  goes to `~/Library/Logs/Framelog/crash.log`. Menu bar uses a POSIX socket ping to
+  distinguish four states: never installed / restarting (launchd recovering) / no photos /
+  normal. See `PROTOCOL.md §4`.
+
+### Pending (FL-404 follow-up)
+
+- **Socket migration for Swift buttons** — "Run Ingest Now" / "Run Outgest Now" currently
+  touch trigger files (v1 IPC). Should send `{"command":"ingest_now"}` /
+  `{"command":"outgest_now"}` over the socket. Once done, both trigger files can be
+  retired from `PROTOCOL.md §2`.
 
 ---
 

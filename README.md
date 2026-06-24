@@ -1,109 +1,149 @@
 # Framelog
 
-A macOS photo pipeline running as a headless Go daemon (`framelogd`) and a
-Swift menu bar app (`Framelog.app`). No Python. No separate shell scripts.
-
-- **Go core** (`core/`) owns everything pipeline-related: SD card detection,
-  ingest, XMP/git, outgest, backup, and IPC. Runs as a `launchd` KeepAlive
-  agent.
-- **Swift frontend** (`menubar/`) is a thin menu bar shell: reads
-  `catalog.db` for status, tails `framelog.log` for the log viewer, and sends
-  commands to the core over a Unix domain socket.
-
-See `docs/PROTOCOL.md` for the frozen core↔frontend contract and
-`docs/ROADMAP.md` for the full ticket backlog.
+A macOS photo pipeline: a headless Go daemon (`framelogd`) and a Swift menu bar app
+(`Framelog.app`). Insert an SD card — photos are imported, deduplicated, git-versioned,
+and Lightroom edits are committed automatically. No Python. No shell scripts.
 
 ---
 
-## Architecture
+## How it works
 
+1. **SD card inserted** → `framelogd` detects it, copies DCIM to `~/Photos/inbox/`
+2. **Ingest** → files are hashed, renamed `<date>_<hash8>.ext`, moved to
+   `originals/YYYY/MM/DD/`, recorded in `catalog.db`
+3. **Lightroom** → open `~/Photos/originals/` as a catalog; edit freely
+4. **XMP watcher** → when Lightroom saves edits (DNG: embedded XMP extracted to sidecar;
+   other formats: `.xmp` sidecar written by Lightroom), debounced git commit in `originals/`
+5. **Outgest** → Lightroom exports land in `~/Photos/processed/`; `framelogd` organises
+   them into `processed/YYYY/MM/`
+6. **Backup** → after ingest, `rclone copy` syncs `originals/` to `$FRAMELOG_BACKUP_PATH`
+
+The menu bar app shows photo count, last import time, and lets you trigger ingest/outgest
+manually. The daemon runs as a `launchd` KeepAlive agent — it restarts automatically on
+crash and starts at login.
+
+---
+
+## Install
+
+### From DMG (recommended)
+
+1. Download `Framelog-<version>.dmg` from the [Releases](https://github.com/thevedantmodi/framelog/releases) page
+2. Drag `Framelog.app` to `/Applications`
+3. Open `Framelog.app` — it appears in the menu bar
+4. Click the menu bar icon → **Install Core…** — this installs `framelogd` as a launchd agent
+
+### Via Homebrew (tap)
+
+```bash
+brew tap thevedantmodi/framelog
+brew install --cask --no-quarantine framelog
 ```
-framelogd (Go binary)
-├── SD card watcher     → ingest on mount
-├── trigger-file poller → ingest/outgest on touch (v1 IPC, FL-301)
-├── XMP watcher         → git commit/push on Lightroom edit
-├── outgest watcher     → organise processed/ on Lightroom export
-├── backup              → rclone copy originals/ to BACKUP_PATH after ingest
-└── IPC server          → Unix socket at ~/Library/Application Support/Framelog/framelog.sock
 
-Framelog.app (Swift menu bar)
-├── reads catalog.db read-only (photo count, last import)
-├── tails ~/Photos/framelog.log (log viewer)
-├── touches ~/Photos/.ingest_trigger / .outgest_trigger (v1 IPC buttons)
-│   └── planned: migrate to socket ("ingest_now"/"outgest_now") — see FL-404
-└── polls socket every 15s for status (photo count, backup drive, running state)
+Then open `Framelog.app` and click **Install Core…**.
+
+> **Note:** `--no-quarantine` is required because the app is not yet notarized with Apple.
+> This is safe for software you build or download from a trusted source.
+
+### From source
+
+```bash
+git clone https://github.com/thevedantmodi/framelog
+cd framelog
+make release          # builds Go + Swift, bundles framelogd into .app, creates DMG
+# → open build/Framelog-<version>.dmg
 ```
 
 ---
 
-## `framelogd` subcommands
+## Menu bar
 
-```bash
-framelogd run        # start the daemon (what launchd runs; also use for manual foreground testing)
-framelogd install    # write ~/Library/LaunchAgents/com.framelog.core.plist and bootstrap it
-framelogd uninstall  # bootout the agent and remove the plist
-framelogd --version  # print the build version
-```
-
-`install` and `uninstall` are explicit subcommands. They do not fire as a side
-effect of `framelogd run` or `go run` — auto-installing a launchd agent during
-development would be a footgun.
-
-### Build
-
-```bash
-cd core
-go build -ldflags "-X main.Version=$(cat ../VERSION)" -o framelogd ./cmd/framelogd
-```
-
-For development without version stamping:
-```bash
-go build -o framelogd ./cmd/framelogd
-```
-
-### Test
-
-```bash
-go test ./... -race
-```
-
-No test requires `exiftool`, `diskutil`, `pmset`, `pgrep`, or `rclone` to be
-installed — all external binaries use injectable paths so tests substitute fake
-shell scripts. `git` is required on PATH for the cold-start test
-(`TestColdStart_DirectoriesAndDB`), which verifies `initWorkspace` creates
-`originals/.git` from scratch.
+| Item | What it does |
+|------|-------------|
+| Status line | Photo count + time since last import. Shows "Core restarting…" if the daemon crashed (launchd is recovering), "Install Core to get started" if never set up. |
+| Launch at Login | Registers/unregisters the menu bar app itself as a login item. |
+| Run Ingest Now | Triggers ingest immediately (touches `.ingest_trigger`). |
+| Run Outgest Now | Triggers outgest immediately (touches `.outgest_trigger`). |
+| Install Core… | Runs `framelogd install` from the bundled binary — writes the launchd plist and starts the daemon. |
+| Open Log File | Opens `~/Photos/framelog.log` in your default viewer. |
+| Run Setup | Re-runs login-item registration and notification permission request. |
+| Quit Framelog | Quits the menu bar app. `framelogd` keeps running. |
 
 ---
 
-## IPC — talking to the daemon
+## Required and optional binaries
 
-### v2 socket (primary)
+| Binary     | Required? | If absent |
+|------------|-----------|-----------|
+| `exiftool` | Yes | Daemon refuses to start |
+| `git`      | Yes | Daemon refuses to start |
+| `pmset`    | No  | Push not gated on AC power (always pushes) |
+| `pgrep`    | No  | Lightroom-running check skipped (always pushes after debounce) |
+| `diskutil` | No  | SD card watcher disabled |
+| `rclone`   | No  | Backup disabled |
 
-Path: `~/Library/Application Support/Framelog/framelog.sock`
+Check `~/Photos/framelog.log` after first start to see which capabilities are active.
 
-Line-delimited JSON, one connection per request. Test with netcat:
+---
 
+## Day-to-day
+
+**Build everything:**
+```bash
+make build
+```
+
+**Run daemon in the foreground (dev/testing):**
+```bash
+./core/framelogd run
+```
+
+**Install as launchd agent:**
+```bash
+./core/framelogd install
+```
+
+**Check status:**
 ```bash
 echo '{"command":"status"}' | nc -U ~/Library/"Application Support"/Framelog/framelog.sock
-# → {"protocol_version":1,"ok":true,"ingest_running":false,"outgest_running":false,
-#    "photo_count":4213,"last_import":"2026-06-20T14:02:00Z","backup_drive_mounted":true}
-
-echo '{"command":"ingest_now"}' | nc -U ~/Library/"Application Support"/Framelog/framelog.sock
-# → {"protocol_version":1,"ok":true,"imported":3,"skipped":1,"failed":0}
-
-echo '{"command":"outgest_now"}' | nc -U ~/Library/"Application Support"/Framelog/framelog.sock
-# → {"protocol_version":1,"ok":true,"moved":2,"skipped":0,"failed":0}
 ```
 
-Full request/response shapes in `docs/PROTOCOL.md §3`.
+**Tail logs:**
+```bash
+tail -f ~/Photos/framelog.log
+```
 
-### v1 trigger files (used by Swift app buttons today)
+**Uninstall:**
+```bash
+./core/framelogd uninstall
+```
 
-The Swift "Run Ingest Now" / "Run Outgest Now" buttons currently touch
-`~/Photos/.ingest_trigger` and `~/Photos/.outgest_trigger`. The Go core polls
-for these every 2 seconds and fires the corresponding pipeline. This will
-migrate to the socket once FL-404 is updated — see the follow-up note in
-`docs/PROTOCOL.md §2`.
+**Reset for testing:**
+```bash
+cd core && make reset   # removes ~/Photos/{inbox,originals,processed}, catalog.db, log, triggers
+```
+
+---
+
+## Build system
+
+The root `Makefile` drives both binaries from the single `VERSION` file:
+
+```bash
+make build        # build Go binary + Swift app
+make build-go     # Go only
+make build-swift  # Swift only
+make test         # Go tests (race detector) + Xcode tests
+make release      # full release: build + bundle framelogd into .app + create DMG
+make sha          # print sha256 of the DMG (for Homebrew cask)
+make clean        # remove build artefacts
+```
+
+**Bump version:**
+```bash
+echo "0.2.0" > VERSION
+make release
+```
 
 ---
 
@@ -111,8 +151,8 @@ migrate to the socket once FL-404 is updated — see the follow-up note in
 
 ```
 ~/Photos/
-├── inbox/                ← landing zone, cleared after import
-├── originals/YYYY/MM/DD/ ← imported files + .xmp sidecars; git-tracked
+├── inbox/                ← SD card landing zone, cleared after import
+├── originals/YYYY/MM/DD/ ← imported files + .xmp sidecars; git-tracked (XMP only)
 ├── processed/YYYY/MM/    ← Lightroom exports, organised by outgest
 ├── catalog.db            ← SQLite; core writes, frontend reads read-only
 └── framelog.log          ← structured log (TIMESTAMP [PREFIX] message)
@@ -124,107 +164,95 @@ migrate to the socket once FL-404 is updated — see the follow-up note in
 └── framelog.sock               ← v2 IPC socket (created at runtime)
 
 ~/Library/Logs/Framelog/
-└── crash.log                   ← launchd stdout/stderr capture (empty in normal operation)
+└── crash.log                   ← launchd stdout/stderr (empty in normal operation)
 ```
 
-`inbox/`, `originals/`, `processed/`, and the `originals/.git` repo are created
-automatically on first `framelogd run` — you do not need to create them or run
-`git init` manually.
+`inbox/`, `originals/`, `processed/`, and `originals/.git` are created automatically
+on first run — no manual `git init` needed.
+
+The `originals/` git repo tracks only `.xmp` sidecar files (`.gitignore` ignores
+everything else). Large RAW files stay on disk but are not versioned.
 
 ---
 
-## Required and optional binaries
+## Architecture
 
-| Binary     | Required? | If absent                                   |
-|------------|-----------|---------------------------------------------|
-| `exiftool` | Yes       | Daemon refuses to start                     |
-| `git`      | Yes       | Daemon refuses to start                     |
-| `pmset`    | No        | Push not gated on AC power (always pushes)  |
-| `pgrep`    | No        | Lightroom-running check skipped (always push after debounce) |
-| `diskutil` | No        | SD card watcher disabled                    |
-| `rclone`   | No        | Backup disabled                             |
+```
+framelogd (Go daemon)
+├── SD card watcher      polls /Volumes every 2s; copies DCIM → inbox/ on mount
+├── ingest               hash → rename → originals/ → catalog.db → git commit → backup
+├── XMP watcher          fsnotify on originals/; 10s debounce → git commit → push
+│   └── DNG handling     exiftool -xmp -b extracts embedded XMP to .xmp sidecar
+├── outgest watcher      fsnotify on processed/; debounce → organise into YYYY/MM/
+├── backup               rclone copy originals/ → $FRAMELOG_BACKUP_PATH after ingest
+├── trigger poller       polls .ingest_trigger / .outgest_trigger every 2s (v1 IPC)
+└── IPC server           Unix socket (v2 IPC): ingest_now / outgest_now / status
 
-The startup log reports the resolved path for each binary (or the degradation
-note if absent). Check `~/Photos/framelog.log` after first start to confirm
-which capabilities are active.
+Framelog.app (Swift menu bar)
+├── polls catalog.db read-only every 15s (photo count, last import)
+├── pings Unix socket to detect core alive vs. crashed vs. never installed
+├── fires UserNotifications on import delta
+└── touches trigger files for Run Ingest / Run Outgest buttons
+```
+
+See `docs/PROTOCOL.md` for the frozen core↔frontend contract.
+
+---
+
+## IPC reference
+
+**Socket:** `~/Library/Application Support/Framelog/framelog.sock`
+
+```bash
+echo '{"command":"status"}' | nc -U ~/Library/"Application Support"/Framelog/framelog.sock
+echo '{"command":"ingest_now"}' | nc -U ~/Library/"Application Support"/Framelog/framelog.sock
+echo '{"command":"outgest_now"}' | nc -U ~/Library/"Application Support"/Framelog/framelog.sock
+```
+
+Full shapes in `docs/PROTOCOL.md §3`.
+
+---
+
+## Development
+
+```bash
+# Go tests (no external binaries required except git):
+cd core && go test ./... -race
+
+# Xcode tests:
+cd .. && make test
+
+# Reset test environment:
+cd core && make reset
+```
+
+No test requires `exiftool`, `diskutil`, `pmset`, `pgrep`, or `rclone` on PATH — all
+external binaries use injectable paths and tests substitute fake shell scripts.
 
 ---
 
 ## Phase status
 
-Phase 1 (Go primitives), complete:
+**Phase 1–4: complete.**
 
-- [x] FL-101 — `core/config`
-- [x] FL-102 — `core/hasher`
-- [x] FL-103 — `core/db` (InitDB, InsertPhoto, HashExists, UpdateStatus, PhotoCount, LastImport)
-- [x] FL-104 — `core/exif` (injectable binary path)
-- [x] FL-105 — `core/xmp` (WriteXMP, xpacket wrapper, dc:subject keyword bag)
-- [x] FL-106 — `core/gitops` (FindGit, Commit, FindPmset, IsOnACPower, Push)
+**Phase 5 (migration/cutover):**
+- [x] FL-501 — cold-start verification
+- [x] FL-502/503 — real-hardware SD card + Lightroom XMP pipeline tested end-to-end
+- [x] FL-504 — docs rewritten against actual architecture
 
-Phase 2 (orchestration), complete:
+**Phase 6 (distribution):**
+- [ ] FL-601 — codesigning + notarization (requires $99 Apple Developer account; deferred)
+- [x] FL-602 — single `VERSION` file drives `framelogd --version` and `CFBundleShortVersionString`
+- [x] FL-603 — `framelogd` bundled in `Framelog.app/Contents/MacOS/`; `make release` produces DMG; Install Core button
+- [x] FL-604 — four-state status display; socket ping distinguishes crash/never-installed/running
 
-- [x] FL-206 — `core/logging`
-- [x] FL-201 — `core/ingest` (Pipeline, ImportFile copy-before-delete, RunIngest, concurrency guard, backup call)
-- [x] FL-202 — `core/outgest` (Pipeline, OrganizeFile, RunOutgest, UpdateStatusByHashPrefix)
-- [x] FL-203 — `core/sdcard` (FindDiskutil, IsRemovableMedia, HasDCIM, FindSDCard, CopyDCIM, Watcher)
-- [x] FL-204 — `core/xmpwatcher` (FindPgrep, IsLightroomRunning, Watcher; debounce+commit+push gated on AC and LR closed)
-- [x] FL-205 — `core/outgestwatcher` (Watcher; single-dir non-recursive, debounce)
-- [x] FL-207 — `core/backup` (FindRclone, IsDriveMounted, Sync via rclone copy)
-
-Phase 3 (IPC & launchd), complete:
-
-- [x] FL-301 — `core/triggerwatcher` (2s poll; both `.ingest_trigger` and `.outgest_trigger`; remove-before-act)
-- [x] FL-302 — `core/ipc` (Unix socket; `ingest_now`, `outgest_now`, `status`; status never blocks on pipeline locks)
-- [x] FL-303 — `core/launchd` (FindLaunchctl, GeneratePlist, Install, Uninstall)
-- [x] FL-304 — `core/cmd/framelogd` (`run`/`install`/`uninstall`/`--version`; testable `runConfig`; cold-start and end-to-end socket tests)
-
-Phase 4 (Swift frontend), complete:
-
-- [x] FL-401 — `MenuBarExtra` skeleton, `LSUIElement=YES`, `photo.stack` icon
-- [x] FL-402 — `SMAppService.mainApp.register/unregister` login-item toggle
-- [x] FL-403 — Read-only SQLite (photo count, last import); log-tail reader; 15s timer; three display states
-- [x] FL-404 — "Run Ingest Now" / "Run Outgest Now" (v1 trigger files; socket migration pending — see FL-404 follow-up in PROTOCOL.md)
-- [x] FL-405 — `UserNotifications` on import delta
-- [x] FL-406 — "Open Log File" / "Run Setup" / "Quit Framelog"
-
-Phase 5 (cutover), in progress:
-
-- [x] FL-501 — Cold-start verification (`TestColdStart_DirectoriesAndDB`); `~/Photos` test data cleared
-- [ ] FL-502/503 — Real-hardware runbook written (`docs/PHASE5_RUNBOOK.md`); pending manual execution
-- [x] FL-504 — Docs rewritten against actual architecture (this file; `CLAUDE.md` added)
-
----
-
-## Day-to-day
-
-**Install the daemon:**
-```bash
-cd ~/dev/framelog/core
-go build -ldflags "-X main.Version=$(cat ../VERSION)" -o framelogd ./cmd/framelogd
-./framelogd install
-```
-
-**Check status:**
-```bash
-echo '{"command":"status"}' | nc -U ~/Library/"Application Support"/Framelog/framelog.sock
-```
-
-**View logs:**
-```bash
-tail -f ~/Photos/framelog.log
-```
-
-**Uninstall:**
-```bash
-./framelogd uninstall
-```
-
-For a clean reinstall from scratch, follow `docs/PHASE5_RUNBOOK.md`.
+**Distribution:**
+- Homebrew tap: `brew tap thevedantmodi/framelog` (see `homebrew/framelog.rb`)
+- GitHub Releases: DMG built by `make release`
 
 ---
 
 ## Decommissioned
 
-The Python version (`menubar.py`, `on_sd_mount.sh`, `~/.framelog/`) and its two
-launchd jobs (`com.framelog.sdcard`, `com.framelog.app`) have been replaced.
-See `docs/PHASE5_RUNBOOK.md §11` for the decommission steps.
+The Python version (`menubar.py`, `on_sd_mount.sh`) and its launchd jobs
+(`com.framelog.sdcard`, `com.framelog.app`) have been fully replaced.

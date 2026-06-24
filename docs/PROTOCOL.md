@@ -1,17 +1,16 @@
 # PROTOCOL.md — Framelog core ↔ frontend contract
 
-This is the only thing the Go core and the Swift menu bar need to agree on. Either side
-should be buildable from this document alone, without reading the other side's source.
+The only thing the Go core and the Swift menu bar need to agree on. Either side is
+buildable from this document alone without reading the other side's source. Any change
+to the contract must be reflected here in the same commit — this is part of the
+Definition of Done for every ticket.
 
-Status: **resolved draft** — the three open questions from the first pass are decided
-below (§6, with rationale, since this is a solo project rather than a team that needs
-sign-off). Flip any of them before starting Phase 1 if you disagree; just update this
-file in the same commit. Treat changes to this file as part of the same PR that changes
-the contract (Definition of Done, roadmap).
+**Status: implemented and tested.** All sections below describe the current shipped
+behaviour, not a design draft.
 
 ---
 
-## 1. `catalog.db` schema (frozen contract — core writes, frontend reads)
+## 1. `catalog.db` schema (core writes, frontend reads read-only)
 
 ```sql
 CREATE TABLE IF NOT EXISTS photos (
@@ -20,75 +19,54 @@ CREATE TABLE IF NOT EXISTS photos (
     imported_path     TEXT,
     camera_model      TEXT,
     capture_date      TEXT,
-    import_timestamp  TEXT,
+    import_timestamp  TEXT,     -- ISO 8601, UTC
     gps_lat           REAL,
     gps_lon           REAL,
     status            TEXT DEFAULT 'raw'  -- raw | edited | published
 );
 ```
 
-- Core opens with `PRAGMA journal_mode=WAL;` and a `busy_timeout` of at least 2000ms.
-  (FL-004)
-- Frontend opens **read-only** (`?mode=ro` DSN or equivalent). Never writes to this file.
-- **Decision: `status` is kept, but only auto-set by two pipeline events, not three.**
-  `culled` is dropped from the enum — nothing in the current pipeline has a signal for
-  "the user decided to keep/discard this," so it would ship unused exactly like the
-  Python version's lifecycle did. The two that *do* have a real trigger:
-  - `ingest` sets `raw` on insert (FL-201, unchanged).
-  - The XMP watcher (FL-204) sets `edited` on the matching `hash` when it commits a
-    sidecar change for that file — this is a real signal (Lightroom touched the XMP) and
-    costs nothing extra to wire, since the watcher already knows which file changed.
-  - `outgest` (FL-202) sets `published` when a file with a matching hash moves through
-    `processed/`. Matching is by filename stem (`<hash8>` is embedded in the original
-    filename) since outgest doesn't re-hash exports.
-  - If you don't want this at all, simplest alternative is dropping the column entirely —
-    just don't leave it half-wired a second time.
+- Core opens with `PRAGMA journal_mode=WAL;` and `busy_timeout=2000`.
+- Frontend opens read-only using the `immutable=1` URI parameter
+  (`file:<path>?immutable=1`) to avoid needing write access for the WAL `-shm` file.
+  Frontend never writes to this file.
+- `status` lifecycle:
+  - `raw` — set on ingest insert.
+  - `edited` — set by the XMP watcher when it commits a sidecar change for that file's
+    `hash8` prefix (real signal: Lightroom wrote to the file).
+  - `published` — set by outgest when a file with a matching `hash8` prefix moves through
+    `processed/`. Matching is by embedded filename stem, not re-hashing.
 
-## 2. v1 IPC — trigger file (FL-301)
+## 2. v1 IPC — trigger files (current Swift button implementation)
 
-- Path: `~/Photos/.ingest_trigger`
-- Frontend creates an empty file at this path to request an ingest run.
-- Core polls for its existence (or watches it via the same `fsnotify` instance used for
-  FL-203/204, to avoid a second poll loop), deletes it, then runs ingest. No payload —
-  pure signal, not a command channel.
-- **Why this still exists even though the SD-card watcher moved in-process (FL-203):**
-  in the Python version, this file was the *only* way `on_sd_mount.sh` (a separate bash
-  process) could tell `menubar.py` to ingest. In the Go core, SD-card-triggered ingest
-  needs no IPC at all anymore — the watcher just calls `ingest.RunIngest()` directly in
-  the same binary. The trigger file's only remaining job is the frontend's manual
-  "Run Ingest Now" button, as the fast path to get that working before FL-302 exists.
-  Once FL-404 is wired to the socket, this file can be deleted from the contract — note
-  that deprecation here when it happens, don't just let it linger unused.
+| File | Trigger |
+|------|---------|
+| `~/Photos/.ingest_trigger` | "Run Ingest Now" button |
+| `~/Photos/.outgest_trigger` | "Run Outgest Now" button |
 
-### `~/Photos/.outgest_trigger` *(added FL-404, 2026-06-23 — contract extended from Swift side; Go-side polling implemented in FL-301)*
+Frontend creates an empty file; core polls every 2 seconds, **deletes the file before
+acting** (remove-before-act: if the runner fails mid-run, the trigger does not re-fire on
+the next tick), then runs the pipeline. No payload — pure signal.
 
-- Follows the identical pattern as `.ingest_trigger`: frontend creates an empty file at
-  this path to request an outgest run, core polls for its existence, deletes it, then
-  runs outgest. No payload — pure signal, not a command channel.
-- Go-side polling is implemented in `core/triggerwatcher` (FL-301). Both `.ingest_trigger`
-  and `.outgest_trigger` are polled in the same 2-second tick loop.
-- **Follow-up (FL-404 migration):** now that the socket (FL-302) is real and tested, FL-404
-  should be updated to send `{"command":"outgest_now"}` over the socket instead of touching
-  the trigger file. Once that migration lands, both trigger-file paths can be retired from
-  this contract.
+**Planned migration (FL-404 follow-up):** once the Swift app's buttons are wired to the
+socket (`ingest_now` / `outgest_now` commands), both trigger files can be retired. Note
+that deprecation here when it happens.
 
-## 3. v2 IPC — Unix domain socket (FL-302) — **implemented and tested**
+## 3. v2 IPC — Unix domain socket (primary, implemented)
 
-- Path: `~/Library/Application Support/Framelog/framelog.sock`
-- Transport: line-delimited JSON. **One connection per request** — dial, write one JSON
-  line + `\n`, read one JSON line response, close. Not a persistent/streaming connection.
-  This keeps the frontend's reconnect logic trivial (just dial again next time) and means
-  a core restart never leaves the frontend holding a dead connection.
-- Frontend dial timeout: 2 seconds. No response (or connection refused, or the socket
-  file doesn't exist) within that window = render "core unreachable" (FL-604). Don't
-  retry more than once before showing that state — a hung core shouldn't make the menu
-  bar itself feel unresponsive.
-- Server-side `ReadDeadline`: 5 seconds. A client that connects and never writes is dropped
-  after this window — prevents goroutine leaks from silent clients.
+**Path:** `~/Library/Application Support/Framelog/framelog.sock`
+
+**Transport:** line-delimited JSON. One connection per request — dial, write one JSON line
++ `\n`, read one JSON line response, close. Not a persistent connection. A core restart
+never leaves the frontend holding a dead connection.
+
+**Connection semantics:**
+- Frontend dial timeout: 2 seconds.
+- No response / connection refused / socket file absent → core unreachable (see §4).
+- Server-side `ReadDeadline`: 5 seconds. Silent clients are dropped after this window.
 - Socket permissions: 0600 (user-only). Stale socket files from unclean shutdowns are
   removed automatically on server startup.
-- Every response includes `"protocol_version": 1` so a future frontend/core pairing that
-  drifts out of sync fails loudly instead of silently misparsing fields.
+- Every response includes `"protocol_version": 1` for forward-compatibility detection.
 
 **Requests:**
 
@@ -103,84 +81,137 @@ CREATE TABLE IF NOT EXISTS photos (
 ```json
 {"protocol_version": 1, "ok": true, "imported": 3, "skipped": 1, "failed": 0}
 {"protocol_version": 1, "ok": true, "moved": 2, "skipped": 0, "failed": 0}
-{"protocol_version": 1, "ok": true, "ingest_running": false, "outgest_running": false, "photo_count": 4213, "last_import": "2026-06-20T14:02:00Z", "backup_drive_mounted": true}
+{"protocol_version": 1, "ok": true, "ingest_running": false, "outgest_running": false,
+ "photo_count": 4213, "last_import": "2026-06-20T14:02:00Z", "backup_drive_mounted": true}
 {"protocol_version": 1, "ok": false, "error": "ingest_already_running"}
+{"protocol_version": 1, "ok": false, "error": "outgest_already_running"}
 {"protocol_version": 1, "ok": false, "error": "unknown_command"}
+{"protocol_version": 1, "ok": false, "error": "bad_request"}
 ```
 
-- **Concurrency is the core's job, not the frontend's.** In the Python version, the
-  `_ingest_running` guard lived in `menubar.py` (the frontend) — that only worked because
-  ingest and the UI shared a process. Now that the SD-card watcher and a manual
-  `ingest_now` request can race from two different goroutines inside the *core*, the core
-  must hold its own mutex/flag around `RunIngest`/`RunOutgest` and return
-  `{"ok": false, "error": "ingest_already_running"}` rather than queuing or blocking the
-  caller. The frontend just displays that error; it doesn't retry automatically.
-- `status` must be served by a separate, always-available handler — don't let it share a
-  lock with `ingest_now`/`outgest_now`, or a slow ingest makes the core *look*
-  unreachable when it's actually just busy. That distinction (busy vs. unreachable)
-  matters to FL-604.
-- Unknown/malformed JSON on the request line → `{"ok": false, "error": "bad_request"}`,
-  connection closed after responding. Don't crash the listener goroutine on bad input.
+**Concurrency:** the core holds its own mutex around `RunIngest`/`RunOutgest` and returns
+`ingest_already_running` / `outgest_already_running` rather than queuing. The frontend
+displays the error; it does not retry automatically.
 
-## 4. Notification / freshness model (resolves the gap in the original draft)
+**`status` is served by a separate handler** that never shares a lock with
+`ingest_now`/`outgest_now`. A slow ingest must not make the core look unreachable to a
+polling status client.
 
-The original draft only covered request/response, but FL-405 (notifications) needs the
-frontend to learn about ingests it didn't ask for — an SD card mounting fires ingest
-entirely inside the core, with no frontend request involved at all. One-shot
-connect/respond has no channel for the core to push that.
+**Error strings match wire JSON exactly.** `ErrIngestAlreadyRunning.Error()` returns
+`"ingest_already_running"` — used verbatim as the JSON `"error"` field value.
 
-**Decision: no push channel. The frontend polls `status` on a timer (15s — frequent
-enough to feel responsive, cheap enough since it's a local socket round-trip, not a DB
-query) and diffs `last_import`/`photo_count` against its previous poll.** If
-`last_import` advanced since the last poll, fire a local `UserNotification`. This is the
-same pattern `menubar.py`'s `@rumps.timer(30)` → `_refresh_status()` already used; it's
-just relocated to the other side of an IPC boundary now. Keeps both ends simple — no
-second message type, no long-lived connection to manage reconnection logic for.
+## 4. Core reachability and status display (FL-604)
 
-## 5. Log line format
+The Swift app determines display state by combining a **socket ping** (POSIX `connect()`
+to the socket path — returns in microseconds) with the **DB snapshot**:
+
+| Socket | DB | Display |
+|--------|-----|---------|
+| down | missing | "Install Core to get started" |
+| down | exists | "Core restarting…" (launchd recovering from crash) |
+| up | empty | "No photos imported yet" |
+| up | has photos | "N photos · last import: X ago" |
+
+"Core restarting…" is the key distinction: when `framelogd` crashes, launchd restarts it
+automatically (`KeepAlive=true`). During that window `catalog.db` still exists from the
+last run. Without the socket ping, the menu bar would silently show stale data as if
+everything were fine.
+
+## 5. Notification / freshness model
+
+No push channel. The frontend polls `status` on a 15-second timer and diffs
+`last_import` / `photo_count` against the previous poll. If `last_import` advanced, a
+local `UserNotification` fires. This handles SD-card-triggered ingests (which happen
+entirely inside the core with no frontend request).
+
+**Do not change the 15-second poll interval** without also updating this document and
+verifying the UNUserNotificationCenter throttling does not suppress rapid successive
+notifications.
+
+## 6. XMP / git behaviour
+
+**Non-DNG files** (RAF, CR3, ARW, HEIC, JPG): Lightroom writes a `.xmp` sidecar next to
+the file. The XMP watcher detects the write via fsnotify, waits 10 seconds (debounce to
+collapse burst edits), then runs `git add -A && git commit` in `originals/`.
+
+**DNG files**: DNG embeds XMP internally. Lightroom writes edits back into the DNG file
+itself (not a sidecar). Ingest does **not** create a `.xmp` sidecar for DNG files —
+doing so causes Lightroom to read the sidecar instead of the embedded data, hiding develop
+edits. The XMP watcher detects a WRITE event on the `.dng` file, then runs
+`exiftool -xmp -b <file>` to extract the embedded XMP packet and writes it to a `.xmp`
+sidecar. The sidecar is then committed by git. This keeps the git history small (XMP
+bytes only, not the full DNG binary).
+
+**Formats that embed XMP** are defined in `config.EmbeddedXMPExtensions`. Adding a new
+format here automatically applies the extraction behaviour in both ingest and xmpwatcher.
+
+**`originals/` git tracking:**
+
+```gitignore
+# managed by framelogd — only XMP sidecars are tracked
+*
+!*/
+!*.xmp
+!.gitignore
+```
+
+`!*/` is required to un-ignore subdirectories. Without it, `*` ignores `2025/` and
+`!*.xmp` never applies to files inside it.
+
+**Push gate:** after committing, the watcher pushes only if both:
+- `pmset` reports AC power, **and**
+- `pgrep -i lightroom` finds no match (Lightroom is closed)
+
+If either binary is absent, that gate is skipped.
+
+## 7. Log line format
 
 ```
 2026-06-22 14:03:11 [INGEST] Done: 3 imported, 1 skipped, 0 failed
 ```
 
-`TIMESTAMP [PREFIX] message`, one logger, always flushed. Closed set of prefixes —
-add to this list in the same PR that introduces a new one, don't invent ad hoc tags:
+`TIMESTAMP [PREFIX] message` — one logger, always flushed (`fsync` on every write).
 
-`INGEST` · `OUTGEST` · `XMP` · `BACKUP` · `GIT` · `CORE`
+Closed set of prefixes — add to this list in the same commit that introduces a new one:
 
-Frontend tails this file for the log viewer (FL-403/FL-406). No bare
-`print()`-equivalent anywhere in the core — the Python version's `ingest.py` vs.
-`outgest.py` split doesn't get a sequel here.
+`CORE` · `INGEST` · `OUTGEST` · `XMP` · `GIT` · `BACKUP`
 
-## 6. Resolved decisions (were open questions in the first draft)
+Frontend tails this file for the log viewer. No bare `print()` anywhere in the core.
 
-- **`crs:` XMP namespace — out of scope for v1.** Nothing in this pipeline ever wrote
-  develop-settings XMP (Lightroom owns those tags via its own writes); the Python
-  version registered the namespace but never emitted a `crs:` element. Don't register
-  it in `xmp` (FL-105) unless a real feature needs it later.
-- **`gitops` — shell out to the `git` CLI, not `go-git`, for v1.** Matches the Python
-  version's tested behavior exactly (same commands, same output parsing), and it's an
-  internal package behind a small interface (`Commit`/`Push`) — swapping the
-  implementation to `go-git` later, if the CLI dependency ever becomes a real problem,
-  doesn't change anything on the other side of that interface.
-- **Backup target — confirmed: `rclone copy` of `originals/` to `BACKUP_PATH`, run after
-  a successful ingest batch (FL-207).** Replaces the old (disabled) Python behavior of
-  syncing the raw SD card pre-ingest. `copy`, not `sync` — a bad delete on the source
-  side must never propagate to the backup.
-
-## 7. File layout on disk
+## 8. File layout on disk
 
 ```
 ~/Photos/
-├── inbox/              ← landing zone, cleared after import
-├── originals/YYYY/MM/DD/<ts>_<hash8>.ext + .xmp
-├── processed/YYYY/MM/   ← Lightroom exports, organized by outgest
-├── catalog.db
-└── framelog.log
+├── inbox/                    ← SD card landing zone, cleared after import
+├── originals/YYYY/MM/DD/     ← imported files + .xmp sidecars; git-tracked
+│   └── .git/                 ← tracks .xmp sidecars only (see gitignore above)
+├── processed/YYYY/MM/        ← Lightroom exports, organised by outgest
+├── catalog.db                ← SQLite WAL; core writes, frontend reads immutable
+└── framelog.log              ← structured log
 
 ~/Library/LaunchAgents/
-└── com.framelog.core.plist   ← installed by the core itself (FL-303)
+└── com.framelog.core.plist   ← installed by `framelogd install` (FL-303)
 
 ~/Library/Application Support/Framelog/
-└── framelog.sock              ← v2 IPC socket (FL-302)
+└── framelog.sock             ← v2 IPC socket (FL-302)
+
+~/Library/Logs/Framelog/
+└── crash.log                 ← launchd stdout/stderr; empty in normal operation
 ```
+
+## 9. Resolved design decisions
+
+- **`crs:` XMP namespace** — out of scope. Nothing in this pipeline writes develop-settings
+  XMP; Lightroom owns those tags via its own writes. Not registered in `core/xmp`.
+- **`gitops` uses the `git` CLI**, not `go-git`. Matches tested Python behaviour; the
+  injectable-path pattern makes it testable without a real git on PATH in CI.
+- **Backup uses `rclone copy`**, not `rclone sync`. A bad delete on the source must never
+  propagate to the backup.
+- **`outgestwatcher` watches only the top-level `processed/` directory**, never
+  subdirectories. `YYYY/MM/` folders created by a prior outgest run must not trigger a
+  re-scan of already-organised files.
+- **XMP watcher skips `.git/`** during initial walk. Watching git internals would leak
+  fsnotify watches on every commit the watcher itself makes.
+- **Socket path is capped at 104 bytes** (macOS `sockaddr_un` limit). Tests use
+  `os.MkdirTemp("", "prefix*")` under `/tmp` (short paths), not `t.TempDir()` (long
+  paths under the test cache). Violations surface as `bind: invalid argument`.
