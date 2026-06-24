@@ -5,7 +5,7 @@ struct menubarApp: App {
     @StateObject private var status = FramelogStatus()
 
     var body: some Scene {
-        MenuBarExtra("Framelog", systemImage: "photo.stack") {
+        MenuBarExtra("Framelog", image: "MenuBarIcon") {
             ContentView()
                 .environmentObject(status)
         }
