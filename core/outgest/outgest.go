@@ -27,6 +27,13 @@ import (
 // PROTOCOL.md §3 (same pattern as ingest's ErrIngestAlreadyRunning).
 var ErrOutgestAlreadyRunning = errors.New("outgest_already_running")
 
+// Runner is the minimal interface consumers of outgest need. *Pipeline satisfies
+// it. Defined here so packages that depend on outgest behaviour (outgestwatcher,
+// ipc, triggerwatcher) can accept a fake in tests without a full Pipeline.
+type Runner interface {
+	RunOutgest() (Counts, error)
+}
+
 // Result describes the outcome of a single OrganizeFile call.
 type Result string
 
@@ -70,6 +77,14 @@ func (p *Pipeline) Release() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.running = false
+}
+
+// OutgestRunning reports whether a RunOutgest call is currently in progress.
+// Mirrors ingest.Pipeline.IngestRunning — used by the IPC status handler.
+func (p *Pipeline) OutgestRunning() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.running
 }
 
 // captureLayout is exiftool's DateTimeOriginal format, identical to what

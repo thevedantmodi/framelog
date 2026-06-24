@@ -40,13 +40,22 @@ func FindRclone() (string, error) {
 	return "", fmt.Errorf("rclone not found. Install it with: brew install rclone")
 }
 
+// IsDriveMounted reports whether backupPath exists and is a directory.
+// Returns false without error when the drive is absent — an unmounted backup
+// drive is the expected normal state between ingest runs, not a failure.
+// Used by Sync internally and by the IPC status handler (FL-302) to populate
+// the backup_drive_mounted field in the status response.
+func IsDriveMounted(backupPath string) bool {
+	fi, err := os.Stat(backupPath)
+	return err == nil && fi.IsDir()
+}
+
 // Sync copies originalsPath into backupPath/originals/ using rclone copy.
 // Returns (false, nil) without invoking rclone when backupPath does not exist
 // or is not a directory — an unmounted backup drive is expected, not an error.
 // Returns (false, err) when rclone exits non-zero; err wraps stderr output.
 func Sync(rclonePath, originalsPath, backupPath string) (bool, error) {
-	fi, err := os.Stat(backupPath)
-	if err != nil || !fi.IsDir() {
+	if !IsDriveMounted(backupPath) {
 		return false, nil
 	}
 

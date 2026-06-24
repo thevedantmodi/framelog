@@ -231,6 +231,7 @@ func TestConcurrent(t *testing.T) {
 		DiskutilPath: diskutil,
 		VolumesRoot:  volumes,
 		InboxPath:    inbox,
+		PollInterval: 100 * time.Millisecond,
 		Runner:       ingestPipeline,
 		Logger:       logger,
 	}
@@ -259,6 +260,8 @@ func TestConcurrent(t *testing.T) {
 	// wait period.
 	var panicVal atomic.Value
 
+	sdStop := make(chan struct{})
+
 	launchWatcher := func(name string, fn func() error) {
 		go func() {
 			defer func() {
@@ -267,20 +270,24 @@ func TestConcurrent(t *testing.T) {
 				}
 			}()
 			if err := fn(); err != nil {
-				// Run() returning after Stop() is the normal path; log it but
-				// don't fail — the assertions below are the real checks.
 				t.Logf("watcher %s Run() returned: %v", name, err)
 			}
 		}()
 	}
 
-	launchWatcher("sdcard", sdW.Run)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicVal.Store(fmt.Sprintf("watcher sdcard panicked: %v", r))
+			}
+		}()
+		sdW.Run(sdStop) //nolint:errcheck
+	}()
 	launchWatcher("xmpwatcher", xmpW.Run)
 	launchWatcher("outgestwatcher", outgestW.Run)
 
-	// Wait for all three watchers to set up their fsnotify watches before we
-	// fire any events. 200 ms is generous; the watches are set up on startup.
-	time.Sleep(200 * time.Millisecond)
+	// Polling watcher needs no setup delay.
+	time.Sleep(50 * time.Millisecond)
 
 	// ---- fire all three triggers simultaneously ------------------------------
 	// Use a closed channel to unblock all three goroutines at the same
@@ -343,16 +350,16 @@ func TestConcurrent(t *testing.T) {
 	close(release)    // unblock all three goroutines simultaneously
 	triggered.Wait() // wait for all three writes to complete before sleeping
 
-	// Wait generously past all debounce windows and the SD card settle delay.
+	// Wait past all debounce windows and the sdcard poll interval.
 	// Timeline:
 	//   ~50ms  — xmpwatcher debounce fires → git commit + DB update
 	//   ~50ms  — outgestwatcher debounce fires → RunOutgest → DB update
-	//   ~2s    — sdcard settle delay fires → CopyDCIM + RunIngest → git commit + DB insert
+	//   ~100ms — sdcard poll tick fires → CopyDCIM + RunIngest → git commit + DB insert
 	//   + buffer
-	time.Sleep(5 * time.Second)
+	time.Sleep(3 * time.Second)
 
 	// Stop all watchers before asserting so no further events race with reads.
-	sdW.Stop()
+	close(sdStop)
 	xmpW.Stop()
 	outgestW.Stop()
 	time.Sleep(100 * time.Millisecond) // let goroutines drain

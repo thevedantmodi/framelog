@@ -77,7 +77,11 @@ const ExifTimeFormat = "2006:01:02 15:04:05"
 // the error includes stderr so the cause is visible without re-running manually.
 func ReadExif(path, exiftoolPath string) (Metadata, error) {
 	var stderr bytes.Buffer
-	cmd := exec.Command(exiftoolPath, "-json", path)
+	// -n suppresses exiftool's print conversions so GPS fields arrive as decimal
+	// float64 rather than DMS strings like "25 deg 12' 34.56\" N". Without -n,
+	// cameras (notably DJI drones) that store GPS in the composite DMS tag return
+	// a string exiftoolJSON cannot unmarshal into *float64.
+	cmd := exec.Command(exiftoolPath, "-json", "-n", path)
 	cmd.Stderr = &stderr
 
 	out, err := cmd.Output()

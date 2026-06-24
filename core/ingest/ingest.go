@@ -40,6 +40,14 @@ import (
 // "error" field with no mapping table.
 var ErrIngestAlreadyRunning = errors.New("ingest_already_running")
 
+// Runner is the minimal interface consumers of ingest need. *Pipeline satisfies
+// it. Defined here so packages that depend on ingest behaviour (sdcard, ipc,
+// triggerwatcher) can accept a fake implementation in tests without wiring up a
+// full Pipeline with real exiftool/git/pmset.
+type Runner interface {
+	RunIngest() (Counts, error)
+}
+
 // Pipeline holds resolved dependencies for an ingest run. Binary paths
 // (ExiftoolPath, GitPath, PmsetPath) are resolved once by the caller via the
 // Find* functions in each package and reused across every file in the batch —
@@ -79,6 +87,15 @@ func (p *Pipeline) Release() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.running = false
+}
+
+// IngestRunning reports whether a RunIngest call is currently in progress.
+// Used by the IPC status handler (FL-302) to populate the ingest_running field
+// without blocking on any long-running pipeline method.
+func (p *Pipeline) IngestRunning() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.running
 }
 
 // Result describes the outcome of a single ImportFile call.
@@ -148,9 +165,14 @@ func (p *Pipeline) ImportFile(srcPath, batchID string) (Result, error) {
 		return p.fail(srcPath, fmt.Errorf("copy to %s: %w", dest, err))
 	}
 
-	// 8. XMP sidecar next to the dest file.
-	if _, err := xmp.WriteXMP(dest, batchID, meta.CameraModel); err != nil {
-		return p.fail(srcPath, fmt.Errorf("xmp: %w", err))
+	// 8. XMP sidecar next to the dest file — skipped for formats that embed XMP
+	// internally (see config.EmbeddedXMPExtensions). Writing a sidecar next to
+	// those files causes Lightroom to read the sidecar and ignore the embedded
+	// data, hiding develop edits.
+	if !config.EmbeddedXMPExtensions[ext] {
+		if _, err := xmp.WriteXMP(dest, batchID, meta.CameraModel); err != nil {
+			return p.fail(srcPath, fmt.Errorf("xmp: %w", err))
+		}
 	}
 
 	// 9. DB insert. GPS fields flow straight from Metadata — this is the fix for
@@ -167,6 +189,11 @@ func (p *Pipeline) ImportFile(srcPath, batchID string) (Result, error) {
 		GPSLon:           meta.GPSLon,
 	}
 	if err := db.InsertPhoto(p.DB, photo); err != nil {
+		// UNIQUE constraint means a previous ingest already recorded this hash
+		// (e.g. originals/ was wiped but catalog.db was not). Treat as duplicate.
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return ResultSkipped, nil
+		}
 		return p.fail(srcPath, fmt.Errorf("db insert: %w", err))
 	}
 
@@ -246,6 +273,7 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 	if err != nil {
 		p.Logger.Log(logging.PrefixGit, fmt.Sprintf("commit error: %v", err))
 	} else if committed {
+		p.Logger.Log(logging.PrefixGit, fmt.Sprintf("commit: %s", msg))
 		onAC, err := gitops.IsOnACPower(p.PmsetPath)
 		if err != nil {
 			p.Logger.Log(logging.PrefixGit, fmt.Sprintf("pmset error: %v", err))

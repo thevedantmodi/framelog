@@ -22,17 +22,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
+	"github.com/thevedantmodi/framelog/core/config"
 	"github.com/thevedantmodi/framelog/core/ingest"
 	"github.com/thevedantmodi/framelog/core/logging"
 )
-
-// IngestRunner is the minimal interface the Watcher needs from ingest.Pipeline.
-// ingest.Pipeline already satisfies it. The interface exists so tests can
-// inject a fake runner without wiring up a full Pipeline with exiftool/git/pmset.
-type IngestRunner interface {
-	RunIngest() (ingest.Counts, error)
-}
 
 // diskutilCandidates is the ordered list of known diskutil locations on macOS.
 // Package-level var (not const) so FindDiskutil tests can force the LookPath branch.
@@ -122,13 +115,25 @@ func FindSDCard(diskutilPath, volumesRoot string) (string, error) {
 // non-clobbering — if a file already exists at the destination it is skipped
 // entirely, protecting a file left over from a previous interrupted run.
 // Returns the count of files actually copied (not counting skips).
-func CopyDCIM(sdDCIMPath, inboxPath string) (int, error) {
+//
+// The optional onCopy callback is invoked after each successful file copy with
+// the source file's base name and the running copied-so-far count. Pass nil
+// (or omit) when progress reporting is not needed.
+func CopyDCIM(sdDCIMPath, inboxPath string, onCopy ...func(filename string, n int)) (int, error) {
+	var cb func(string, int)
+	if len(onCopy) > 0 {
+		cb = onCopy[0]
+	}
+
 	var count int
 	err := filepath.WalkDir(sdDCIMPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
+			return nil
+		}
+		if !config.SupportedExtensions[strings.ToLower(filepath.Ext(path))] {
 			return nil
 		}
 		rel, err := filepath.Rel(sdDCIMPath, path)
@@ -149,144 +154,141 @@ func CopyDCIM(sdDCIMPath, inboxPath string) (int, error) {
 			return err
 		}
 		count++
+		if cb != nil {
+			cb(filepath.Base(path), count)
+		}
 		return nil
 	})
 	return count, err
 }
 
-// Watcher watches VolumesRoot for new mounts, detects SD cards among them, and
-// calls Runner.RunIngest after copying DCIM contents to InboxPath.
+// Watcher polls VolumesRoot for new mounts, detects SD cards, and fires
+// RunIngest after copying DCIM contents to InboxPath.
+//
+// macOS volume mounts are kernel-level synthetic filesystem ops not delivered
+// by FSEvents or kqueue; polling /Volumes every PollInterval is the reliable
+// fix. Cost is negligible — os.ReadDir on a directory with ~5 entries.
 type Watcher struct {
 	DiskutilPath string
 	VolumesRoot  string
 	InboxPath    string
-	Runner       IngestRunner
+	PollInterval time.Duration
+	Runner       ingest.Runner
 	Logger       *logging.Logger
 
-	// processed tracks volume names already handled during the current mount
-	// session. Cleared (via delete) when a Remove event fires for that name,
-	// so re-inserting the same card is correctly treated as new.
+	// seen is the set of volume names present on the last tick.
+	// processed is the set already handled this mount session.
+	// A name leaving seen is evicted from processed so re-insertion fires again.
+	seen      map[string]bool
 	processed map[string]bool
-
-	mu sync.Mutex
-	fw *fsnotify.Watcher // non-nil while Run() is executing
+	mu        sync.Mutex
 }
 
-// Stop closes the underlying fsnotify watcher, causing Run() to return nil.
-// Safe to call from another goroutine; no-op if Run() has not been called.
-func (w *Watcher) Stop() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.fw != nil {
-		w.fw.Close()
-	}
-}
-
-// Run watches VolumesRoot for mount/unmount events and fires ingest on SD card
-// detection. Blocks until Stop() is called or the underlying watcher fails.
-//
-// Watch is non-recursive: only entries appearing/disappearing directly under
-// VolumesRoot (i.e. actual mount points) generate events. File activity inside
-// an already-mounted volume does not.
-//
-// On each new-entry Create event:
-//  1. Skip if already in w.processed (duplicate event guard).
-//  2. Sleep 2 s — let a freshly-mounted volume settle before querying it.
-//  3. Check IsRemovableMedia && HasDCIM on the specific new path.
-//  4. If matched: CopyDCIM → RunIngest. ErrIngestAlreadyRunning is logged
-//     and treated as a normal outcome, not a fatal watcher error.
-//
-// On Remove: evict the name from w.processed so re-insertion triggers anew.
-func (w *Watcher) Run() error {
-	fw, err := fsnotify.NewWatcher()
-	if err != nil {
-		return fmt.Errorf("sdcard: fsnotify: %w", err)
+// Run polls VolumesRoot every PollInterval (default 2s) until stop is closed.
+func (w *Watcher) Run(stop <-chan struct{}) error {
+	interval := w.PollInterval
+	if interval == 0 {
+		interval = 2 * time.Second
 	}
 
 	w.mu.Lock()
-	w.fw = fw
-	if w.processed == nil {
-		w.processed = make(map[string]bool)
-	}
+	w.seen = make(map[string]bool)
+	w.processed = make(map[string]bool)
 	w.mu.Unlock()
 
-	defer func() {
-		w.mu.Lock()
-		w.fw = nil
-		w.mu.Unlock()
-		fw.Close()
-	}()
-
-	if err := fw.Add(w.VolumesRoot); err != nil {
-		return fmt.Errorf("sdcard: watch %s: %w", w.VolumesRoot, err)
-	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
 	for {
 		select {
-		case event, ok := <-fw.Events:
-			if !ok {
-				return nil // watcher closed via Stop()
-			}
-			name := filepath.Base(event.Name)
-			volPath := event.Name
-
-			switch {
-			case event.Op&fsnotify.Create != 0:
-				if w.processed[name] {
-					continue
-				}
-				// Settle delay: freshly-mounted volumes may not be queryable immediately.
-				time.Sleep(2 * time.Second)
-
-				removable, err := IsRemovableMedia(w.DiskutilPath, volPath)
-				if err != nil {
-					w.Logger.Log(logging.PrefixCore,
-						fmt.Sprintf("diskutil error for %s: %v", name, err))
-					continue
-				}
-				if !removable || !HasDCIM(volPath) {
-					continue
-				}
-
-				w.processed[name] = true
-				w.Logger.Log(logging.PrefixCore, "SD card detected: "+volPath)
-
-				n, err := CopyDCIM(filepath.Join(volPath, "DCIM"), w.InboxPath)
-				if err != nil {
-					w.Logger.Log(logging.PrefixCore,
-						fmt.Sprintf("DCIM copy error: %v", err))
-					// Fall through — files copied before the error still need ingest.
-				}
-				w.Logger.Log(logging.PrefixCore,
-					fmt.Sprintf("copied %d files from DCIM", n))
-
-				counts, err := w.Runner.RunIngest()
-				if err != nil {
-					if errors.Is(err, ingest.ErrIngestAlreadyRunning) {
-						w.Logger.Log(logging.PrefixCore,
-							"ingest already running, skipping SD card trigger")
-					} else {
-						w.Logger.Log(logging.PrefixCore,
-							fmt.Sprintf("ingest error: %v", err))
-					}
-				} else {
-					w.Logger.Log(logging.PrefixCore,
-						fmt.Sprintf("ingest done: %d imported, %d skipped, %d failed",
-							counts.Imported, counts.Skipped, counts.Failed))
-				}
-
-			case event.Op&fsnotify.Remove != 0:
-				delete(w.processed, name)
-			}
-
-		case err, ok := <-fw.Errors:
-			if !ok {
-				return nil
-			}
-			w.Logger.Log(logging.PrefixCore,
-				fmt.Sprintf("fsnotify error: %v", err))
+		case <-stop:
+			return nil
+		case <-ticker.C:
+			w.tick()
 		}
 	}
+}
+
+func (w *Watcher) tick() {
+	entries, err := os.ReadDir(w.VolumesRoot)
+	if err != nil {
+		w.Logger.Log(logging.PrefixCore,
+			fmt.Sprintf("sdcard: readdir %s: %v", w.VolumesRoot, err))
+		return
+	}
+
+	current := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			current[e.Name()] = true
+		}
+	}
+
+	w.mu.Lock()
+	seen := w.seen
+	processed := w.processed
+	w.mu.Unlock()
+
+	// Evict unmounted volumes so re-insertion fires again.
+	for name := range seen {
+		if !current[name] {
+			delete(processed, name)
+		}
+	}
+
+	// Check newly-appeared volumes.
+	for name := range current {
+		if seen[name] || processed[name] {
+			continue
+		}
+		seen[name] = true // mark seen regardless of whether it's an SD card
+
+		volPath := filepath.Join(w.VolumesRoot, name)
+		removable, err := IsRemovableMedia(w.DiskutilPath, volPath)
+		if err != nil {
+			w.Logger.Log(logging.PrefixCore,
+				fmt.Sprintf("diskutil error for %s: %v", name, err))
+			continue
+		}
+		if !removable || !HasDCIM(volPath) {
+			continue
+		}
+
+		processed[name] = true
+		w.Logger.Log(logging.PrefixCore, "SD card detected: "+volPath)
+		w.Logger.Log(logging.PrefixCore, "scanning DCIM (may take a moment on slow card readers)...")
+
+		logProgress := func(filename string, n int) {
+			w.Logger.Log(logging.PrefixCore,
+				fmt.Sprintf("copying [%d] %s → inbox/", n, filename))
+		}
+		n, copyErr := CopyDCIM(filepath.Join(volPath, "DCIM"), w.InboxPath, logProgress)
+		if copyErr != nil {
+			w.Logger.Log(logging.PrefixCore,
+				fmt.Sprintf("DCIM copy error: %v", copyErr))
+		}
+		w.Logger.Log(logging.PrefixCore,
+			fmt.Sprintf("copied %d files from DCIM", n))
+
+		counts, err := w.Runner.RunIngest()
+		if err != nil {
+			if errors.Is(err, ingest.ErrIngestAlreadyRunning) {
+				w.Logger.Log(logging.PrefixCore,
+					"ingest already running, skipping SD card trigger")
+			} else {
+				w.Logger.Log(logging.PrefixCore,
+					fmt.Sprintf("ingest error: %v", err))
+			}
+		} else {
+			w.Logger.Log(logging.PrefixCore,
+				fmt.Sprintf("ingest done: %d imported, %d skipped, %d failed",
+					counts.Imported, counts.Skipped, counts.Failed))
+		}
+	}
+
+	w.mu.Lock()
+	w.seen = current
+	w.mu.Unlock()
 }
 
 // copyFile copies src to dst with a sync before returning.

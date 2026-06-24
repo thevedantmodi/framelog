@@ -60,7 +60,19 @@ CREATE TABLE IF NOT EXISTS photos (
   Once FL-404 is wired to the socket, this file can be deleted from the contract — note
   that deprecation here when it happens, don't just let it linger unused.
 
-## 3. v2 IPC — Unix domain socket (FL-302)
+### `~/Photos/.outgest_trigger` *(added FL-404, 2026-06-23 — contract extended from Swift side; Go-side polling implemented in FL-301)*
+
+- Follows the identical pattern as `.ingest_trigger`: frontend creates an empty file at
+  this path to request an outgest run, core polls for its existence, deletes it, then
+  runs outgest. No payload — pure signal, not a command channel.
+- Go-side polling is implemented in `core/triggerwatcher` (FL-301). Both `.ingest_trigger`
+  and `.outgest_trigger` are polled in the same 2-second tick loop.
+- **Follow-up (FL-404 migration):** now that the socket (FL-302) is real and tested, FL-404
+  should be updated to send `{"command":"outgest_now"}` over the socket instead of touching
+  the trigger file. Once that migration lands, both trigger-file paths can be retired from
+  this contract.
+
+## 3. v2 IPC — Unix domain socket (FL-302) — **implemented and tested**
 
 - Path: `~/Library/Application Support/Framelog/framelog.sock`
 - Transport: line-delimited JSON. **One connection per request** — dial, write one JSON
@@ -71,6 +83,10 @@ CREATE TABLE IF NOT EXISTS photos (
   file doesn't exist) within that window = render "core unreachable" (FL-604). Don't
   retry more than once before showing that state — a hung core shouldn't make the menu
   bar itself feel unresponsive.
+- Server-side `ReadDeadline`: 5 seconds. A client that connects and never writes is dropped
+  after this window — prevents goroutine leaks from silent clients.
+- Socket permissions: 0600 (user-only). Stale socket files from unclean shutdowns are
+  removed automatically on server startup.
 - Every response includes `"protocol_version": 1` so a future frontend/core pairing that
   drifts out of sync fails loudly instead of silently misparsing fields.
 

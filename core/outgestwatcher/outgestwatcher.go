@@ -23,19 +23,11 @@ import (
 	"github.com/thevedantmodi/framelog/core/outgest"
 )
 
-// OutgestRunner is the minimal interface the Watcher needs from outgest.Pipeline.
-// outgest.Pipeline already satisfies it. The interface exists so tests can
-// inject a fake runner that just records call counts, decoupling watcher-
-// mechanics tests from needing a fully-wired Pipeline with real exiftool.
-type OutgestRunner interface {
-	RunOutgest() (outgest.Counts, error)
-}
-
 // Watcher watches ProcessedPath for new Lightroom exports and debounces bursts
 // into a single RunOutgest call.
 type Watcher struct {
 	ProcessedPath string
-	Outgest       OutgestRunner
+	Outgest       outgest.Runner
 	Logger        *logging.Logger
 	// DebounceDuration controls how long to wait after the last event before
 	// calling RunOutgest. Production code sets this from config.DebounceSeconds.

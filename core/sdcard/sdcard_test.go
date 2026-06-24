@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -319,19 +318,18 @@ func TestWatcher_Integration(t *testing.T) {
 	runner := &fakeRunner{notifyCh: notifyCh}
 	logger := openTestLogger(t)
 
+	stop := make(chan struct{})
 	w := &Watcher{
 		DiskutilPath: diskutil,
 		VolumesRoot:  volumes,
 		InboxPath:    inbox,
+		PollInterval: 100 * time.Millisecond,
 		Runner:       runner,
 		Logger:       logger,
 	}
 
 	runErr := make(chan error, 1)
-	go func() { runErr <- w.Run() }()
-
-	// Give fsnotify time to establish the watch before creating directories.
-	time.Sleep(200 * time.Millisecond)
+	go func() { runErr <- w.Run(stop) }()
 
 	// --- Create an SD card: subdir + DCIM + one file inside. ---
 	sdPath := filepath.Join(volumes, "SDCARD")
@@ -343,13 +341,10 @@ func TestWatcher_Integration(t *testing.T) {
 		t.Fatalf("write photo: %v", err)
 	}
 
-	// Wait for 2s settle + processing with a hard deadline.
-	var called int32
 	select {
 	case <-notifyCh:
-		atomic.StoreInt32(&called, 1)
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout: RunIngest was not called within 5s of SD card creation")
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout: RunIngest was not called within 3s of SD card creation")
 	}
 
 	if runner.callCount() != 1 {
@@ -368,25 +363,23 @@ func TestWatcher_Integration(t *testing.T) {
 		t.Fatalf("create other dir: %v", err)
 	}
 
-	// Wait for the 2s settle to elapse (watcher will check and skip on no DCIM).
-	time.Sleep(3 * time.Second)
+	time.Sleep(500 * time.Millisecond)
 
 	if runner.callCount() != 1 {
 		t.Errorf("runner called %d times after non-SD-card dir, want still 1",
 			runner.callCount())
 	}
 
-	w.Stop()
+	close(stop)
 
 	select {
 	case err := <-runErr:
 		if err != nil {
-			t.Errorf("Run() returned non-nil error after Stop: %v", err)
+			t.Errorf("Run() returned non-nil error after stop: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Error("Run() did not return after Stop()")
+		t.Error("Run() did not return after stop channel closed")
 	}
 
-	_ = called
 	_ = fmt.Sprintf // keep fmt import used via Sprintf in fakeRunner
 }

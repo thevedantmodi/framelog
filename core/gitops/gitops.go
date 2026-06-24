@@ -118,14 +118,38 @@ func IsOnACPower(pmsetPath string) (bool, error) {
 	return strings.Contains(string(out), "AC Power"), nil
 }
 
+// HasRemote reports whether originalsPath has at least one git remote configured.
+// Push calls this before attempting to push — a repo with no remote is a normal
+// first-run state, not an error.
+func HasRemote(gitPath, originalsPath string) (bool, error) {
+	var stderr bytes.Buffer
+	cmd := exec.Command(gitPath, "remote")
+	cmd.Dir = originalsPath
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("git remote: %w; stderr: %s", err, bytes.TrimSpace(stderr.Bytes()))
+	}
+	return strings.TrimSpace(string(out)) != "", nil
+}
+
 // Push pushes originalsPath to its configured remote when onACPower is true.
 // The AC-power check is the caller's responsibility — Push just acts on the
 // result. This keeps Push testable with a simple bool argument and no injection
 // ceremony: pass true to exercise the push path, false to exercise the skip path.
-// Returns pushed=false (not an error) when onACPower is false.
+// Returns pushed=false (not an error) when onACPower is false or no remote is
+// configured — a fresh git init with no remote is a normal first-run state.
 func Push(gitPath, originalsPath string, onACPower bool) (pushed bool, err error) {
 	if !onACPower {
 		return false, nil
+	}
+
+	ok, err := HasRemote(gitPath, originalsPath)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil // no remote configured — skip silently
 	}
 
 	var stderr bytes.Buffer

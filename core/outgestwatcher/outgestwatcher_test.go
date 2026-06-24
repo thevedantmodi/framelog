@@ -90,7 +90,7 @@ func (r *countingRunner) count() int {
 
 // newWatcher builds a Watcher with the given runner and debounce, logging to a
 // temp file. Returns the watcher and the log file path for assertion.
-func newWatcher(t *testing.T, processedPath string, runner OutgestRunner, debounce time.Duration) (*Watcher, string) {
+func newWatcher(t *testing.T, processedPath string, runner outgest.Runner, debounce time.Duration) (*Watcher, string) {
 	t.Helper()
 	logger, logPath := openTestLogger(t)
 	return &Watcher{

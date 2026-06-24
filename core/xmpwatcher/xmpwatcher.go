@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/thevedantmodi/framelog/core/config"
 	"github.com/thevedantmodi/framelog/core/db"
 	"github.com/thevedantmodi/framelog/core/gitops"
 	"github.com/thevedantmodi/framelog/core/logging"
@@ -37,11 +38,18 @@ var pgrepCandidates = []string{
 // watchedExts is the closed set of extensions the watcher cares about.
 // .xmp: Lightroom XMP sidecar writes.
 // .jpg, .jpeg, .heic: formats Lightroom edits in-place.
+// .xmp: Lightroom XMP sidecar writes (RAF, CR3, and other proprietary RAW).
+// .jpg, .jpeg, .heic: formats Lightroom edits in-place.
+// watchedExts is the set of extensions the watcher cares about.
+// Includes config.EmbeddedXMPExtensions so Lightroom edits to DNG (and any
+// future embedded-XMP formats) are detected; runCommit extracts the embedded
+// XMP to a sidecar before committing.
 var watchedExts = map[string]bool{
 	".xmp":  true,
 	".jpg":  true,
 	".jpeg": true,
 	".heic": true,
+	".dng":  true, // see config.EmbeddedXMPExtensions
 }
 
 // FindPgrep returns the absolute path to the pgrep binary. Checks known macOS
@@ -80,6 +88,7 @@ func IsLightroomRunning(pgrepPath string) (bool, error) {
 // bursts into a single commit, and pushes when on AC power and Lightroom is closed.
 type Watcher struct {
 	GitPath          string
+	ExiftoolPath     string // used to extract XMP from DNG before committing
 	OriginalsPath    string
 	PmsetPath        string
 	PgrepPath        string
@@ -136,6 +145,8 @@ func (w *Watcher) Run() error {
 		fw.Close()
 	}()
 
+	w.Logger.Log(logging.PrefixXMP, "watching "+w.OriginalsPath)
+
 	// Initial walk: add every directory except .git trees.
 	err = filepath.WalkDir(w.OriginalsPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -177,12 +188,19 @@ func (w *Watcher) handleEvent(fw *fsnotify.Watcher, event fsnotify.Event) {
 	if event.Op&fsnotify.Create != 0 {
 		fi, err := os.Stat(path)
 		if err == nil && fi.IsDir() {
-			// New directory: add it so future YYYY/MM/DD trees ingest creates
-			// are automatically watched without a watcher restart. Never add
-			// anything named ".git" — its subtree is explicitly excluded.
-			if filepath.Base(path) != ".git" {
-				fw.Add(path) //nolint:errcheck
-			}
+			// Walk the new tree: MkdirAll can create 2025/12/27/ before fsnotify
+			// delivers the CREATE for 2025/, so we'd miss the deeper dirs if we
+			// only added path itself.
+			filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error { //nolint:errcheck
+				if err != nil || !d.IsDir() {
+					return nil
+				}
+				if d.Name() == ".git" {
+					return filepath.SkipDir
+				}
+				fw.Add(p) //nolint:errcheck
+				return nil
+			})
 			return
 		}
 	}
@@ -237,6 +255,35 @@ func (w *Watcher) runCommit() {
 		if _, err := db.UpdateStatusByHashPrefix(w.DB, hash8, db.StatusEdited); err != nil {
 			w.Logger.Log(logging.PrefixXMP,
 				fmt.Sprintf("db update error for %s: %v", filepath.Base(path), err))
+		}
+	}
+
+	// For DNG files, extract embedded XMP to a sidecar so git only tracks the
+	// small XMP file, not the full DNG binary. Uses exiftool -xmp -b to dump
+	// the raw XMP packet; writes it alongside the DNG with a .xmp extension.
+	if w.ExiftoolPath != "" {
+		for path := range snapshot {
+			if !config.EmbeddedXMPExtensions[strings.ToLower(filepath.Ext(path))] {
+				continue
+			}
+			xmpPath := strings.TrimSuffix(path, filepath.Ext(path)) + ".xmp"
+			out, err := exec.Command(w.ExiftoolPath, "-xmp", "-b", path).Output()
+			if err != nil {
+				w.Logger.Log(logging.PrefixXMP,
+					fmt.Sprintf("extract XMP from %s: %v", filepath.Base(path), err))
+				continue
+			}
+			if len(out) == 0 {
+				w.Logger.Log(logging.PrefixXMP,
+					fmt.Sprintf("extract XMP from %s: empty output — no XMP embedded yet", filepath.Base(path)))
+				continue
+			}
+			w.Logger.Log(logging.PrefixXMP,
+				fmt.Sprintf("extracted %d bytes XMP from %s", len(out), filepath.Base(path)))
+			if err := os.WriteFile(xmpPath, out, 0o644); err != nil {
+				w.Logger.Log(logging.PrefixXMP,
+					fmt.Sprintf("write XMP sidecar for %s: %v", filepath.Base(path), err))
+			}
 		}
 	}
 
