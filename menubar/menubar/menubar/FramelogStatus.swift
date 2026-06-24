@@ -105,7 +105,6 @@ enum CoreInstallState {
 final class FramelogStatus: ObservableObject {
     @Published private(set) var displayString: String = "Core not running"
     @Published private(set) var loginItemStatus: SMAppService.Status = .notRegistered
-    @Published private(set) var logLines: [String] = []
     @Published var ingestRequested = false
     @Published var outgestRequested = false
     @Published private(set) var coreInstallState: CoreInstallState = .idle
@@ -168,7 +167,6 @@ final class FramelogStatus: ObservableObject {
         previousCount = newCount
         previousLastImport = newLastImport
         displayString = statusDisplayString(snapshot: snapshot, coreReachable: coreReachable)
-        logLines = CatalogReader.logTail(logPath: FramelogPaths.framelogLog.path)
         refreshLoginItemStatus()
 
         // TODO(FL-302): backup-drive-missing notification belongs here once the

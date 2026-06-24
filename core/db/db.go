@@ -162,23 +162,6 @@ const (
 	StatusPublished = "published"
 )
 
-// UpdateStatus sets the status column for the row identified by hash. The only
-// valid values per PROTOCOL.md §1 are "raw", "edited", and "published". Call
-// sites: XMP watcher → "edited" (FL-204), outgest → "published" (FL-202).
-func UpdateStatus(db *sql.DB, hash, status string) error {
-	res, err := db.Exec("UPDATE photos SET status = ? WHERE hash = ?", status, hash)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return fmt.Errorf("db: UpdateStatus: no row with hash %q", hash)
-	}
-	return nil
-}
 
 // UpdateStatusByHashPrefix sets status on the row whose hash starts with
 // hashPrefix (the 8-char prefix embedded in outgest filenames). Returns true

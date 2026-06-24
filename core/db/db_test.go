@@ -72,34 +72,6 @@ func TestInsertPhoto_DefaultStatusIsRaw(t *testing.T) {
 	}
 }
 
-func TestUpdateStatus(t *testing.T) {
-	conn, _ := openTestDB(t)
-	const hash = "cafebabe"
-
-	if err := InsertPhoto(conn, Photo{Hash: hash}); err != nil {
-		t.Fatalf("InsertPhoto: %v", err)
-	}
-
-	for _, want := range []string{"edited", "published", "raw"} {
-		if err := UpdateStatus(conn, hash, want); err != nil {
-			t.Fatalf("UpdateStatus(%q): %v", want, err)
-		}
-		var got string
-		if err := conn.QueryRow("SELECT status FROM photos WHERE hash = ?", hash).Scan(&got); err != nil {
-			t.Fatal(err)
-		}
-		if got != want {
-			t.Errorf("after UpdateStatus(%q): got %q", want, got)
-		}
-	}
-}
-
-func TestUpdateStatus_MissingHash(t *testing.T) {
-	conn, _ := openTestDB(t)
-	if err := UpdateStatus(conn, "no-such-hash", "edited"); err == nil {
-		t.Error("expected error for missing hash, got nil")
-	}
-}
 
 func TestPhotoCountAndLastImport_Empty(t *testing.T) {
 	conn, _ := openTestDB(t)
