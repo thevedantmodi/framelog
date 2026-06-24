@@ -1,35 +1,63 @@
-VERSION := 1.0.0
-APP     := dist/Framelog.app
-DMG     := dist/Framelog-$(VERSION).dmg
+.PHONY: build build-go build-swift bundle dmg release sha test clean
 
-.PHONY: build sign dmg release clean
+VERSION      := $(shell cat VERSION)
+XCODE_PROJECT := menubar/menubar/menubar.xcodeproj
+SCHEME       := menubar
+APP_BUILD_DIR := build/app
+APP          := $(APP_BUILD_DIR)/Framelog.app
+DMG          := build/Framelog-$(VERSION).dmg
 
-build:
-	rm -rf build/ dist/
-	PYTHONPATH=src .venv-build/bin/python setup.py py2app
+build: build-go build-swift
 
-sign: $(APP)
-	codesign --deep --force --sign "-" $(APP)
+build-go:
+	cd core && go build \
+		-ldflags "-X main.Version=$(VERSION)" \
+		-o framelogd \
+		./cmd/framelogd
 
-dmg: sign
-	rm -f $(DMG)
-	hdiutil create -volname "Framelog" -srcfolder $(APP) -ov -format UDZO $(DMG)
-	@echo "Built $(DMG)"
+build-swift:
+	xcodebuild \
+		-project $(XCODE_PROJECT) \
+		-scheme $(SCHEME) \
+		-configuration Release \
+		MARKETING_VERSION=$(VERSION) \
+		CURRENT_PROJECT_VERSION=$(VERSION) \
+		CONFIGURATION_BUILD_DIR=$(PWD)/$(APP_BUILD_DIR) \
+		build \
+		| grep -E "error:|warning:|Build succeeded|BUILD FAILED" || true
 
-release: build dmg
+# Copy framelogd into the app bundle so "Install Core" can find it.
+bundle: build
+	cp core/framelogd $(APP)/Contents/MacOS/framelogd
+
+# Wrap the bundled app in a DMG for distribution.
+dmg: bundle
+	mkdir -p build/staging
+	cp -R $(APP) build/staging/
+	ln -sf /Applications build/staging/Applications
+	hdiutil create \
+		-volname "Framelog $(VERSION)" \
+		-srcfolder build/staging \
+		-ov -format UDZO \
+		$(DMG)
+	rm -rf build/staging
+	@echo "Created $(DMG)"
+
+# Full release artifact: Go + Swift + bundle + DMG.
+release: dmg sha
+
+# Print the sha256 of the DMG for pasting into the Homebrew cask formula.
+sha:
+	@shasum -a 256 $(DMG)
+
+test:
+	cd core && go test ./... -race
+	xcodebuild \
+		-project $(XCODE_PROJECT) \
+		-scheme $(SCHEME) \
+		-destination 'platform=macOS' \
+		test \
+		| grep -E "PASS|FAIL|error:" || true
 
 clean:
-	rm -rf build/ dist/
-
-reset:
-	-launchctl unload ~/Library/LaunchAgents/com.framelog.app.plist 2>/dev/null
-	-launchctl unload ~/Library/LaunchAgents/com.framelog.sdcard.plist 2>/dev/null
-	-pkill -f Framelog 2>/dev/null; true
-	rm -f ~/Library/LaunchAgents/com.framelog.app.plist
-	rm -f ~/Library/LaunchAgents/com.framelog.sdcard.plist
-	rm -rf ~/.framelog/
-	rm -f ~/Photos/inbox/*
-	rm -f ~/.framelog_setup_done ~/.framelog_sd_paused ~/.framelog_on_sd_mount.sh
-	rm -f ~/Photos/.ingest_trigger ~/Photos/catalog.db ~/Photos/framelog.log
-	rm -f /tmp/framelog.lock
-	@echo "Reset complete. Run: make release && open dist/Framelog.app"
+	rm -rf core/framelogd build/
