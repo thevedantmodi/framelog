@@ -1,92 +1,88 @@
 # Release Runbook
 
-Step-by-step instructions for cutting a new Framelog release and publishing it to the
-Homebrew tap.
+How to cut a new Framelog release. GitHub Actions does the build, DMG, and
+release creation automatically — you only need to bump the version, tag, and
+push.
 
 ---
 
 ## Prerequisites (one-time setup)
 
-1. **Create the Homebrew tap repo** on GitHub named exactly `homebrew-framelog`:
-   - Go to github.com → New repository → name: `homebrew-framelog`
-   - Clone it: `git clone https://github.com/thevedantmodi/homebrew-framelog`
-   - Create the directory: `mkdir -p homebrew-framelog/Casks`
-   - Copy the cask template: `cp framelog/homebrew/framelog.rb homebrew-framelog/Casks/framelog.rb`
-   - Commit and push: `cd homebrew-framelog && git add . && git commit -m "add framelog cask" && git push`
+### Homebrew tap repo
 
-2. **Verify Homebrew tap works** (after at least one real release):
-   ```bash
-   brew tap thevedantmodi/framelog
-   brew install --cask --no-quarantine framelog
-   ```
+Create a repo named **`homebrew-framelog`** on GitHub, then set it up:
+
+```bash
+git clone https://github.com/thevedantmodi/homebrew-framelog
+cd homebrew-framelog
+mkdir -p Casks
+cp /path/to/framelog/homebrew/framelog.rb Casks/framelog.rb
+git add . && git commit -m "add framelog cask" && git push
+```
+
+After the first real release, verify it works:
+```bash
+brew tap thevedantmodi/framelog
+brew install --cask --no-quarantine framelog
+```
 
 ---
 
 ## Cutting a release
 
-### Step 1 — Bump the version
+### 1 — Bump the version
+
+Edit `VERSION` in the repo root:
 
 ```bash
-echo "0.2.0" > VERSION   # replace with the new version
+echo "0.2.0" > VERSION   # replace with the new version number
 ```
 
 Version guidelines:
 - **Patch** (`0.1.x`) — bug fix, no new user-visible behaviour
-- **Minor** (`0.x.0`) — new feature, no breaking changes
-- **Major** (`x.0.0`) — breaking protocol/schema change, or major overhaul
+- **Minor** (`0.x.0`) — new feature, backwards-compatible
+- **Major** (`x.0.0`) — breaking protocol or schema change
 
-### Step 2 — Run tests
+### 2 — Run tests
 
 ```bash
 make test
 ```
 
-All Go tests must pass under the race detector. Fix any failures before proceeding.
+All Go tests must pass under the race detector. Fix any failures before tagging.
 
-### Step 3 — Build the release DMG
+### 3 — Commit, tag, push
 
 ```bash
-make release
+git add VERSION
+git commit -m "Bump version to 0.2.0"
+git tag v0.2.0
+git push origin main
+git push origin v0.2.0
 ```
 
-This:
-1. Builds `core/framelogd` with version stamp (`-ldflags "-X main.Version=<VERSION>"`)
-2. Builds `Framelog.app` with matching `MARKETING_VERSION`
-3. Copies `framelogd` into `Framelog.app/Contents/MacOS/`
-4. Creates `build/Framelog-<VERSION>.dmg`
-5. Prints the sha256 of the DMG
+The tag push triggers the release CI workflow
+(`.github/workflows/release.yml`). It:
 
-**Save the sha256 output** — you need it in Step 5.
+1. Verifies the tag matches `VERSION` (fails fast if they diverge)
+2. Builds `framelogd` with `-ldflags "-X main.Version=<VERSION>"`
+3. Builds `Framelog.app` with `MARKETING_VERSION=<VERSION>` (unsigned)
+4. Bundles `framelogd` into `Framelog.app/Contents/MacOS/`
+5. Creates `Framelog-<VERSION>.dmg`
+6. Opens a GitHub Release, uploads the DMG, and prints the sha256 in the
+   release notes
 
-### Step 4 — Create a GitHub release
+Monitor progress at `github.com/thevedantmodi/framelog/actions`.
 
-1. Commit and push any pending changes:
-   ```bash
-   git add -A
-   git commit -m "release: v<VERSION>"
-   git push
-   ```
+### 4 — Update the Homebrew cask
 
-2. Tag the release:
-   ```bash
-   git tag v<VERSION>
-   git push origin v<VERSION>
-   ```
-
-3. On GitHub → Releases → Draft a new release:
-   - Tag: `v<VERSION>`
-   - Title: `v<VERSION>`
-   - Attach: `build/Framelog-<VERSION>.dmg`
-   - Publish the release
-
-### Step 5 — Update the Homebrew cask
-
-In your `homebrew-framelog` repo, edit `Casks/framelog.rb`:
+After the GitHub Release is published, copy the sha256 from the release notes
+and edit `Casks/framelog.rb` in your `homebrew-framelog` repo:
 
 ```ruby
 cask "framelog" do
-  version "<VERSION>"          # ← update this
-  sha256 "<sha256 from step 3>"  # ← update this
+  version "0.2.0"                    # ← new version
+  sha256 "<sha256 from release notes>" # ← paste here
 
   url "https://github.com/thevedantmodi/framelog/releases/download/v#{version}/Framelog-#{version}.dmg"
   ...
@@ -97,27 +93,27 @@ Commit and push:
 ```bash
 cd homebrew-framelog
 git add Casks/framelog.rb
-git commit -m "framelog <VERSION>"
+git commit -m "framelog 0.2.0"
 git push
 ```
 
-### Step 6 — Verify the install
+### 5 — Verify the install
 
 ```bash
 brew update
 brew upgrade --cask framelog
-# or fresh install:
+# or, on a clean machine:
 brew install --cask --no-quarantine framelog
 ```
 
-Open `Framelog.app`, click **Install Core…**, confirm the daemon starts and the menu bar
-shows status.
+Open `Framelog.app`, click **Install Core…**, confirm the daemon starts and
+the menu bar shows status.
 
 ---
 
 ## Getting the sha256 manually
 
-If you need the sha256 outside of `make release`:
+If you need the sha256 without a full release (e.g. to test a local DMG):
 
 ```bash
 make sha
@@ -127,12 +123,34 @@ shasum -a 256 build/Framelog-<VERSION>.dmg
 
 ---
 
+## Building locally without CI
+
+To produce a DMG on your own machine:
+
+```bash
+make release   # build Go + Swift + bundle + DMG
+make sha       # print sha256
+```
+
+The DMG lands at `build/Framelog-<VERSION>.dmg`. Note that without a
+Developer ID the app is unsigned; users need `--no-quarantine` or must
+right-click → Open on first launch.
+
+---
+
 ## Rollback
 
 If a release is broken:
-1. Delete the GitHub release and tag
-2. Revert `VERSION` to the previous value
-3. Revert `homebrew-framelog/Casks/framelog.rb` to the previous version + sha256
-4. Push the revert
 
-Users who already upgraded will need to run `brew install --cask --no-quarantine framelog@<previous>` or manually download the previous DMG from GitHub releases.
+1. Delete the GitHub release and tag:
+   ```bash
+   gh release delete v0.2.0 --yes
+   git push --delete origin v0.2.0
+   git tag -d v0.2.0
+   ```
+2. Revert `VERSION` and push a new tag for the previous good version.
+3. In `homebrew-framelog`, revert `Casks/framelog.rb` to the previous
+   version + sha256 and push.
+
+Users who already upgraded will need to download the previous DMG from
+GitHub Releases and reinstall manually.

@@ -40,11 +40,10 @@ re-creating the build-config mess found in the Python version.
   *Acceptance:* documented in PROTOCOL.md; enforced in `db` package via a read-only DSN
   option.
 
-- **FL-005 — CI skeleton**
-  GitHub Actions: `go build && go test ./...` job, `xcodebuild test` job.
-  *Acceptance:* CI is green on a runner that does **not** have `exiftool` installed —
-  decide now that no test may depend on a real external binary being on `PATH` (this is
-  the exact bug class found in `test_exif.py` in the Python version).
+- **FL-005 ✓ — CI skeleton**
+  GitHub Actions: `go build && go test ./... -race` on ubuntu-latest (no exiftool,
+  diskutil, pmset — the exact clean-room the injectable-binary-path pattern was built
+  against). `xcodebuild test` on macOS. Both jobs run on every push and PR.
 
 ---
 
@@ -162,6 +161,12 @@ Lightroom's relationship to `originals/`.
 - **FL-601 — Codesigning + notarization** *(deferred — requires $99 Apple Developer
   account)* — app runs unsigned for personal use; Homebrew users need `--no-quarantine`.
   Revisit when distributing publicly.
+
+- **FL-605 ✓ — Release CI/CD** — `.github/workflows/release.yml` triggers on `v*` tags,
+  builds Go + Swift (unsigned) on `macos-latest`, bundles `framelogd` into the app,
+  creates DMG, opens a GitHub Release with the DMG attached and sha256 in the notes.
+  Process: bump `VERSION`, commit, `git tag vX.Y.Z && git push origin vX.Y.Z`.
+  See `docs/RELEASE_RUNBOOK.md`.
 
 - **FL-602 ✓ — Single version number end-to-end** — root `VERSION` file drives both
   `framelogd --version` (via `-ldflags "-X main.Version=$(cat VERSION)"`) and

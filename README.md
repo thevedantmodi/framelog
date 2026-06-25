@@ -139,11 +139,16 @@ make sha          # print sha256 of the DMG (for Homebrew cask)
 make clean        # remove build artefacts
 ```
 
-**Bump version:**
+**Cut a release:**
 ```bash
 echo "0.2.0" > VERSION
-make release
+git add VERSION && git commit -m "Bump version to 0.2.0"
+git tag v0.2.0 && git push origin main && git push origin v0.2.0
 ```
+
+Pushing the tag triggers CI, which builds the DMG and creates a GitHub Release
+automatically. See `docs/RELEASE_RUNBOOK.md` for the full process including
+Homebrew tap update.
 
 ---
 
