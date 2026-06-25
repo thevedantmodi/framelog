@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -61,6 +62,10 @@ func New(path string) (*Logger, error) {
 // even though the write syscall succeeded (the line would still be in the OS
 // page cache).
 func (l *Logger) Log(prefix Prefix, message string) {
+	// Collapse embedded newlines so multi-line subprocess errors (e.g. git's
+	// "Another git process is running" advisory) stay on one line and remain
+	// parseable per PROTOCOL.md §5.
+	message = strings.ReplaceAll(message, "\n", " ")
 	line := fmt.Sprintf("%s [%s] %s\n", time.Now().Format(timestampFormat), prefix, message)
 
 	l.mu.Lock()

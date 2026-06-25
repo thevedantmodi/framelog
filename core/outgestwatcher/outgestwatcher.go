@@ -37,6 +37,7 @@ type Watcher struct {
 	mu    sync.Mutex
 	timer *time.Timer
 	fw    *fsnotify.Watcher
+	seq   uint64 // incremented by scheduleRun; runOnce skips if stale
 }
 
 // Stop closes the underlying fsnotify watcher, causing Run to return nil.
@@ -117,20 +118,35 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 // scheduleRun restarts the debounce timer. Unlike xmpwatcher there is no need
 // to accumulate which specific files changed — RunOutgest's own top-level
 // ReadDir already covers every eligible file in ProcessedPath on each call.
+//
+// A sequence number is incremented on every call. The timer closure captures
+// the current sequence so that a stale goroutine (created before a later
+// scheduleRun superseded it) detects the mismatch and exits without running
+// RunOutgest. This prevents the double-fire race: if time.Timer.Stop returns
+// false (the timer already fired), creating a second timer would cause two
+// concurrent runOnce goroutines; the sequence check makes the older one a no-op.
 func (w *Watcher) scheduleRun() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.timer != nil {
 		w.timer.Stop()
 	}
-	w.timer = time.AfterFunc(w.DebounceDuration, w.runOnce)
+	w.seq++
+	seq := w.seq
+	w.timer = time.AfterFunc(w.DebounceDuration, func() { w.runOnce(seq) })
 }
 
-// runOnce calls RunOutgest once. ErrOutgestAlreadyRunning is an expected
-// outcome under load and is logged without treating it as a watcher failure.
-// Any other error is logged with its text. On success, no extra line is emitted
-// here — RunOutgest's own "Done: N moved..." summary already appeared in the log.
-func (w *Watcher) runOnce() {
+// runOnce calls RunOutgest once if seq matches the current sequence number.
+// ErrOutgestAlreadyRunning is an expected outcome under load and is logged
+// without treating it as a watcher failure.
+func (w *Watcher) runOnce(seq uint64) {
+	w.mu.Lock()
+	stale := w.seq != seq
+	w.mu.Unlock()
+	if stale {
+		return
+	}
+
 	_, err := w.Outgest.RunOutgest()
 	if err == nil {
 		return

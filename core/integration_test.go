@@ -261,6 +261,7 @@ func TestConcurrent(t *testing.T) {
 	var panicVal atomic.Value
 
 	sdStop := make(chan struct{})
+	var sdDone sync.WaitGroup
 
 	launchWatcher := func(name string, fn func() error) {
 		go func() {
@@ -275,7 +276,9 @@ func TestConcurrent(t *testing.T) {
 		}()
 	}
 
+	sdDone.Add(1)
 	go func() {
+		defer sdDone.Done()
 		defer func() {
 			if r := recover(); r != nil {
 				panicVal.Store(fmt.Sprintf("watcher sdcard panicked: %v", r))
@@ -362,7 +365,11 @@ func TestConcurrent(t *testing.T) {
 	close(sdStop)
 	xmpW.Stop()
 	outgestW.Stop()
-	time.Sleep(100 * time.Millisecond) // let goroutines drain
+	// sdDone.Wait() blocks until the sdcard goroutine fully exits, which means
+	// any in-flight tick() — including RunIngest and its DB commit — has completed.
+	// The 100ms sleep only covers xmp/outgest watcher goroutines.
+	sdDone.Wait()
+	time.Sleep(100 * time.Millisecond)
 
 	// ---- assertions ---------------------------------------------------------
 
@@ -398,16 +405,19 @@ func TestConcurrent(t *testing.T) {
 		t.Errorf("outgest row status = %q, want %q", outStatus, db.StatusPublished)
 	}
 
-	// 5. SD card ingest row exists and has status "raw", appears exactly once.
-	var rawCount int
+	// 5. SD card ingest row exists, appears exactly once.
+	// Status is NOT asserted here: the xmpwatcher legitimately fires for the
+	// XMP sidecar written by ingest and promotes the row to "edited" before
+	// this check runs, so requiring "raw" would be a race against the watcher.
+	var sdCount int
 	if err := conn.QueryRow(
-		"SELECT COUNT(*) FROM photos WHERE status = ? AND hash NOT IN (?, ?)",
-		db.StatusRaw, hashXMP, hashOut,
-	).Scan(&rawCount); err != nil {
-		t.Fatalf("query raw count: %v", err)
+		"SELECT COUNT(*) FROM photos WHERE hash NOT IN (?, ?)",
+		hashXMP, hashOut,
+	).Scan(&sdCount); err != nil {
+		t.Fatalf("query sd card count: %v", err)
 	}
-	if rawCount != 1 {
-		t.Errorf("SD card import row count = %d, want exactly 1 (no missing row, no double-fire duplicate)", rawCount)
+	if sdCount != 1 {
+		t.Errorf("SD card import row count = %d, want exactly 1 (no missing row, no double-fire duplicate)", sdCount)
 	}
 
 	// 6. Git commit messages are all parseable and match a known format —
