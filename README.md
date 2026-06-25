@@ -37,13 +37,16 @@ crash and starts at login.
 
 ```bash
 brew tap thevedantmodi/framelog
-brew install --cask --no-quarantine framelog
+brew install --cask framelog
 ```
 
 Then open `Framelog.app` and click **Install Core…**.
 
-> **Note:** `--no-quarantine` is required because the app is not yet notarized with Apple.
-> This is safe for software you build or download from a trusted source.
+> **Note:** The app is not notarized (no Apple Developer ID). If macOS blocks launch,
+> right-click → Open, or run:
+> ```bash
+> xattr -d com.apple.quarantine /Applications/Framelog.app
+> ```
 
 ### From source
 

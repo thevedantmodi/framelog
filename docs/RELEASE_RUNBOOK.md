@@ -23,7 +23,8 @@ git add . && git commit -m "add framelog cask" && git push
 After the first real release, verify it works:
 ```bash
 brew tap thevedantmodi/framelog
-brew install --cask --no-quarantine framelog
+brew install --cask framelog
+# if macOS blocks launch: xattr -d com.apple.quarantine /Applications/Framelog.app
 ```
 
 ---
@@ -103,7 +104,8 @@ git push
 brew update
 brew upgrade --cask framelog
 # or, on a clean machine:
-brew install --cask --no-quarantine framelog
+brew install --cask framelog
+# if macOS blocks launch: xattr -d com.apple.quarantine /Applications/Framelog.app
 ```
 
 Open `Framelog.app`, click **Install Core…**, confirm the daemon starts and
@@ -133,8 +135,10 @@ make sha       # print sha256
 ```
 
 The DMG lands at `build/Framelog-<VERSION>.dmg`. Note that without a
-Developer ID the app is unsigned; users need `--no-quarantine` or must
-right-click → Open on first launch.
+Developer ID the app is unsigned; right-click → Open on first launch, or:
+```bash
+xattr -d com.apple.quarantine /Applications/Framelog.app
+```
 
 ---
 

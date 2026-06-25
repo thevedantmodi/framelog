@@ -80,17 +80,28 @@ jobs:
           **Via Homebrew tap:**
           \`\`\`bash
           brew tap thevedantmodi/framelog
-          brew install --cask --no-quarantine framelog
+          brew install --cask framelog
           \`\`\`
 
-          > **Note:** This release is not notarized (no Apple Developer ID). Use \`--no-quarantine\` with Homebrew, or right-click → Open on first launch from DMG.
+          > **Note:** This release is not notarized (no Apple Developer ID). Right-click → Open on first launch, or run: \`xattr -d com.apple.quarantine /Applications/Framelog.app\`"
 
-          ---
+      - name: Update Homebrew tap
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          VERSION="${{ steps.ver.outputs.V }}"
+          SHA="${{ steps.sha.outputs.SHA256 }}"
 
-          ## Homebrew cask sha256
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/thevedantmodi/homebrew-framelog.git" tap
+          cd tap
 
-          Paste this into \`homebrew/framelog.rb\` when updating the tap:
+          sed -i '' \
+            -e "s/version \".*\"/version \"${VERSION}\"/" \
+            -e "s/sha256 \".*\"/sha256 \"${SHA}\"/" \
+            Casks/framelog.rb
 
-          \`\`\`
-          ${SHA}
-          \`\`\`"
+          git config user.email "vedantmodi@gmail.com"
+          git config user.name "Vedant Modi"
+          git add Casks/framelog.rb
+          git diff --cached --quiet || git commit -m "framelog ${VERSION}"
+          git push
