@@ -22,9 +22,11 @@ build-swift:
 		-configuration Release \
 		MARKETING_VERSION=$(VERSION) \
 		CURRENT_PROJECT_VERSION=$(VERSION) \
+		PRODUCT_NAME=Framelog \
 		CONFIGURATION_BUILD_DIR=$(PWD)/$(APP_BUILD_DIR) \
+		$(XCODE_EXTRA_FLAGS) \
 		build \
-		| grep -E "error:|warning:|Build succeeded|BUILD FAILED" || true
+		| grep -E "error:|Build succeeded|BUILD FAILED" || true
 
 # Copy framelogd into the app bundle so "Install Core" can find it.
 bundle: build

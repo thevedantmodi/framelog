@@ -1,0 +1,96 @@
+name: Release
+
+# Triggered by pushing a version tag, e.g. `git tag v0.2.0 && git push --tags`.
+# The tag must match the contents of the VERSION file — the workflow enforces
+# this so the binary version stamp, the DMG filename, and the GitHub release
+# title are all consistent.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: macos-latest
+    permissions:
+      contents: write # create GitHub release + upload assets
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: core/go.mod
+
+      - name: Verify tag matches VERSION file
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          WANT="v$(cat VERSION)"
+          if [ "$TAG" != "$WANT" ]; then
+            echo "error: tag $TAG does not match VERSION file ($WANT)"
+            echo "Bump VERSION before tagging, or re-tag: git tag -f $WANT"
+            exit 1
+          fi
+
+      - name: Read version
+        id: ver
+        run: echo "V=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Build Go binary
+        run: |
+          cd core
+          go build \
+            -ldflags "-X main.Version=${{ steps.ver.outputs.V }}" \
+            -o framelogd \
+            ./cmd/framelogd
+
+      - name: Build Swift app (unsigned)
+        run: |
+          make build-swift \
+            XCODE_EXTRA_FLAGS="CODE_SIGN_IDENTITY= CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO"
+
+      - name: Bundle framelogd into app
+        run: make bundle
+
+      - name: Create DMG
+        run: make dmg
+
+      - name: Compute SHA-256
+        id: sha
+        run: |
+          DMG="build/Framelog-${{ steps.ver.outputs.V }}.dmg"
+          SHA=$(shasum -a 256 "$DMG" | awk '{print $1}')
+          echo "SHA256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "DMG=$DMG"   >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.ver.outputs.V }}"
+          SHA="${{ steps.sha.outputs.SHA256 }}"
+          DMG="${{ steps.sha.outputs.DMG }}"
+
+          gh release create "v${VERSION}" "$DMG" \
+            --title "Framelog ${VERSION}" \
+            --notes "## Install
+
+          **From DMG** (easiest): download \`Framelog-${VERSION}.dmg\` below, drag \`Framelog.app\` to \`/Applications\`, open it, then click **Install Core…** in the menu bar.
+
+          **Via Homebrew tap:**
+          \`\`\`bash
+          brew tap thevedantmodi/framelog
+          brew install --cask --no-quarantine framelog
+          \`\`\`
+
+          > **Note:** This release is not notarized (no Apple Developer ID). Use \`--no-quarantine\` with Homebrew, or right-click → Open on first launch from DMG.
+
+          ---
+
+          ## Homebrew cask sha256
+
+          Paste this into \`homebrew/framelog.rb\` when updating the tap:
+
+          \`\`\`
+          ${SHA}
+          \`\`\`"
