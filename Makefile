@@ -61,5 +61,15 @@ test:
 		test \
 		| grep -E "PASS|FAIL|error:" || true
 
+bump:
+	@read -p "New version (current: $(VERSION)): " v; \
+	echo "$$v" > VERSION; \
+	git add VERSION; \
+	git commit -m "Bump version to $$v"; \
+	git tag "v$$v"; \
+	git push origin main; \
+	git push origin "v$$v"; \
+	echo "Tagged and pushed v$$v — release CI is running."
+
 clean:
 	rm -rf core/framelogd build/
