@@ -77,6 +77,22 @@ func (f *fakeStatus) LastImport() (string, error) {
 }
 func (f *fakeStatus) BackupDriveMounted() bool { return f.backupDriveMounted }
 
+type fakeConfig struct {
+	mu          sync.Mutex
+	backupPath  string
+	err         error
+}
+
+func (f *fakeConfig) SetBackupPath(path string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.backupPath = path
+	return nil
+}
+
 // ---- helpers ----------------------------------------------------------------
 
 func openTestLogger(t *testing.T) *logging.Logger {
@@ -89,7 +105,7 @@ func openTestLogger(t *testing.T) *logging.Logger {
 	return l
 }
 
-func startServer(t *testing.T, fi *fakeIngest, fo *fakeOutgest, fs *fakeStatus) *Server {
+func startServer(t *testing.T, fi *fakeIngest, fo *fakeOutgest, fs *fakeStatus, fc ConfigSetter) *Server {
 	t.Helper()
 	socketPath := filepath.Join(shortTempDir(t), "ipc.sock")
 	s := &Server{
@@ -97,6 +113,7 @@ func startServer(t *testing.T, fi *fakeIngest, fo *fakeOutgest, fs *fakeStatus) 
 		Ingest:       fi,
 		Outgest:      fo,
 		Status:       fs,
+		Config:       fc,
 		Logger:       openTestLogger(t),
 		ReadDeadline: 2 * time.Second,
 	}
@@ -105,6 +122,28 @@ func startServer(t *testing.T, fi *fakeIngest, fo *fakeOutgest, fs *fakeStatus) 
 	}
 	t.Cleanup(func() { s.Stop() })
 	return s
+}
+
+// dialJSON sends an arbitrary JSON payload and returns the parsed response.
+func dialJSON(t *testing.T, socketPath string, payload string) map[string]any {
+	t.Helper()
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if _, err := fmt.Fprintf(conn, "%s\n", payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(line), &m); err != nil {
+		t.Fatalf("unmarshal %q: %v", line, err)
+	}
+	return m
 }
 
 // dial sends one JSON request line and returns the parsed response map.
@@ -136,7 +175,7 @@ func dial(t *testing.T, socketPath, cmd string) map[string]any {
 
 func TestIngestNow_SuccessResponse(t *testing.T) {
 	fi := &fakeIngest{counts: ingest.Counts{Imported: 3, Skipped: 1, Failed: 0}}
-	s := startServer(t, fi, &fakeOutgest{}, &fakeStatus{})
+	s := startServer(t, fi, &fakeOutgest{}, &fakeStatus{}, &fakeConfig{})
 
 	m := dial(t, s.SocketPath, "ingest_now")
 
@@ -159,7 +198,7 @@ func TestIngestNow_SuccessResponse(t *testing.T) {
 
 func TestIngestNow_AlreadyRunning(t *testing.T) {
 	fi := &fakeIngest{err: ingest.ErrIngestAlreadyRunning}
-	s := startServer(t, fi, &fakeOutgest{}, &fakeStatus{})
+	s := startServer(t, fi, &fakeOutgest{}, &fakeStatus{}, &fakeConfig{})
 
 	m := dial(t, s.SocketPath, "ingest_now")
 
@@ -173,7 +212,7 @@ func TestIngestNow_AlreadyRunning(t *testing.T) {
 
 func TestOutgestNow_SuccessResponse(t *testing.T) {
 	fo := &fakeOutgest{counts: outgest.Counts{Moved: 2, Skipped: 0, Failed: 0}}
-	s := startServer(t, &fakeIngest{}, fo, &fakeStatus{})
+	s := startServer(t, &fakeIngest{}, fo, &fakeStatus{}, &fakeConfig{})
 
 	m := dial(t, s.SocketPath, "outgest_now")
 
@@ -187,7 +226,7 @@ func TestOutgestNow_SuccessResponse(t *testing.T) {
 
 func TestOutgestNow_AlreadyRunning(t *testing.T) {
 	fo := &fakeOutgest{err: outgest.ErrOutgestAlreadyRunning}
-	s := startServer(t, &fakeIngest{}, fo, &fakeStatus{})
+	s := startServer(t, &fakeIngest{}, fo, &fakeStatus{}, &fakeConfig{})
 
 	m := dial(t, s.SocketPath, "outgest_now")
 
@@ -204,7 +243,7 @@ func TestStatus_AllFields(t *testing.T) {
 		lastImport:         "2026-06-20T14:02:00Z",
 		backupDriveMounted: true,
 	}
-	s := startServer(t, &fakeIngest{}, &fakeOutgest{}, fs)
+	s := startServer(t, &fakeIngest{}, &fakeOutgest{}, fs, &fakeConfig{})
 
 	m := dial(t, s.SocketPath, "status")
 
@@ -230,7 +269,7 @@ func TestStatus_AllFields(t *testing.T) {
 
 func TestStatus_EmptyLastImport(t *testing.T) {
 	fs := &fakeStatus{photoCount: 0, lastImport: ""}
-	s := startServer(t, &fakeIngest{}, &fakeOutgest{}, fs)
+	s := startServer(t, &fakeIngest{}, &fakeOutgest{}, fs, &fakeConfig{})
 
 	m := dial(t, s.SocketPath, "status")
 
@@ -243,7 +282,7 @@ func TestStatus_EmptyLastImport(t *testing.T) {
 }
 
 func TestUnknownCommand(t *testing.T) {
-	s := startServer(t, &fakeIngest{}, &fakeOutgest{}, &fakeStatus{})
+	s := startServer(t, &fakeIngest{}, &fakeOutgest{}, &fakeStatus{}, &fakeConfig{})
 
 	m := dial(t, s.SocketPath, "frobnicate")
 
@@ -256,7 +295,7 @@ func TestUnknownCommand(t *testing.T) {
 }
 
 func TestBadJSON(t *testing.T) {
-	s := startServer(t, &fakeIngest{}, &fakeOutgest{}, &fakeStatus{})
+	s := startServer(t, &fakeIngest{}, &fakeOutgest{}, &fakeStatus{}, &fakeConfig{})
 
 	conn, err := net.Dial("unix", s.SocketPath)
 	if err != nil {
@@ -285,7 +324,7 @@ func TestBadJSON(t *testing.T) {
 func TestStatus_NotBlockedByIngestNow(t *testing.T) {
 	blockCh := make(chan struct{})
 	fi := &fakeIngest{blockCh: blockCh}
-	s := startServer(t, fi, &fakeOutgest{}, &fakeStatus{photoCount: 7})
+	s := startServer(t, fi, &fakeOutgest{}, &fakeStatus{photoCount: 7}, &fakeConfig{})
 
 	// Fire ingest_now and keep it blocked.
 	go func() {
@@ -387,4 +426,55 @@ func TestStart_StaleSocketSucceeds(t *testing.T) {
 		t.Fatalf("Start with stale socket: %v", err)
 	}
 	s.Stop()
+}
+
+func TestSetBackupPath_Success(t *testing.T) {
+	fc := &fakeConfig{}
+	s := startServer(t, &fakeIngest{}, &fakeOutgest{}, &fakeStatus{}, fc)
+
+	m := dialJSON(t, s.SocketPath, `{"command":"set_backup_path","path":"/Volumes/MyDrive"}`)
+
+	if m["ok"] != true {
+		t.Errorf("ok = %v, want true", m["ok"])
+	}
+	if m["protocol_version"] != float64(1) {
+		t.Errorf("protocol_version = %v, want 1", m["protocol_version"])
+	}
+	fc.mu.Lock()
+	got := fc.backupPath
+	fc.mu.Unlock()
+	if got != "/Volumes/MyDrive" {
+		t.Errorf("backupPath = %q, want /Volumes/MyDrive", got)
+	}
+}
+
+func TestSetBackupPath_Empty(t *testing.T) {
+	fc := &fakeConfig{backupPath: "/Volumes/OldDrive"}
+	s := startServer(t, &fakeIngest{}, &fakeOutgest{}, &fakeStatus{}, fc)
+
+	m := dialJSON(t, s.SocketPath, `{"command":"set_backup_path","path":""}`)
+
+	if m["ok"] != true {
+		t.Errorf("ok = %v, want true (empty path disables backup)", m["ok"])
+	}
+	fc.mu.Lock()
+	got := fc.backupPath
+	fc.mu.Unlock()
+	if got != "" {
+		t.Errorf("backupPath = %q, want empty string", got)
+	}
+}
+
+func TestSetBackupPath_SetterError(t *testing.T) {
+	fc := &fakeConfig{err: fmt.Errorf("disk full")}
+	s := startServer(t, &fakeIngest{}, &fakeOutgest{}, &fakeStatus{}, fc)
+
+	m := dialJSON(t, s.SocketPath, `{"command":"set_backup_path","path":"/Volumes/MyDrive"}`)
+
+	if m["ok"] != false {
+		t.Errorf("ok = %v, want false", m["ok"])
+	}
+	if m["error"] != "internal_error" {
+		t.Errorf("error = %v, want internal_error", m["error"])
+	}
 }

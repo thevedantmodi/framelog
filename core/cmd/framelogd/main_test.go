@@ -137,9 +137,10 @@ func TestColdStart_DirectoriesAndDB(t *testing.T) {
 		ProcessedPath: processed, ExiftoolPath: fakeExiftool,
 	}
 	socketPath := filepath.Join(base, "d.sock")
+	cs := &configSetter{pipeline: ingestP, path: ""}
 	sp := &statusProvider{
 		ingestPipeline: ingestP, outgestPipeline: outgestP,
-		dbConn: dbConn, backupPath: "",
+		dbConn: dbConn, configSetter: cs,
 	}
 	rc := &runConfig{
 		dbConn: dbConn, logger: logger,
@@ -241,11 +242,12 @@ func TestSmokeDaemon_StatusResponse(t *testing.T) {
 
 	// IPC server — socket in shortTempDir to avoid the 104-char limit.
 	socketPath := filepath.Join(base, "d.sock")
+	cs := &configSetter{pipeline: ingestP, path: ""}
 	sp := &statusProvider{
 		ingestPipeline:  ingestP,
 		outgestPipeline: outgestP,
 		dbConn:          dbConn,
-		backupPath:      "", // empty → backup disabled in status
+		configSetter:    cs,
 	}
 	ipcSrv := &ipc.Server{
 		SocketPath:   socketPath,

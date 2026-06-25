@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/thevedantmodi/framelog/core/backup"
@@ -61,10 +62,25 @@ type Pipeline struct {
 	GitPath       string
 	PmsetPath     string
 	RclonePath    string
-	BackupPath    string
+	BackupPath    string // initial value; SetBackupPath overrides at runtime
 
-	mu      sync.Mutex
-	running bool
+	mu                 sync.Mutex
+	running            bool
+	backupPathOverride atomic.Pointer[string]
+}
+
+// SetBackupPath updates the backup path at runtime (thread-safe). Overrides
+// the BackupPath field set at construction for all subsequent RunIngest calls.
+func (p *Pipeline) SetBackupPath(path string) {
+	p.backupPathOverride.Store(&path)
+}
+
+// getBackupPath returns the current effective backup path.
+func (p *Pipeline) getBackupPath() string {
+	if v := p.backupPathOverride.Load(); v != nil {
+		return *v
+	}
+	return p.BackupPath
 }
 
 // TryAcquire attempts to mark RunIngest as running. Returns true and sets the
@@ -291,13 +307,14 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 	// Deliberately independent of the git commit/push block above — git only
 	// tracks XMP sidecars; the photo bytes are safe in originals/ as soon as
 	// the import loop finishes, regardless of AC power or push outcome.
-	if counts.Imported > 0 && p.BackupPath != "" {
-		synced, err := backup.Sync(p.RclonePath, p.OriginalsPath, p.BackupPath)
+	backupPath := p.getBackupPath()
+	if counts.Imported > 0 && backupPath != "" {
+		synced, err := backup.Sync(p.RclonePath, p.OriginalsPath, backupPath)
 		if err != nil {
 			p.Logger.Log(logging.PrefixBackup, fmt.Sprintf("sync error: %v", err))
 		} else if synced {
 			p.Logger.Log(logging.PrefixBackup,
-				fmt.Sprintf("synced %d photos to %s", counts.Imported, p.BackupPath))
+				fmt.Sprintf("synced %d photos to %s", counts.Imported, backupPath))
 		} else {
 			p.Logger.Log(logging.PrefixBackup, "backup drive not found, skipped")
 		}

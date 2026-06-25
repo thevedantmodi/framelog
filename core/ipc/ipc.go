@@ -25,6 +25,13 @@ import (
 	"github.com/thevedantmodi/framelog/core/outgest"
 )
 
+// ConfigSetter persists a new backup path and propagates it to the running
+// pipelines. Implemented in cmd/framelogd/main.go next to the concrete
+// StatusProvider, for the same cross-package-boundary reason.
+type ConfigSetter interface {
+	SetBackupPath(path string) error
+}
+
 // StatusProvider is the read-only view of pipeline state the status handler
 // needs. The concrete implementation (in cmd/framelogd/main.go) wraps
 // ingest.Pipeline, outgest.Pipeline, db, and backup — all live across package
@@ -44,6 +51,7 @@ type Server struct {
 	Ingest     ingest.Runner
 	Outgest    outgest.Runner
 	Status     StatusProvider
+	Config     ConfigSetter
 	Logger     *logging.Logger
 	// ReadDeadline is a server-side mirror of the client's 2s dial timeout
 	// (PROTOCOL.md §3). A client that connects and never writes must not hold
@@ -105,9 +113,10 @@ func (s *Server) acceptLoop() {
 	}
 }
 
-// request is the single field we parse from the client line.
+// request is parsed from the client line. Path is only used by set_backup_path.
 type request struct {
 	Command string `json:"command"`
+	Path    string `json:"path,omitempty"`
 }
 
 // Per-command response structs — separate types so each command gets exactly
@@ -133,6 +142,11 @@ type outgestOKResp struct {
 	Moved           int `json:"moved"`
 	Skipped         int `json:"skipped"`
 	Failed          int `json:"failed"`
+}
+
+type setBackupPathOKResp struct {
+	ProtocolVersion int  `json:"protocol_version"`
+	OK              bool `json:"ok"`
 }
 
 type statusResp struct {
@@ -228,6 +242,18 @@ func (s *Server) handleConn(conn net.Conn) {
 			LastImport:         lastImport,
 			BackupDriveMounted: s.Status.BackupDriveMounted(),
 		})
+
+	case "set_backup_path":
+		if s.Config == nil {
+			writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			return
+		}
+		if err := s.Config.SetBackupPath(req.Path); err != nil {
+			s.Logger.Log(logging.PrefixCore, fmt.Sprintf("ipc set_backup_path error: %v", err))
+			writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			return
+		}
+		writeResp(conn, setBackupPathOKResp{ProtocolVersion: 1, OK: true})
 
 	default:
 		writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "unknown_command"})

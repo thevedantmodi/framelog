@@ -41,8 +41,9 @@ struct ContentView: View {
         Divider()
 
         // FL-406
-        Button("Open Log File") { status.openLogFile() }
-        Button("Run Setup")     { status.runSetup() }
+        Button("Open Log File")       { status.openLogFile() }
+        Button("Set Backup Drive…")   { status.chooseAndSetBackupDrive() }
+        Button("Run Setup")           { status.runSetup() }
 
         Divider()
 

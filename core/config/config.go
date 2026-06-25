@@ -42,6 +42,10 @@ var (
 	// BackupPath is where the deduped originals/ library gets synced after a
 	// successful ingest (FL-207). Empty/unset means backup is disabled.
 	BackupPath = os.Getenv("FRAMELOG_BACKUP_PATH")
+
+	// UserConfigPath is the persisted JSON file written by set_backup_path IPC.
+	// Takes precedence over FRAMELOG_BACKUP_PATH at daemon startup.
+	UserConfigPath = filepath.Join(home, "Library", "Application Support", "Framelog", "framelog_config.json")
 )
 
 // SupportedExtensions mirrors config.py's SUPPORTED_EXTENSIONS. Decide here,

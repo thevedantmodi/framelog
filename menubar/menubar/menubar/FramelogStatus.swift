@@ -82,6 +82,42 @@ func statusDisplayString(snapshot: CatalogSnapshot?, coreReachable: Bool) -> Str
     return "\(countPart) · last import: \(fmt.localizedString(for: date, relativeTo: Date()))"
 }
 
+// Sends set_backup_path over the Unix socket. Fire-and-forget — failures are
+// silent (the drive picker already confirmed a valid path).
+func sendSetBackupPath(socketPath: String, path: String) {
+    let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { return }
+    defer { Darwin.close(fd) }
+
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = socketPath.utf8.prefix(103)
+    withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+        pathBytes.withContiguousStorageIfAvailable { src in
+            UnsafeMutableRawPointer(ptr).copyMemory(from: src.baseAddress!, byteCount: src.count)
+        }
+    }
+    let connected = withUnsafePointer(to: &addr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
+        }
+    }
+    guard connected else { return }
+
+    // Escape path for JSON (backslashes and quotes are the only chars that need it
+    // on macOS volume paths, but a full escape is safer).
+    let escaped = path
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+    let payload = "{\"command\":\"set_backup_path\",\"path\":\"\(escaped)\"}\n"
+    payload.withCString { ptr in
+        _ = Darwin.write(fd, ptr, strlen(ptr))
+    }
+    // Read (and discard) the response so the server sees a clean close.
+    var buf = [UInt8](repeating: 0, count: 256)
+    _ = Darwin.read(fd, &buf, buf.count)
+}
+
 enum CoreInstallState {
     case idle, installing, success, error(String)
 
@@ -250,6 +286,21 @@ final class FramelogStatus: ObservableObject {
         Task {
             try? await Task.sleep(for: .seconds(3))
             coreInstallState = .idle
+        }
+    }
+
+    // MARK: Backup path (set_backup_path IPC command)
+
+    func chooseAndSetBackupDrive() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Set as Backup Drive"
+        panel.message = "Choose the folder where Framelog should copy your originals."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task.detached {
+            sendSetBackupPath(socketPath: FramelogPaths.socket.path, path: url.path)
         }
     }
 

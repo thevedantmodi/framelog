@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -184,17 +185,40 @@ type statusProvider struct {
 	ingestPipeline  *ingest.Pipeline
 	outgestPipeline *outgest.Pipeline
 	dbConn          *sql.DB
-	backupPath      string
+	configSetter    *configSetter
 }
 
-func (s *statusProvider) IngestRunning() bool { return s.ingestPipeline.IngestRunning() }
-func (s *statusProvider) OutgestRunning() bool {
-	return s.outgestPipeline.OutgestRunning()
-}
-func (s *statusProvider) PhotoCount() (int, error)   { return db.PhotoCount(s.dbConn) }
+func (s *statusProvider) IngestRunning() bool      { return s.ingestPipeline.IngestRunning() }
+func (s *statusProvider) OutgestRunning() bool     { return s.outgestPipeline.OutgestRunning() }
+func (s *statusProvider) PhotoCount() (int, error) { return db.PhotoCount(s.dbConn) }
 func (s *statusProvider) LastImport() (string, error) { return db.LastImport(s.dbConn) }
 func (s *statusProvider) BackupDriveMounted() bool {
-	return backup.IsDriveMounted(s.backupPath)
+	return backup.IsDriveMounted(s.configSetter.backupPath())
+}
+
+// configSetter implements ipc.ConfigSetter: persists the new path to disk and
+// propagates it to the running ingest pipeline without a daemon restart.
+type configSetter struct {
+	pipeline *ingest.Pipeline
+	mu       sync.RWMutex
+	path     string
+}
+
+func (c *configSetter) backupPath() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.path
+}
+
+func (c *configSetter) SetBackupPath(path string) error {
+	if err := config.WriteUserConfig(config.UserConfig{BackupPath: path}); err != nil {
+		return fmt.Errorf("persist backup path: %w", err)
+	}
+	c.mu.Lock()
+	c.path = path
+	c.mu.Unlock()
+	c.pipeline.SetBackupPath(path)
+	return nil
 }
 
 // mainRun resolves all binaries, opens the DB, wires the pipeline, and runs
@@ -225,6 +249,16 @@ func mainRun() error {
 		return fmt.Errorf("logging.New: %w", err)
 	}
 	defer logger.Close()
+
+	// Load persisted user config; fall back to env var.
+	userCfg, err := config.ReadUserConfig()
+	if err != nil {
+		logger.Log(logging.PrefixCore, fmt.Sprintf("WARN could not read user config: %v", err))
+	}
+	initialBackupPath := userCfg.BackupPath
+	if initialBackupPath == "" {
+		initialBackupPath = config.BackupPath // env var fallback
+	}
 
 	logger.Log(logging.PrefixCore, fmt.Sprintf("framelogd %s starting", Version))
 	logger.Log(logging.PrefixCore, fmt.Sprintf("exiftool: %s", exiftoolPath))
@@ -278,8 +312,8 @@ func mainRun() error {
 		GitPath:       gitPath,
 		PmsetPath:     pmsetPath,
 		RclonePath:    rclonePath,
-		BackupPath:    config.BackupPath,
 	}
+	ingestPipeline.SetBackupPath(initialBackupPath)
 	outgestPipeline := &outgest.Pipeline{
 		DB:            dbConn,
 		Logger:        logger,
@@ -288,17 +322,19 @@ func mainRun() error {
 	}
 
 	// --- IPC server ---
+	cs := &configSetter{pipeline: ingestPipeline, path: initialBackupPath}
 	sp := &statusProvider{
 		ingestPipeline:  ingestPipeline,
 		outgestPipeline: outgestPipeline,
 		dbConn:          dbConn,
-		backupPath:      config.BackupPath,
+		configSetter:    cs,
 	}
 	ipcServer := &ipc.Server{
 		SocketPath:   config.SocketPath,
 		Ingest:       ingestPipeline,
 		Outgest:      outgestPipeline,
 		Status:       sp,
+		Config:       cs,
 		Logger:       logger,
 		ReadDeadline: 5 * time.Second,
 	}
