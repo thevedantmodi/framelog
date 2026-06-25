@@ -309,6 +309,7 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 	// the import loop finishes, regardless of AC power or push outcome.
 	backupPath := p.getBackupPath()
 	if counts.Imported > 0 && backupPath != "" {
+		p.Logger.Log(logging.PrefixBackup, fmt.Sprintf("syncing %d photos to %s", counts.Imported, backupPath))
 		synced, err := backup.Sync(p.RclonePath, p.OriginalsPath, backupPath)
 		if err != nil {
 			p.Logger.Log(logging.PrefixBackup, fmt.Sprintf("sync error: %v", err))
