@@ -53,6 +53,10 @@ type Server struct {
 	Status     StatusProvider
 	Config     ConfigSetter
 	Logger     *logging.Logger
+	// Version is stamped by the build system and reported in status responses so
+	// the Swift app can detect when the bundled binary is newer than the running
+	// daemon and trigger a silent re-install.
+	Version string
 	// ReadDeadline is a server-side mirror of the client's 2s dial timeout
 	// (PROTOCOL.md §3). A client that connects and never writes must not hold
 	// a goroutine open indefinitely. Default: 5s in production (set by main).
@@ -157,6 +161,7 @@ type statusResp struct {
 	PhotoCount         int    `json:"photo_count"`
 	LastImport         string `json:"last_import"`
 	BackupDriveMounted bool   `json:"backup_drive_mounted"`
+	DaemonVersion      string `json:"daemon_version"`
 }
 
 func writeResp(conn net.Conn, v any) {
@@ -241,6 +246,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			PhotoCount:         photoCount,
 			LastImport:         lastImport,
 			BackupDriveMounted: s.Status.BackupDriveMounted(),
+			DaemonVersion:      s.Version,
 		})
 
 	case "set_backup_path":

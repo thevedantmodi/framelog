@@ -268,8 +268,11 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 	}
 	sort.Strings(files)
 
+	total := len(files)
 	var counts Counts
-	for _, f := range files {
+	for i, f := range files {
+		p.Logger.Log(logging.PrefixIngest,
+			fmt.Sprintf("copying [%d/%d] %s", i+1, total, filepath.Base(f)))
 		switch result, _ := p.ImportFile(f, batchID); result {
 		case ResultImported:
 			counts.Imported++

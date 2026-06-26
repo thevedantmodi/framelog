@@ -82,6 +82,38 @@ func statusDisplayString(snapshot: CatalogSnapshot?, coreReachable: Bool) -> Str
     return "\(countPart) · last import: \(fmt.localizedString(for: date, relativeTo: Date()))"
 }
 
+// Sends {"command":"status"} over the Unix socket and returns daemon_version
+// from the response. Returns nil if the socket is unreachable or the field is absent.
+func fetchDaemonVersion(socketPath: String) -> String? {
+    let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { return nil }
+    defer { Darwin.close(fd) }
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = socketPath.utf8.prefix(103)
+    withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+        pathBytes.withContiguousStorageIfAvailable { src in
+            UnsafeMutableRawPointer(ptr).copyMemory(from: src.baseAddress!, byteCount: src.count)
+        }
+    }
+    let connected = withUnsafePointer(to: &addr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
+        }
+    }
+    guard connected else { return nil }
+    let payload = "{\"command\":\"status\"}\n"
+    payload.withCString { ptr in _ = Darwin.write(fd, ptr, strlen(ptr)) }
+    var buf = [UInt8](repeating: 0, count: 512)
+    let n = Darwin.read(fd, &buf, buf.count - 1)
+    guard n > 0 else { return nil }
+    let data = Data(buf.prefix(n))
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let version = json["daemon_version"] as? String,
+          !version.isEmpty else { return nil }
+    return version
+}
+
 // Sends set_backup_path over the Unix socket. Fire-and-forget — failures are
 // silent (the drive picker already confirmed a valid path).
 func sendSetBackupPath(socketPath: String, path: String) {
@@ -149,6 +181,14 @@ final class FramelogStatus: ObservableObject {
     private var previousLastImport: String?
     private var timer: Timer?
 
+    // Version stamped into the app bundle at build time — same source as framelogd's
+    // -ldflags Version. Used to detect when an upgrade replaced the bundle but the
+    // old daemon is still running.
+    private let bundledVersion: String? =
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+    // Guard against re-triggering install in the same app session.
+    private var hasAutoInstalled = false
+
     init() {
         requestNotificationPermissionIfNeeded()
         refreshLoginItemStatus()
@@ -205,8 +245,13 @@ final class FramelogStatus: ObservableObject {
         displayString = statusDisplayString(snapshot: snapshot, coreReachable: coreReachable)
         refreshLoginItemStatus()
 
-        // TODO(FL-302): backup-drive-missing notification belongs here once the
-        // socket's status command exists and reports "backup_drive_mounted".
+        if coreReachable, !hasAutoInstalled, let expected = bundledVersion {
+            let running = fetchDaemonVersion(socketPath: FramelogPaths.socket.path)
+            if let running, running != expected {
+                hasAutoInstalled = true
+                installCore()
+            }
+        }
     }
 
     // MARK: Notifications (FL-405)

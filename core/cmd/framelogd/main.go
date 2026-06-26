@@ -336,6 +336,7 @@ func mainRun() error {
 		Status:       sp,
 		Config:       cs,
 		Logger:       logger,
+		Version:      Version,
 		ReadDeadline: 5 * time.Second,
 	}
 

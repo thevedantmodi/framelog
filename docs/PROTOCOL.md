@@ -88,7 +88,8 @@ startup, the persisted value takes precedence over `FRAMELOG_BACKUP_PATH`.
 {"protocol_version": 1, "ok": true, "imported": 3, "skipped": 1, "failed": 0}
 {"protocol_version": 1, "ok": true, "moved": 2, "skipped": 0, "failed": 0}
 {"protocol_version": 1, "ok": true, "ingest_running": false, "outgest_running": false,
- "photo_count": 4213, "last_import": "2026-06-20T14:02:00Z", "backup_drive_mounted": true}
+ "photo_count": 4213, "last_import": "2026-06-20T14:02:00Z", "backup_drive_mounted": true,
+ "daemon_version": "0.4.0"}
 {"protocol_version": 1, "ok": true}
 {"protocol_version": 1, "ok": false, "error": "ingest_already_running"}
 {"protocol_version": 1, "ok": false, "error": "outgest_already_running"}
