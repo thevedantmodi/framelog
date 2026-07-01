@@ -298,6 +298,8 @@ final class FramelogStatus: ObservableObject {
 
     // MARK: Core install (FL-603)
 
+    private static let gitRemoteURLKey = "gitRemoteURL"
+
     func installCore() {
         guard !coreInstallState.isInProgress else { return }
         guard let binary = FramelogPaths.framelogdBinary else {
@@ -306,10 +308,15 @@ final class FramelogStatus: ObservableObject {
             return
         }
         coreInstallState = .installing
+        var arguments = ["install"]
+        let remoteURL = UserDefaults.standard.string(forKey: Self.gitRemoteURLKey) ?? ""
+        if !remoteURL.isEmpty {
+            arguments += ["--remote", remoteURL]
+        }
         Task.detached {
             let proc = Process()
             proc.executableURL = binary
-            proc.arguments = ["install"]
+            proc.arguments = arguments
             do {
                 try proc.run()
                 proc.waitUntilExit()
@@ -347,6 +354,22 @@ final class FramelogStatus: ObservableObject {
         Task.detached {
             sendSetBackupPath(socketPath: FramelogPaths.socket.path, path: url.path)
         }
+    }
+
+    func configureGitRemote() {
+        let alert = NSAlert()
+        alert.messageText = "Git Remote URL"
+        alert.informativeText = "Where framelogd pushes originals/ to (e.g. git@github.com:user/photos.git). Leave blank to unset."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        field.stringValue = UserDefaults.standard.string(forKey: Self.gitRemoteURLKey) ?? ""
+        alert.accessoryView = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let url = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        UserDefaults.standard.set(url, forKey: Self.gitRemoteURLKey)
+        guard !url.isEmpty else { return }
+        installCore()
     }
 
     // MARK: Other menu actions (FL-406)

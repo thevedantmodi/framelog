@@ -37,6 +37,7 @@ struct ContentView: View {
         // FL-603: Install the Go daemon as a launchd agent.
         Button(status.coreInstallState.label) { status.installCore() }
             .disabled(status.coreInstallState.isInProgress)
+        Button("Set Git Remote…") { status.configureGitRemote() }
 
         Divider()
 
