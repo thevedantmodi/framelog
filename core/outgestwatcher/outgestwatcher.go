@@ -155,5 +155,9 @@ func (w *Watcher) runOnce(seq uint64) {
 		w.Logger.Log(logging.PrefixOutgest, "skipped: outgest already running")
 		return
 	}
+	if errors.Is(err, outgest.ErrOutgestPaused) {
+		w.Logger.Log(logging.PrefixOutgest, "skipped: outgest paused")
+		return
+	}
 	w.Logger.Log(logging.PrefixOutgest, fmt.Sprintf("RunOutgest error: %v", err))
 }

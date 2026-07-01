@@ -196,6 +196,27 @@ func (s *statusProvider) BackupDriveMounted() bool {
 	return backup.IsDriveMounted(s.configSetter.backupPath())
 }
 
+// Paused reads only the ingest pipeline's flag — pauseController always sets
+// both pipelines together, so the two are never out of sync in practice.
+func (s *statusProvider) Paused() bool { return s.ingestPipeline.Paused() }
+
+// pauseController implements ipc.PauseController: "pause framelog" is a
+// single global toggle that pauses/resumes ingest and outgest together.
+type pauseController struct {
+	ingestPipeline  *ingest.Pipeline
+	outgestPipeline *outgest.Pipeline
+}
+
+func (p *pauseController) Pause() {
+	p.ingestPipeline.Pause()
+	p.outgestPipeline.Pause()
+}
+
+func (p *pauseController) Resume() {
+	p.ingestPipeline.Resume()
+	p.outgestPipeline.Resume()
+}
+
 // configSetter implements ipc.ConfigSetter: persists the new path to disk and
 // propagates it to the running ingest pipeline without a daemon restart.
 type configSetter struct {
@@ -335,6 +356,7 @@ func mainRun() error {
 		Outgest:      outgestPipeline,
 		Status:       sp,
 		Config:       cs,
+		Pause:        &pauseController{ingestPipeline: ingestPipeline, outgestPipeline: outgestPipeline},
 		Logger:       logger,
 		Version:      Version,
 		ReadDeadline: 5 * time.Second,

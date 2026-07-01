@@ -35,6 +35,7 @@ type fakeIngest struct {
 	counts  ingest.Counts
 	err     error
 	blockCh chan struct{} // if non-nil, RunIngest blocks until closed
+	paused  bool
 }
 
 func (f *fakeIngest) RunIngest() (ingest.Counts, error) {
@@ -49,10 +50,17 @@ func (f *fakeIngest) RunIngest() (ingest.Counts, error) {
 	return f.counts, f.err
 }
 
+func (f *fakeIngest) Paused() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.paused
+}
+
 type fakeOutgest struct {
 	mu     sync.Mutex
 	counts outgest.Counts
 	err    error
+	paused bool
 }
 
 func (f *fakeOutgest) RunOutgest() (outgest.Counts, error) {
@@ -61,12 +69,19 @@ func (f *fakeOutgest) RunOutgest() (outgest.Counts, error) {
 	return f.counts, f.err
 }
 
+func (f *fakeOutgest) Paused() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.paused
+}
+
 type fakeStatus struct {
 	ingestRunning      bool
 	outgestRunning     bool
 	photoCount         int
 	lastImport         string
 	backupDriveMounted bool
+	paused             bool
 }
 
 func (f *fakeStatus) IngestRunning() bool      { return f.ingestRunning }
@@ -76,6 +91,24 @@ func (f *fakeStatus) LastImport() (string, error) {
 	return f.lastImport, nil
 }
 func (f *fakeStatus) BackupDriveMounted() bool { return f.backupDriveMounted }
+func (f *fakeStatus) Paused() bool             { return f.paused }
+
+type fakePauseController struct {
+	mu     sync.Mutex
+	paused bool
+}
+
+func (f *fakePauseController) Pause() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.paused = true
+}
+
+func (f *fakePauseController) Resume() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.paused = false
+}
 
 type fakeConfig struct {
 	mu          sync.Mutex
@@ -114,6 +147,26 @@ func startServer(t *testing.T, fi *fakeIngest, fo *fakeOutgest, fs *fakeStatus, 
 		Outgest:      fo,
 		Status:       fs,
 		Config:       fc,
+		Logger:       openTestLogger(t),
+		ReadDeadline: 2 * time.Second,
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { s.Stop() })
+	return s
+}
+
+func startServerWithPause(t *testing.T, fi *fakeIngest, fo *fakeOutgest, fs *fakeStatus, fp PauseController) *Server {
+	t.Helper()
+	socketPath := filepath.Join(shortTempDir(t), "ipc.sock")
+	s := &Server{
+		SocketPath:   socketPath,
+		Ingest:       fi,
+		Outgest:      fo,
+		Status:       fs,
+		Config:       &fakeConfig{},
+		Pause:        fp,
 		Logger:       openTestLogger(t),
 		ReadDeadline: 2 * time.Second,
 	}
@@ -210,6 +263,17 @@ func TestIngestNow_AlreadyRunning(t *testing.T) {
 	}
 }
 
+func TestIngestNow_Paused(t *testing.T) {
+	fi := &fakeIngest{err: ingest.ErrIngestPaused}
+	s := startServer(t, fi, &fakeOutgest{}, &fakeStatus{}, &fakeConfig{})
+
+	m := dial(t, s.SocketPath, "ingest_now")
+
+	if m["error"] != "ingest_paused" {
+		t.Errorf("error = %v, want ingest_paused", m["error"])
+	}
+}
+
 func TestOutgestNow_SuccessResponse(t *testing.T) {
 	fo := &fakeOutgest{counts: outgest.Counts{Moved: 2, Skipped: 0, Failed: 0}}
 	s := startServer(t, &fakeIngest{}, fo, &fakeStatus{}, &fakeConfig{})
@@ -232,6 +296,58 @@ func TestOutgestNow_AlreadyRunning(t *testing.T) {
 
 	if m["error"] != "outgest_already_running" {
 		t.Errorf("error = %v, want outgest_already_running", m["error"])
+	}
+}
+
+func TestOutgestNow_Paused(t *testing.T) {
+	fo := &fakeOutgest{err: outgest.ErrOutgestPaused}
+	s := startServer(t, &fakeIngest{}, fo, &fakeStatus{}, &fakeConfig{})
+
+	m := dial(t, s.SocketPath, "outgest_now")
+
+	if m["error"] != "outgest_paused" {
+		t.Errorf("error = %v, want outgest_paused", m["error"])
+	}
+}
+
+func TestPauseResume_RoundTrip(t *testing.T) {
+	fp := &fakePauseController{}
+	s := startServerWithPause(t, &fakeIngest{}, &fakeOutgest{}, &fakeStatus{}, fp)
+
+	m := dial(t, s.SocketPath, "pause")
+	if m["ok"] != true || m["paused"] != true {
+		t.Errorf("pause resp = %v, want ok=true paused=true", m)
+	}
+	if !fp.paused {
+		t.Error("PauseController.Pause() was not called")
+	}
+
+	m = dial(t, s.SocketPath, "resume")
+	if m["ok"] != true || m["paused"] != false {
+		t.Errorf("resume resp = %v, want ok=true paused=false", m)
+	}
+	if fp.paused {
+		t.Error("PauseController.Resume() was not called")
+	}
+}
+
+func TestPause_NilController(t *testing.T) {
+	s := startServer(t, &fakeIngest{}, &fakeOutgest{}, &fakeStatus{}, &fakeConfig{})
+
+	m := dial(t, s.SocketPath, "pause")
+	if m["ok"] != false || m["error"] != "internal_error" {
+		t.Errorf("pause resp with nil controller = %v, want internal_error", m)
+	}
+}
+
+func TestStatus_ReportsPaused(t *testing.T) {
+	fs := &fakeStatus{paused: true}
+	s := startServer(t, &fakeIngest{}, &fakeOutgest{}, fs, &fakeConfig{})
+
+	m := dial(t, s.SocketPath, "status")
+
+	if m["paused"] != true {
+		t.Errorf("paused = %v, want true", m["paused"])
 	}
 }
 

@@ -42,6 +42,16 @@ type StatusProvider interface {
 	PhotoCount() (int, error)
 	LastImport() (string, error)
 	BackupDriveMounted() bool
+	Paused() bool
+}
+
+// PauseController pauses/resumes automatic and on-demand ingest+outgest
+// together — "pause framelog" is a single global toggle, not per-pipeline.
+// The concrete implementation (in cmd/framelogd/main.go) calls Pause/Resume
+// on both ingest.Pipeline and outgest.Pipeline.
+type PauseController interface {
+	Pause()
+	Resume()
 }
 
 // Server accepts connections on a Unix domain socket and dispatches one
@@ -52,6 +62,7 @@ type Server struct {
 	Outgest    outgest.Runner
 	Status     StatusProvider
 	Config     ConfigSetter
+	Pause      PauseController
 	Logger     *logging.Logger
 	// Version is stamped by the build system and reported in status responses so
 	// the Swift app can detect when the bundled binary is newer than the running
@@ -153,6 +164,12 @@ type setBackupPathOKResp struct {
 	OK              bool `json:"ok"`
 }
 
+type pauseOKResp struct {
+	ProtocolVersion int  `json:"protocol_version"`
+	OK              bool `json:"ok"`
+	Paused          bool `json:"paused"`
+}
+
 type statusResp struct {
 	ProtocolVersion    int    `json:"protocol_version"`
 	OK                 bool   `json:"ok"`
@@ -162,6 +179,7 @@ type statusResp struct {
 	LastImport         string `json:"last_import"`
 	BackupDriveMounted bool   `json:"backup_drive_mounted"`
 	DaemonVersion      string `json:"daemon_version"`
+	Paused             bool   `json:"paused"`
 }
 
 func writeResp(conn net.Conn, v any) {
@@ -196,6 +214,8 @@ func (s *Server) handleConn(conn net.Conn) {
 		if err != nil {
 			if errors.Is(err, ingest.ErrIngestAlreadyRunning) {
 				writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "ingest_already_running"})
+			} else if errors.Is(err, ingest.ErrIngestPaused) {
+				writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "ingest_paused"})
 			} else {
 				s.Logger.Log(logging.PrefixCore, fmt.Sprintf("ipc ingest_now error: %v", err))
 				writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
@@ -212,6 +232,8 @@ func (s *Server) handleConn(conn net.Conn) {
 		if err != nil {
 			if errors.Is(err, outgest.ErrOutgestAlreadyRunning) {
 				writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "outgest_already_running"})
+			} else if errors.Is(err, outgest.ErrOutgestPaused) {
+				writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "outgest_paused"})
 			} else {
 				s.Logger.Log(logging.PrefixCore, fmt.Sprintf("ipc outgest_now error: %v", err))
 				writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
@@ -247,7 +269,24 @@ func (s *Server) handleConn(conn net.Conn) {
 			LastImport:         lastImport,
 			BackupDriveMounted: s.Status.BackupDriveMounted(),
 			DaemonVersion:      s.Version,
+			Paused:             s.Status.Paused(),
 		})
+
+	case "pause":
+		if s.Pause == nil {
+			writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			return
+		}
+		s.Pause.Pause()
+		writeResp(conn, pauseOKResp{ProtocolVersion: 1, OK: true, Paused: true})
+
+	case "resume":
+		if s.Pause == nil {
+			writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			return
+		}
+		s.Pause.Resume()
+		writeResp(conn, pauseOKResp{ProtocolVersion: 1, OK: true, Paused: false})
 
 	case "set_backup_path":
 		if s.Config == nil {

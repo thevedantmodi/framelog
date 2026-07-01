@@ -41,12 +41,22 @@ import (
 // "error" field with no mapping table.
 var ErrIngestAlreadyRunning = errors.New("ingest_already_running")
 
+// ErrIngestPaused is returned by RunIngest when the pipeline has been paused
+// via Pause(). String value matches the wire error code convention (same
+// pattern as ErrIngestAlreadyRunning) so the socket handler can use
+// err.Error() directly as the JSON "error" field.
+var ErrIngestPaused = errors.New("ingest_paused")
+
 // Runner is the minimal interface consumers of ingest need. *Pipeline satisfies
 // it. Defined here so packages that depend on ingest behaviour (sdcard, ipc,
 // triggerwatcher) can accept a fake implementation in tests without wiring up a
-// full Pipeline with real exiftool/git/pmset.
+// full Pipeline with real exiftool/git/pmset. Paused lets callers that trigger
+// ingest automatically (sdcard, triggerwatcher) check state before consuming a
+// trigger file or copying DCIM contents, rather than losing the signal to a
+// paused RunIngest call.
 type Runner interface {
 	RunIngest() (Counts, error)
+	Paused() bool
 }
 
 // Pipeline holds resolved dependencies for an ingest run. Binary paths
@@ -66,8 +76,22 @@ type Pipeline struct {
 
 	mu                 sync.Mutex
 	running            bool
+	paused             atomic.Bool
 	backupPathOverride atomic.Pointer[string]
 }
+
+// Pause prevents new RunIngest calls from starting. An in-flight run (if any)
+// completes normally — Pause only blocks future starts, it does not cancel
+// work already underway.
+func (p *Pipeline) Pause() { p.paused.Store(true) }
+
+// Resume clears the paused flag set by Pause.
+func (p *Pipeline) Resume() { p.paused.Store(false) }
+
+// Paused reports whether the pipeline is currently paused. Checked by
+// triggerwatcher and sdcard before consuming a trigger file or DCIM copy, so
+// automatic triggers don't silently discard work while paused.
+func (p *Pipeline) Paused() bool { return p.paused.Load() }
 
 // SetBackupPath updates the backup path at runtime (thread-safe). Overrides
 // the BackupPath field set at construction for all subsequent RunIngest calls.
@@ -236,6 +260,9 @@ func (p *Pipeline) fail(srcPath string, err error) (Result, error) {
 // Returns ErrIngestAlreadyRunning immediately if another call is in progress
 // (PROTOCOL.md §3: "concurrency is the core's job").
 func (p *Pipeline) RunIngest() (Counts, error) {
+	if p.Paused() {
+		return Counts{}, ErrIngestPaused
+	}
 	if !p.TryAcquire() {
 		return Counts{}, ErrIngestAlreadyRunning
 	}

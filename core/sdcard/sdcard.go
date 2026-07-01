@@ -236,6 +236,12 @@ func (w *Watcher) tick() {
 		}
 	}
 
+	// pausedNames collects SD cards seen this tick that were skipped because the
+	// pipeline is paused. They're excluded from w.seen below so they look "new"
+	// again on the next tick and get retried once resumed, rather than
+	// requiring a physical unmount/remount.
+	var pausedNames []string
+
 	// Check newly-appeared volumes.
 	for name := range current {
 		if seen[name] || processed[name] {
@@ -251,6 +257,12 @@ func (w *Watcher) tick() {
 			continue
 		}
 		if !removable || !HasDCIM(volPath) {
+			continue
+		}
+		if w.Runner.Paused() {
+			w.Logger.Log(logging.PrefixCore,
+				fmt.Sprintf("ingest paused, SD card %s left for retry on resume", volPath))
+			pausedNames = append(pausedNames, name)
 			continue
 		}
 
@@ -284,6 +296,10 @@ func (w *Watcher) tick() {
 				fmt.Sprintf("ingest done: %d imported, %d skipped, %d failed",
 					counts.Imported, counts.Skipped, counts.Failed))
 		}
+	}
+
+	for _, name := range pausedNames {
+		delete(current, name)
 	}
 
 	w.mu.Lock()

@@ -114,6 +114,70 @@ func fetchDaemonVersion(socketPath: String) -> String? {
     return version
 }
 
+// Sends {"command":"status"} and returns the "paused" field. Returns nil if
+// the socket is unreachable or the field is absent — callers should leave the
+// previous displayed state unchanged in that case, matching fetchDaemonVersion.
+func fetchPaused(socketPath: String) -> Bool? {
+    let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { return nil }
+    defer { Darwin.close(fd) }
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = socketPath.utf8.prefix(103)
+    withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+        pathBytes.withContiguousStorageIfAvailable { src in
+            UnsafeMutableRawPointer(ptr).copyMemory(from: src.baseAddress!, byteCount: src.count)
+        }
+    }
+    let connected = withUnsafePointer(to: &addr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
+        }
+    }
+    guard connected else { return nil }
+    let payload = "{\"command\":\"status\"}\n"
+    payload.withCString { ptr in _ = Darwin.write(fd, ptr, strlen(ptr)) }
+    var buf = [UInt8](repeating: 0, count: 512)
+    let n = Darwin.read(fd, &buf, buf.count - 1)
+    guard n > 0 else { return nil }
+    let data = Data(buf.prefix(n))
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    return json["paused"] as? Bool
+}
+
+// Sends {"command":"pause"} or {"command":"resume"} over the Unix socket and
+// returns the acknowledged "paused" field, or nil if the socket is
+// unreachable / the daemon predates this command (e.g. an unpatched build —
+// caller should not assume the toggle took effect and should re-poll).
+func sendPauseResume(socketPath: String, pause: Bool) -> Bool? {
+    let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { return nil }
+    defer { Darwin.close(fd) }
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = socketPath.utf8.prefix(103)
+    withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+        pathBytes.withContiguousStorageIfAvailable { src in
+            UnsafeMutableRawPointer(ptr).copyMemory(from: src.baseAddress!, byteCount: src.count)
+        }
+    }
+    let connected = withUnsafePointer(to: &addr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
+        }
+    }
+    guard connected else { return nil }
+    let payload = "{\"command\":\"\(pause ? "pause" : "resume")\"}\n"
+    payload.withCString { ptr in _ = Darwin.write(fd, ptr, strlen(ptr)) }
+    var buf = [UInt8](repeating: 0, count: 256)
+    let n = Darwin.read(fd, &buf, buf.count - 1)
+    guard n > 0 else { return nil }
+    let data = Data(buf.prefix(n))
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          json["ok"] as? Bool == true else { return nil }
+    return json["paused"] as? Bool
+}
+
 // Sends set_backup_path over the Unix socket. Fire-and-forget — failures are
 // silent (the drive picker already confirmed a valid path).
 func sendSetBackupPath(socketPath: String, path: String) {
@@ -176,6 +240,8 @@ final class FramelogStatus: ObservableObject {
     @Published var ingestRequested = false
     @Published var outgestRequested = false
     @Published private(set) var coreInstallState: CoreInstallState = .idle
+    @Published private(set) var isPaused = false
+    @Published private(set) var pauseToggleInFlight = false
 
     private var previousCount = 0
     private var previousLastImport: String?
@@ -245,6 +311,10 @@ final class FramelogStatus: ObservableObject {
         displayString = statusDisplayString(snapshot: snapshot, coreReachable: coreReachable)
         refreshLoginItemStatus()
 
+        if coreReachable, let paused = fetchPaused(socketPath: FramelogPaths.socket.path) {
+            isPaused = paused
+        }
+
         if coreReachable, !hasAutoInstalled, let expected = bundledVersion {
             let running = fetchDaemonVersion(socketPath: FramelogPaths.socket.path)
             if let running, running != expected {
@@ -293,6 +363,26 @@ final class FramelogStatus: ObservableObject {
         Task {
             try? await Task.sleep(for: .seconds(2))
             outgestRequested = false
+        }
+    }
+
+    // MARK: Pause / resume
+
+    // Toggles the daemon's global pause state. Optimistic UI: flips isPaused
+    // immediately so the menu label updates without waiting on the socket
+    // round-trip, then reconciles with the daemon's actual acknowledged state
+    // (or the next 15s status poll, if this request fails silently).
+    func togglePause() {
+        guard !pauseToggleInFlight else { return }
+        let target = !isPaused
+        pauseToggleInFlight = true
+        isPaused = target
+        Task.detached {
+            let acked = sendPauseResume(socketPath: FramelogPaths.socket.path, pause: target)
+            await MainActor.run {
+                if let acked { self.isPaused = acked }
+                self.pauseToggleInFlight = false
+            }
         }
     }
 

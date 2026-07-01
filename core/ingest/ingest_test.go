@@ -3,6 +3,7 @@ package ingest
 import (
 	"bufio"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -464,6 +465,34 @@ func TestTryAcquireRelease(t *testing.T) {
 		t.Fatal("TryAcquire() after Release = false, want true")
 	}
 	p.Release() // clean up
+}
+
+func TestPauseResume_BlocksAndUnblocksRunIngest(t *testing.T) {
+	p := &Pipeline{}
+
+	if p.Paused() {
+		t.Fatal("Paused() = true before Pause() called")
+	}
+
+	p.Pause()
+	if !p.Paused() {
+		t.Fatal("Paused() = false after Pause()")
+	}
+	if _, err := p.RunIngest(); !errors.Is(err, ErrIngestPaused) {
+		t.Fatalf("RunIngest() while paused = %v, want ErrIngestPaused", err)
+	}
+
+	// TryAcquire is unaffected by Pause — pausing blocks RunIngest at the top,
+	// not the lower-level locking primitive tests rely on in isolation.
+	if !p.TryAcquire() {
+		t.Fatal("TryAcquire() while paused = false, want true")
+	}
+	p.Release()
+
+	p.Resume()
+	if p.Paused() {
+		t.Fatal("Paused() = true after Resume()")
+	}
 }
 
 // ---- backup tests -----------------------------------------------------------

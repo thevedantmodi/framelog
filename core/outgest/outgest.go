@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/thevedantmodi/framelog/core/config"
@@ -27,11 +28,18 @@ import (
 // PROTOCOL.md §3 (same pattern as ingest's ErrIngestAlreadyRunning).
 var ErrOutgestAlreadyRunning = errors.New("outgest_already_running")
 
+// ErrOutgestPaused is returned by RunOutgest when the pipeline has been paused
+// via Pause(). Mirrors ingest.ErrIngestPaused.
+var ErrOutgestPaused = errors.New("outgest_paused")
+
 // Runner is the minimal interface consumers of outgest need. *Pipeline satisfies
 // it. Defined here so packages that depend on outgest behaviour (outgestwatcher,
 // ipc, triggerwatcher) can accept a fake in tests without a full Pipeline.
+// Paused lets callers that trigger outgest automatically check state before
+// acting, so automatic triggers don't silently discard work while paused.
 type Runner interface {
 	RunOutgest() (Counts, error)
+	Paused() bool
 }
 
 // Result describes the outcome of a single OrganizeFile call.
@@ -55,7 +63,20 @@ type Pipeline struct {
 
 	mu      sync.Mutex
 	running bool
+	paused  atomic.Bool
 }
+
+// Pause prevents new RunOutgest calls from starting. An in-flight run (if
+// any) completes normally.
+func (p *Pipeline) Pause() { p.paused.Store(true) }
+
+// Resume clears the paused flag set by Pause.
+func (p *Pipeline) Resume() { p.paused.Store(false) }
+
+// Paused reports whether the pipeline is currently paused. Checked by
+// outgestwatcher before scanning processed/, so automatic triggers don't
+// silently discard work while paused.
+func (p *Pipeline) Paused() bool { return p.paused.Load() }
 
 // TryAcquire attempts to mark RunOutgest as running. Returns true when the
 // pipeline was idle and the flag is now set; returns false without blocking
@@ -166,6 +187,9 @@ func (p *Pipeline) fail(path string, err error) (Result, error) {
 // supported extensions, and calls OrganizeFile on each. Returns
 // ErrOutgestAlreadyRunning immediately if another call is in progress.
 func (p *Pipeline) RunOutgest() (Counts, error) {
+	if p.Paused() {
+		return Counts{}, ErrOutgestPaused
+	}
 	if !p.TryAcquire() {
 		return Counts{}, ErrOutgestAlreadyRunning
 	}

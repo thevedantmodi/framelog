@@ -3,6 +3,7 @@ package outgest
 import (
 	"bufio"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -304,5 +305,26 @@ func TestTryAcquireRelease(t *testing.T) {
 		t.Fatal("TryAcquire() after Release = false, want true")
 	}
 	p.Release()
+}
+
+func TestPauseResume_BlocksAndUnblocksRunOutgest(t *testing.T) {
+	p := &Pipeline{}
+
+	if p.Paused() {
+		t.Fatal("Paused() = true before Pause() called")
+	}
+
+	p.Pause()
+	if !p.Paused() {
+		t.Fatal("Paused() = false after Pause()")
+	}
+	if _, err := p.RunOutgest(); !errors.Is(err, ErrOutgestPaused) {
+		t.Fatalf("RunOutgest() while paused = %v, want ErrOutgestPaused", err)
+	}
+
+	p.Resume()
+	if p.Paused() {
+		t.Fatal("Paused() = true after Resume()")
+	}
 }
 

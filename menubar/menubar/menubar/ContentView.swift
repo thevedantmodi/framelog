@@ -21,16 +21,30 @@ struct ContentView: View {
 
         Divider()
 
+        // Pause/resume: a single global toggle covering ingest + outgest,
+        // automatic (SD card / trigger file) and manual alike.
+        Button(status.isPaused ? "Resume Framelog" : "Pause Framelog") {
+            status.togglePause()
+        }
+        .disabled(status.pauseToggleInFlight)
+
+        if status.isPaused {
+            Text("Paused — ingest and outgest are stopped")
+                .foregroundStyle(.secondary)
+        }
+
+        Divider()
+
         // FL-404: Trigger-file controls. "Requested…" for ~2s — no false confirmation.
         Button(status.ingestRequested ? "Requested…" : "Run Ingest Now") {
             status.requestIngest()
         }
-        .disabled(status.ingestRequested)
+        .disabled(status.ingestRequested || status.isPaused)
 
         Button(status.outgestRequested ? "Requested…" : "Run Outgest Now") {
             status.requestOutgest()
         }
-        .disabled(status.outgestRequested)
+        .disabled(status.outgestRequested || status.isPaused)
 
         Divider()
 

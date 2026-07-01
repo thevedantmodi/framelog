@@ -39,6 +39,7 @@ type fakeRunner struct {
 	mu       sync.Mutex
 	calls    int
 	notifyCh chan struct{}
+	paused   bool
 }
 
 func (r *fakeRunner) RunIngest() (ingest.Counts, error) {
@@ -53,6 +54,12 @@ func (r *fakeRunner) RunIngest() (ingest.Counts, error) {
 		}
 	}
 	return ingest.Counts{}, nil
+}
+
+func (r *fakeRunner) Paused() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.paused
 }
 
 func (r *fakeRunner) callCount() int {
@@ -382,4 +389,80 @@ func TestWatcher_Integration(t *testing.T) {
 	}
 
 	_ = fmt.Sprintf // keep fmt import used via Sprintf in fakeRunner
+}
+
+// TestWatcher_PausedRetriesOnResume verifies that an SD card inserted while
+// the pipeline is paused is not ingested immediately, does not get marked
+// "seen" forever, and fires RunIngest once the pipeline is resumed — without
+// requiring a physical unmount/remount.
+func TestWatcher_PausedRetriesOnResume(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping watcher integration test: requires 2s settle delays")
+	}
+
+	volumes := t.TempDir()
+	inbox := t.TempDir()
+	binDir := t.TempDir()
+
+	diskutil := writeFakeBin(t, binDir, "diskutil",
+		`echo "   Removable Media:           Removable"`)
+
+	notifyCh := make(chan struct{}, 1)
+	runner := &fakeRunner{notifyCh: notifyCh}
+	runner.mu.Lock()
+	runner.paused = true
+	runner.mu.Unlock()
+	logger := openTestLogger(t)
+
+	stop := make(chan struct{})
+	w := &Watcher{
+		DiskutilPath: diskutil,
+		VolumesRoot:  volumes,
+		InboxPath:    inbox,
+		PollInterval: 100 * time.Millisecond,
+		Runner:       runner,
+		Logger:       logger,
+	}
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- w.Run(stop) }()
+
+	sdPath := filepath.Join(volumes, "SDCARD")
+	if err := os.MkdirAll(filepath.Join(sdPath, "DCIM", "100CANON"), 0o755); err != nil {
+		t.Fatalf("create DCIM tree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sdPath, "DCIM", "100CANON", "IMG_0001.JPG"),
+		[]byte("photo bytes"), 0o644); err != nil {
+		t.Fatalf("write photo: %v", err)
+	}
+
+	// Give the watcher several ticks to see the card while paused.
+	time.Sleep(500 * time.Millisecond)
+	if n := runner.callCount(); n != 0 {
+		t.Fatalf("RunIngest called %d times while paused, want 0", n)
+	}
+
+	runner.mu.Lock()
+	runner.paused = false
+	runner.mu.Unlock()
+
+	select {
+	case <-notifyCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout: RunIngest was not called within 3s of resume")
+	}
+
+	if n := runner.callCount(); n != 1 {
+		t.Errorf("runner called %d times after resume, want 1", n)
+	}
+
+	close(stop)
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Errorf("Run() returned non-nil error after stop: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("Run() did not return after stop channel closed")
+	}
 }

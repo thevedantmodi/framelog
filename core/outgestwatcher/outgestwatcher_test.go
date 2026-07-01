@@ -82,6 +82,8 @@ func (r *countingRunner) RunOutgest() (outgest.Counts, error) {
 	return outgest.Counts{}, nil
 }
 
+func (r *countingRunner) Paused() bool { return false }
+
 func (r *countingRunner) count() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -245,6 +247,7 @@ func TestAlreadyRunning_Graceful(t *testing.T) {
 type OutgestRunnerFunc func() (outgest.Counts, error)
 
 func (f OutgestRunnerFunc) RunOutgest() (outgest.Counts, error) { return f() }
+func (f OutgestRunnerFunc) Paused() bool                        { return false }
 
 // ---- Integration: real Pipeline ---------------------------------------------
 

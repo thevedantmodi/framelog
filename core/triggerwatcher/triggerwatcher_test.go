@@ -26,9 +26,10 @@ func openTestLogger(t *testing.T) *logging.Logger {
 
 // fakeIngest counts RunIngest calls and can return a controlled error.
 type fakeIngest struct {
-	mu    sync.Mutex
-	calls int
-	err   error
+	mu     sync.Mutex
+	calls  int
+	err    error
+	paused bool
 }
 
 func (f *fakeIngest) RunIngest() (ingest.Counts, error) {
@@ -36,6 +37,12 @@ func (f *fakeIngest) RunIngest() (ingest.Counts, error) {
 	defer f.mu.Unlock()
 	f.calls++
 	return ingest.Counts{}, f.err
+}
+
+func (f *fakeIngest) Paused() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.paused
 }
 
 func (f *fakeIngest) callCount() int {
@@ -46,9 +53,10 @@ func (f *fakeIngest) callCount() int {
 
 // fakeOutgest counts RunOutgest calls and can return a controlled error.
 type fakeOutgest struct {
-	mu    sync.Mutex
-	calls int
-	err   error
+	mu     sync.Mutex
+	calls  int
+	err    error
+	paused bool
 }
 
 func (f *fakeOutgest) RunOutgest() (outgest.Counts, error) {
@@ -56,6 +64,12 @@ func (f *fakeOutgest) RunOutgest() (outgest.Counts, error) {
 	defer f.mu.Unlock()
 	f.calls++
 	return outgest.Counts{}, f.err
+}
+
+func (f *fakeOutgest) Paused() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.paused
 }
 
 func (f *fakeOutgest) callCount() int {
@@ -128,6 +142,50 @@ func TestOutgestTrigger_CalledOnceFileRemoved(t *testing.T) {
 	}
 	if _, err := os.Stat(w.OutgestTriggerPath); err == nil {
 		t.Error("outgest trigger file still exists after run")
+	}
+}
+
+// TestIngestTrigger_PausedLeavesFileInPlace verifies that a paused ingest
+// pipeline neither consumes the trigger file nor calls RunIngest, so the
+// trigger fires once the pipeline is resumed instead of being silently lost.
+func TestIngestTrigger_PausedLeavesFileInPlace(t *testing.T) {
+	dir := t.TempDir()
+	fi := &fakeIngest{paused: true}
+	fo := &fakeOutgest{}
+	w, stop := newWatcher(t, dir, fi, fo)
+
+	touchFile(t, w.IngestTriggerPath)
+
+	go w.Run(stop)
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+
+	if n := fi.callCount(); n != 0 {
+		t.Errorf("RunIngest called %d times while paused, want 0", n)
+	}
+	if _, err := os.Stat(w.IngestTriggerPath); err != nil {
+		t.Error("ingest trigger file was removed while paused")
+	}
+}
+
+// TestOutgestTrigger_PausedLeavesFileInPlace mirrors the ingest test for outgest.
+func TestOutgestTrigger_PausedLeavesFileInPlace(t *testing.T) {
+	dir := t.TempDir()
+	fi := &fakeIngest{}
+	fo := &fakeOutgest{paused: true}
+	w, stop := newWatcher(t, dir, fi, fo)
+
+	touchFile(t, w.OutgestTriggerPath)
+
+	go w.Run(stop)
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+
+	if n := fo.callCount(); n != 0 {
+		t.Errorf("RunOutgest called %d times while paused, want 0", n)
+	}
+	if _, err := os.Stat(w.OutgestTriggerPath); err != nil {
+		t.Error("outgest trigger file was removed while paused")
 	}
 }
 

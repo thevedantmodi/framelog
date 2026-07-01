@@ -54,6 +54,10 @@ func (w *Watcher) checkIngest() {
 	if _, err := os.Stat(w.IngestTriggerPath); err != nil {
 		return // not present — normal
 	}
+	if w.Ingest.Paused() {
+		w.Logger.Log(logging.PrefixCore, "ingest paused, trigger left in place")
+		return
+	}
 	if err := os.Remove(w.IngestTriggerPath); err != nil {
 		w.Logger.Log(logging.PrefixCore,
 			fmt.Sprintf("triggerwatcher: remove %s: %v", w.IngestTriggerPath, err))
@@ -71,6 +75,10 @@ func (w *Watcher) checkIngest() {
 
 func (w *Watcher) checkOutgest() {
 	if _, err := os.Stat(w.OutgestTriggerPath); err != nil {
+		return
+	}
+	if w.Outgest.Paused() {
+		w.Logger.Log(logging.PrefixCore, "outgest paused, trigger left in place")
 		return
 	}
 	if err := os.Remove(w.OutgestTriggerPath); err != nil {

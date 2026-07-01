@@ -75,12 +75,30 @@ never leaves the frontend holding a dead connection.
 {"command": "outgest_now"}
 {"command": "status"}
 {"command": "set_backup_path", "path": "/Volumes/MyBackupDrive"}
+{"command": "pause"}
+{"command": "resume"}
 ```
 
 `set_backup_path` with an empty `"path"` disables backup. The core persists the
 value to `~/Library/Application Support/Framelog/framelog_config.json` and
 applies it to the running pipeline immediately — no daemon restart needed. On
 startup, the persisted value takes precedence over `FRAMELOG_BACKUP_PATH`.
+
+`pause` / `resume` are a single global toggle covering ingest **and** outgest
+together — there is no separate "pause ingest only" mode. While paused:
+- `ingest_now` / `outgest_now` return `ingest_paused` / `outgest_paused` instead
+  of running.
+- The trigger-file watcher (§2) leaves `.ingest_trigger` / `.outgest_trigger` in
+  place instead of consuming them, so the pending request fires once resumed.
+- The SD card watcher does not copy DCIM contents or mark the card processed;
+  it re-checks the card on every poll tick until resumed, so no physical
+  unmount/remount is needed to retry.
+- The XMP-triggered outgest watcher (`outgestwatcher`) still logs the fsnotify
+  event but skips the run; a later export/manual `outgest_now` after resume
+  picks up any files left in `processed/`.
+
+Pause state is in-memory only — it resets to unpaused on every daemon restart
+(including a `launchd` `KeepAlive` crash-restart).
 
 **Responses:**
 
@@ -89,10 +107,13 @@ startup, the persisted value takes precedence over `FRAMELOG_BACKUP_PATH`.
 {"protocol_version": 1, "ok": true, "moved": 2, "skipped": 0, "failed": 0}
 {"protocol_version": 1, "ok": true, "ingest_running": false, "outgest_running": false,
  "photo_count": 4213, "last_import": "2026-06-20T14:02:00Z", "backup_drive_mounted": true,
- "daemon_version": "0.4.0"}
+ "daemon_version": "0.4.0", "paused": false}
 {"protocol_version": 1, "ok": true}
+{"protocol_version": 1, "ok": true, "paused": true}
 {"protocol_version": 1, "ok": false, "error": "ingest_already_running"}
 {"protocol_version": 1, "ok": false, "error": "outgest_already_running"}
+{"protocol_version": 1, "ok": false, "error": "ingest_paused"}
+{"protocol_version": 1, "ok": false, "error": "outgest_paused"}
 {"protocol_version": 1, "ok": false, "error": "unknown_command"}
 {"protocol_version": 1, "ok": false, "error": "bad_request"}
 {"protocol_version": 1, "ok": false, "error": "internal_error"}
@@ -100,7 +121,9 @@ startup, the persisted value takes precedence over `FRAMELOG_BACKUP_PATH`.
 
 **Concurrency:** the core holds its own mutex around `RunIngest`/`RunOutgest` and returns
 `ingest_already_running` / `outgest_already_running` rather than queuing. The frontend
-displays the error; it does not retry automatically.
+displays the error; it does not retry automatically. The `paused` check happens before
+the mutex is even attempted, so `ingest_paused`/`outgest_paused` and
+`ingest_already_running`/`outgest_already_running` are mutually exclusive outcomes.
 
 **`status` is served by a separate handler** that never shares a lock with
 `ingest_now`/`outgest_now`. A slow ingest must not make the core look unreachable to a
