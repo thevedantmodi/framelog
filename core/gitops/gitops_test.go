@@ -167,6 +167,72 @@ func TestPush_OnAC(t *testing.T) {
 	}
 }
 
+// TestPush_FirstPushSetsUpstream mirrors what `framelogd install --remote`
+// leaves behind: `git remote add origin <url>` with no push ever having run,
+// so the branch has no upstream configured yet. Push must pass -u on this
+// first push instead of a plain `git push`, which would fail with "no
+// upstream branch".
+func TestPush_FirstPushSetsUpstream(t *testing.T) {
+	repoDir := t.TempDir()
+	bareDir := t.TempDir()
+
+	git := initRepo(t, repoDir)
+
+	run := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command(git, args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run(bareDir, "init", "--bare")
+
+	writeFile(t, repoDir, "photo.raf", "fake raw bytes")
+	if _, err := Commit(git, repoDir, "first commit"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	// Wire the remote exactly like `install --remote` does: no -u, no push yet.
+	run(repoDir, "remote", "add", "origin", bareDir)
+
+	if hasUpstream(git, repoDir) {
+		t.Fatal("hasUpstream=true before any push, want false")
+	}
+
+	pushed, err := Push(git, repoDir, true)
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if !pushed {
+		t.Error("pushed=false on first push with remote configured, want true")
+	}
+	if !hasUpstream(git, repoDir) {
+		t.Error("hasUpstream=false after first Push, want true (Push should set tracking)")
+	}
+
+	out, err := exec.Command(git, "-C", bareDir, "log", "-1", "--format=%s").Output()
+	if err != nil {
+		t.Fatalf("git log bare: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "first commit" {
+		t.Errorf("bare repo HEAD subject = %q, want %q", got, "first commit")
+	}
+
+	// A second push, now that upstream is set, must still work as a plain push.
+	writeFile(t, repoDir, "photo2.raf", "more bytes")
+	if _, err := Commit(git, repoDir, "second commit"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	pushed, err = Push(git, repoDir, true)
+	if err != nil {
+		t.Fatalf("second Push: %v", err)
+	}
+	if !pushed {
+		t.Error("second pushed=false, want true")
+	}
+}
+
 // writeFakeBin writes a shell script to dir/<name> that executes body and
 // makes it executable. Returns its path.
 func writeFakeBin(t *testing.T, dir, name, body string) string {

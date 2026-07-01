@@ -152,12 +152,44 @@ func Push(gitPath, originalsPath string, onACPower bool) (pushed bool, err error
 		return false, nil // no remote configured — skip silently
 	}
 
+	args := []string{"push"}
+	if !hasUpstream(gitPath, originalsPath) {
+		branch, err := currentBranch(gitPath, originalsPath)
+		if err != nil {
+			return false, err
+		}
+		args = []string{"push", "-u", "origin", branch}
+	}
+
 	var stderr bytes.Buffer
-	cmd := exec.Command(gitPath, "push")
+	cmd := exec.Command(gitPath, args...)
 	cmd.Dir = originalsPath
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return false, fmt.Errorf("git push: %w; stderr: %s", err, bytes.TrimSpace(stderr.Bytes()))
+		return false, fmt.Errorf("git %s: %w; stderr: %s", strings.Join(args, " "), err, bytes.TrimSpace(stderr.Bytes()))
 	}
 	return true, nil
+}
+
+// hasUpstream reports whether the current branch in originalsPath already
+// tracks a remote branch. The first push after `install --remote` has no
+// upstream configured yet, so Push must pass -u once to set tracking;
+// every push after that can stay a plain `git push`.
+func hasUpstream(gitPath, originalsPath string) bool {
+	cmd := exec.Command(gitPath, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	cmd.Dir = originalsPath
+	return cmd.Run() == nil
+}
+
+// currentBranch returns the name of the checked-out branch in originalsPath.
+func currentBranch(gitPath, originalsPath string) (string, error) {
+	var stderr bytes.Buffer
+	cmd := exec.Command(gitPath, "rev-parse", "--abbrev-ref", "HEAD")
+	cmd.Dir = originalsPath
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse --abbrev-ref HEAD: %w; stderr: %s", err, bytes.TrimSpace(stderr.Bytes()))
+	}
+	return strings.TrimSpace(string(out)), nil
 }
