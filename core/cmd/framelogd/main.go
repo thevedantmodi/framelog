@@ -196,6 +196,7 @@ func (s *statusProvider) LastImport() (string, error) { return db.LastImport(s.d
 func (s *statusProvider) BackupDriveMounted() bool {
 	return backup.IsDriveMounted(s.configSetter.backupPath())
 }
+func (s *statusProvider) BackupConfigured() bool { return s.configSetter.backupPath() != "" }
 
 // Paused reads only the ingest pipeline's flag — pauseController always sets
 // both pipelines together, so the two are never out of sync in practice.
@@ -361,6 +362,14 @@ func mainRun() error {
 		Logger:       logger,
 		Version:      Version,
 		ReadDeadline: 5 * time.Second,
+		// Same facts the startup log lines above record, but machine-readable
+		// so the menu bar can show "backup disabled" without a log tail.
+		Caps: ipc.Capabilities{
+			SDCardWatch:    diskutilErr == nil,
+			Backup:         rclonePath != "",
+			ACPowerGate:    pmsetPath != "",
+			LightroomCheck: pgrepPath != "",
+		},
 	}
 
 	// --- Trigger watcher ---

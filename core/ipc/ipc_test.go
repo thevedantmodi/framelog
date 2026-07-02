@@ -81,6 +81,7 @@ type fakeStatus struct {
 	photoCount         int
 	lastImport         string
 	backupDriveMounted bool
+	backupConfigured   bool
 	paused             bool
 }
 
@@ -91,6 +92,7 @@ func (f *fakeStatus) LastImport() (string, error) {
 	return f.lastImport, nil
 }
 func (f *fakeStatus) BackupDriveMounted() bool { return f.backupDriveMounted }
+func (f *fakeStatus) BackupConfigured() bool   { return f.backupConfigured }
 func (f *fakeStatus) Paused() bool             { return f.paused }
 
 type fakePauseController struct {
@@ -633,5 +635,29 @@ func TestIngestNow_RunLongerThanDeadlineStillGetsResponse(t *testing.T) {
 	}
 	if m["imported"] != float64(2) || m["skipped"] != float64(1) {
 		t.Errorf("counts = imported %v, skipped %v; want 2, 1", m["imported"], m["skipped"])
+	}
+}
+
+// TestStatus_CapabilitiesAndBackupConfigured pins the PROTOCOL.md §3 fields the
+// menu bar uses to surface degraded capabilities and backup state without a
+// log tail.
+func TestStatus_CapabilitiesAndBackupConfigured(t *testing.T) {
+	fs := &fakeStatus{backupDriveMounted: false, backupConfigured: true}
+	s := startServer(t, &fakeIngest{}, &fakeOutgest{}, fs, &fakeConfig{})
+	s.Caps = Capabilities{SDCardWatch: true, Backup: false, ACPowerGate: true, LightroomCheck: true}
+
+	m := dial(t, s.SocketPath, "status")
+	if m["ok"] != true {
+		t.Fatalf("ok = %v, want true", m["ok"])
+	}
+	if m["backup_configured"] != true {
+		t.Errorf("backup_configured = %v, want true", m["backup_configured"])
+	}
+	caps, ok := m["capabilities"].(map[string]any)
+	if !ok {
+		t.Fatalf("capabilities missing or wrong shape: %v", m["capabilities"])
+	}
+	if caps["backup"] != false || caps["sd_card_watch"] != true {
+		t.Errorf("capabilities = %v, want backup=false sd_card_watch=true", caps)
 	}
 }

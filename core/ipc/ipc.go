@@ -42,7 +42,23 @@ type StatusProvider interface {
 	PhotoCount() (int, error)
 	LastImport() (string, error)
 	BackupDriveMounted() bool
+	// BackupConfigured distinguishes "no backup path set" from "backup drive
+	// unplugged" — both report BackupDriveMounted()==false, but the frontend
+	// shows different guidance for each (PROTOCOL.md §3).
+	BackupConfigured() bool
 	Paused() bool
+}
+
+// Capabilities reports which optional binaries were found at daemon startup.
+// A false value means the corresponding feature is silently disabled — the
+// frontend surfaces this in the menu instead of requiring a log tail
+// (PROTOCOL.md §3). Static for the life of the process; set by main from the
+// same Find* results it logs.
+type Capabilities struct {
+	SDCardWatch    bool `json:"sd_card_watch"`   // diskutil found
+	Backup         bool `json:"backup"`          // rclone found
+	ACPowerGate    bool `json:"ac_power_gate"`   // pmset found
+	LightroomCheck bool `json:"lightroom_check"` // pgrep found
 }
 
 // PauseController pauses/resumes automatic and on-demand ingest+outgest
@@ -72,6 +88,9 @@ type Server struct {
 	// (PROTOCOL.md §3). A client that connects and never writes must not hold
 	// a goroutine open indefinitely. Default: 5s in production (set by main).
 	ReadDeadline time.Duration
+	// Caps is set once at wiring time from binary resolution and echoed in
+	// every status response.
+	Caps Capabilities
 
 	ln net.Listener
 }
@@ -171,15 +190,17 @@ type pauseOKResp struct {
 }
 
 type statusResp struct {
-	ProtocolVersion    int    `json:"protocol_version"`
-	OK                 bool   `json:"ok"`
-	IngestRunning      bool   `json:"ingest_running"`
-	OutgestRunning     bool   `json:"outgest_running"`
-	PhotoCount         int    `json:"photo_count"`
-	LastImport         string `json:"last_import"`
-	BackupDriveMounted bool   `json:"backup_drive_mounted"`
-	DaemonVersion      string `json:"daemon_version"`
-	Paused             bool   `json:"paused"`
+	ProtocolVersion    int          `json:"protocol_version"`
+	OK                 bool         `json:"ok"`
+	IngestRunning      bool         `json:"ingest_running"`
+	OutgestRunning     bool         `json:"outgest_running"`
+	PhotoCount         int          `json:"photo_count"`
+	LastImport         string       `json:"last_import"`
+	BackupDriveMounted bool         `json:"backup_drive_mounted"`
+	BackupConfigured   bool         `json:"backup_configured"`
+	DaemonVersion      string       `json:"daemon_version"`
+	Paused             bool         `json:"paused"`
+	Capabilities       Capabilities `json:"capabilities"`
 }
 
 // deadline returns the configured ReadDeadline, defaulting to 5s.
@@ -281,8 +302,10 @@ func (s *Server) handleConn(conn net.Conn) {
 			PhotoCount:         photoCount,
 			LastImport:         lastImport,
 			BackupDriveMounted: s.Status.BackupDriveMounted(),
+			BackupConfigured:   s.Status.BackupConfigured(),
 			DaemonVersion:      s.Version,
 			Paused:             s.Status.Paused(),
+			Capabilities:       s.Caps,
 		})
 
 	case "pause":

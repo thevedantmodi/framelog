@@ -4,9 +4,21 @@ struct ContentView: View {
     @EnvironmentObject var status: FramelogStatus
 
     var body: some View {
-        // FL-403: Three-state display — "Core not running" / "No photos imported yet" / count+age
+        // FL-403: status line — see statusDisplayString for the state table.
         Text(status.displayString)
             .foregroundStyle(.secondary)
+
+        // Backup state + degraded-capability warnings from the daemon's
+        // status response — surfaced here so a missing rclone or unplugged
+        // backup drive is visible without tailing framelog.log.
+        if let backupLine = status.backupLine {
+            Text(backupLine)
+                .foregroundStyle(.secondary)
+        }
+        ForEach(status.capabilityNotes, id: \.self) { note in
+            Text("⚠ \(note)")
+                .foregroundStyle(.secondary)
+        }
 
         Divider()
 

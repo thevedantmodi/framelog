@@ -111,7 +111,9 @@ Pause state is in-memory only — it resets to unpaused on every daemon restart
 {"protocol_version": 1, "ok": true, "moved": 2, "skipped": 0, "failed": 0}
 {"protocol_version": 1, "ok": true, "ingest_running": false, "outgest_running": false,
  "photo_count": 4213, "last_import": "2026-06-20T14:02:00Z", "backup_drive_mounted": true,
- "daemon_version": "0.4.0", "paused": false}
+ "backup_configured": true, "daemon_version": "0.4.0", "paused": false,
+ "capabilities": {"sd_card_watch": true, "backup": true, "ac_power_gate": true,
+                  "lightroom_check": true}}
 {"protocol_version": 1, "ok": true}
 {"protocol_version": 1, "ok": true, "paused": true}
 {"protocol_version": 1, "ok": false, "error": "ingest_already_running"}
@@ -128,6 +130,13 @@ Pause state is in-memory only — it resets to unpaused on every daemon restart
 displays the error; it does not retry automatically. The `paused` check happens before
 the mutex is even attempted, so `ingest_paused`/`outgest_paused` and
 `ingest_already_running`/`outgest_already_running` are mutually exclusive outcomes.
+
+**Degraded-capability surfacing:** `capabilities` reports which optional binaries the
+daemon found at startup (`sd_card_watch`=diskutil, `backup`=rclone, `ac_power_gate`=pmset,
+`lightroom_check`=pgrep). A `false` value means that feature is disabled for this daemon
+run; the frontend shows it in the menu instead of requiring a log tail. Static per daemon
+process. `backup_configured` distinguishes "no backup path set" from "backup drive
+unplugged" — both report `backup_drive_mounted: false` but call for different guidance.
 
 **`status` is served by a separate handler** that never shares a lock with
 `ingest_now`/`outgest_now`. A slow ingest must not make the core look unreachable to a

@@ -82,15 +82,26 @@ func statusDisplayString(snapshot: CatalogSnapshot?, coreReachable: Bool) -> Str
     return "\(countPart) · last import: \(fmt.localizedString(for: date, relativeTo: Date()))"
 }
 
-// Sends {"command":"status"} over the Unix socket and returns daemon_version
-// from the response. Returns nil if the socket is unreachable or the field is absent.
-func fetchDaemonVersion(socketPath: String) -> String? {
+// MARK: - Socket client (PROTOCOL.md §3)
+
+// Dials the Unix socket, writes one JSON command line, reads one JSON line
+// back, and returns the parsed object. Returns nil on any failure — callers
+// treat nil as "core unreachable / no answer" and keep their previous state.
+// Send/receive timeouts are set on the socket so a stalled daemon can never
+// hang the caller indefinitely (the status handler stats the backup volume,
+// which can block on a dead network mount).
+func sendSocketCommand(socketPath: String, payload: String, timeout: TimeInterval = 5) -> [String: Any]? {
     let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else { return nil }
     defer { Darwin.close(fd) }
+
+    var tv = timeval(tv_sec: Int(timeout), tv_usec: 0)
+    _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
-    let pathBytes = socketPath.utf8.prefix(103)
+    let pathBytes = socketPath.utf8.prefix(103) // 104-byte macOS limit
     withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
         pathBytes.withContiguousStorageIfAvailable { src in
             UnsafeMutableRawPointer(ptr).copyMemory(from: src.baseAddress!, byteCount: src.count)
@@ -102,116 +113,80 @@ func fetchDaemonVersion(socketPath: String) -> String? {
         }
     }
     guard connected else { return nil }
-    let payload = "{\"command\":\"status\"}\n"
-    payload.withCString { ptr in _ = Darwin.write(fd, ptr, strlen(ptr)) }
-    var buf = [UInt8](repeating: 0, count: 512)
-    let n = Darwin.read(fd, &buf, buf.count - 1)
-    guard n > 0 else { return nil }
-    let data = Data(buf.prefix(n))
-    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let version = json["daemon_version"] as? String,
-          !version.isEmpty else { return nil }
-    return version
+
+    let line = payload + "\n"
+    let wrote = line.withCString { Darwin.write(fd, $0, strlen($0)) }
+    guard wrote > 0 else { return nil }
+
+    // Read until newline or EOF — the response is one JSON line, which can
+    // exceed a single read.
+    var data = Data()
+    var buf = [UInt8](repeating: 0, count: 1024)
+    while !data.contains(0x0A), data.count < 64 * 1024 {
+        let n = Darwin.read(fd, &buf, buf.count)
+        guard n > 0 else { break }
+        data.append(contentsOf: buf[0..<n])
+    }
+    guard !data.isEmpty else { return nil }
+    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
 }
 
-// Sends {"command":"status"} and returns the "paused" field. Returns nil if
-// the socket is unreachable or the field is absent — callers should leave the
-// previous displayed state unchanged in that case, matching fetchDaemonVersion.
-func fetchPaused(socketPath: String) -> Bool? {
-    let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-    guard fd >= 0 else { return nil }
-    defer { Darwin.close(fd) }
-    var addr = sockaddr_un()
-    addr.sun_family = sa_family_t(AF_UNIX)
-    let pathBytes = socketPath.utf8.prefix(103)
-    withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
-        pathBytes.withContiguousStorageIfAvailable { src in
-            UnsafeMutableRawPointer(ptr).copyMemory(from: src.baseAddress!, byteCount: src.count)
-        }
-    }
-    let connected = withUnsafePointer(to: &addr) { ptr in
-        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
-        }
-    }
-    guard connected else { return nil }
-    let payload = "{\"command\":\"status\"}\n"
-    payload.withCString { ptr in _ = Darwin.write(fd, ptr, strlen(ptr)) }
-    var buf = [UInt8](repeating: 0, count: 512)
-    let n = Darwin.read(fd, &buf, buf.count - 1)
-    guard n > 0 else { return nil }
-    let data = Data(buf.prefix(n))
-    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-    return json["paused"] as? Bool
+// Sends {"command":"status"} and returns the full response object, or nil if
+// the core is unreachable.
+func fetchStatus(socketPath: String) -> [String: Any]? {
+    sendSocketCommand(socketPath: socketPath, payload: "{\"command\":\"status\"}")
 }
 
-// Sends {"command":"pause"} or {"command":"resume"} over the Unix socket and
-// returns the acknowledged "paused" field, or nil if the socket is
-// unreachable / the daemon predates this command (e.g. an unpatched build —
-// caller should not assume the toggle took effect and should re-poll).
+// Sends {"command":"pause"} or {"command":"resume"} and returns the
+// acknowledged "paused" field, or nil if the socket is unreachable / the
+// daemon predates this command (caller should not assume the toggle took
+// effect and should re-poll).
 func sendPauseResume(socketPath: String, pause: Bool) -> Bool? {
-    let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-    guard fd >= 0 else { return nil }
-    defer { Darwin.close(fd) }
-    var addr = sockaddr_un()
-    addr.sun_family = sa_family_t(AF_UNIX)
-    let pathBytes = socketPath.utf8.prefix(103)
-    withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
-        pathBytes.withContiguousStorageIfAvailable { src in
-            UnsafeMutableRawPointer(ptr).copyMemory(from: src.baseAddress!, byteCount: src.count)
-        }
-    }
-    let connected = withUnsafePointer(to: &addr) { ptr in
-        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
-        }
-    }
-    guard connected else { return nil }
-    let payload = "{\"command\":\"\(pause ? "pause" : "resume")\"}\n"
-    payload.withCString { ptr in _ = Darwin.write(fd, ptr, strlen(ptr)) }
-    var buf = [UInt8](repeating: 0, count: 256)
-    let n = Darwin.read(fd, &buf, buf.count - 1)
-    guard n > 0 else { return nil }
-    let data = Data(buf.prefix(n))
-    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+    let payload = "{\"command\":\"\(pause ? "pause" : "resume")\"}"
+    guard let json = sendSocketCommand(socketPath: socketPath, payload: payload),
           json["ok"] as? Bool == true else { return nil }
     return json["paused"] as? Bool
 }
 
-// Sends set_backup_path over the Unix socket. Fire-and-forget — failures are
-// silent (the drive picker already confirmed a valid path).
+// Sends set_backup_path. Fire-and-forget — failures are silent (the drive
+// picker already confirmed a valid path); the next status poll shows the result.
 func sendSetBackupPath(socketPath: String, path: String) {
-    let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-    guard fd >= 0 else { return }
-    defer { Darwin.close(fd) }
-
-    var addr = sockaddr_un()
-    addr.sun_family = sa_family_t(AF_UNIX)
-    let pathBytes = socketPath.utf8.prefix(103)
-    withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
-        pathBytes.withContiguousStorageIfAvailable { src in
-            UnsafeMutableRawPointer(ptr).copyMemory(from: src.baseAddress!, byteCount: src.count)
-        }
-    }
-    let connected = withUnsafePointer(to: &addr) { ptr in
-        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
-        }
-    }
-    guard connected else { return }
-
     // Escape path for JSON (backslashes and quotes are the only chars that need it
     // on macOS volume paths, but a full escape is safer).
     let escaped = path
         .replacingOccurrences(of: "\\", with: "\\\\")
         .replacingOccurrences(of: "\"", with: "\\\"")
-    let payload = "{\"command\":\"set_backup_path\",\"path\":\"\(escaped)\"}\n"
-    payload.withCString { ptr in
-        _ = Darwin.write(fd, ptr, strlen(ptr))
+    _ = sendSocketCommand(socketPath: socketPath,
+                          payload: "{\"command\":\"set_backup_path\",\"path\":\"\(escaped)\"}")
+}
+
+// MARK: - Degraded-capability display (PROTOCOL.md §3 capabilities)
+
+// Returns the backup line for the menu. Pure function.
+// rcloneAvailable=false wins: without rclone no backup runs regardless of
+// configuration. configured distinguishes "never set up" from "drive unplugged".
+func backupStatusLine(rcloneAvailable: Bool, configured: Bool, mounted: Bool) -> String {
+    guard rcloneAvailable else { return "Backup off — rclone not installed" }
+    guard configured else { return "Backup not set up" }
+    return mounted ? "Backup drive connected" : "Backup drive not connected"
+}
+
+// Returns menu warnings for missing optional binaries other than rclone
+// (which gets the dedicated backup line above). Pure function; unknown or
+// absent keys produce no warning so older daemons stay quiet.
+func capabilityWarnings(_ caps: [String: Any]?) -> [String] {
+    guard let caps else { return [] }
+    var warnings: [String] = []
+    if caps["sd_card_watch"] as? Bool == false {
+        warnings.append("SD card detection off — diskutil missing")
     }
-    // Read (and discard) the response so the server sees a clean close.
-    var buf = [UInt8](repeating: 0, count: 256)
-    _ = Darwin.read(fd, &buf, buf.count)
+    if caps["ac_power_gate"] as? Bool == false {
+        warnings.append("AC-power check off — pmset missing")
+    }
+    if caps["lightroom_check"] as? Bool == false {
+        warnings.append("Lightroom check off — pgrep missing")
+    }
+    return warnings
 }
 
 enum CoreInstallState {
@@ -242,9 +217,18 @@ final class FramelogStatus: ObservableObject {
     @Published private(set) var coreInstallState: CoreInstallState = .idle
     @Published private(set) var isPaused = false
     @Published private(set) var pauseToggleInFlight = false
+    // Backup line + degraded-capability warnings from the daemon's status
+    // response (PROTOCOL.md §3). nil/empty until the first successful poll.
+    @Published private(set) var backupLine: String?
+    @Published private(set) var capabilityNotes: [String] = []
 
     private var previousCount = 0
     private var previousLastImport: String?
+    // The first poll seeds previousCount/previousLastImport from the existing
+    // catalog. Diffing against the zero-value initial state instead would fire
+    // an "Imported N new photos" notification for the whole library on every
+    // app launch.
+    private var hasSeededCounters = false
     private var timer: Timer?
 
     // Version stamped into the app bundle at build time — same source as framelogd's
@@ -300,27 +284,47 @@ final class FramelogStatus: ObservableObject {
         let newLastImport = snapshot?.lastImport
 
         // Reuse this tick for import notifications (FL-405) — no second timer.
-        if let newLast = newLastImport,
+        // Skipped on the seeding poll: the pre-existing library is not "new".
+        if hasSeededCounters,
+           let newLast = newLastImport,
            newLast != previousLastImport,
            newCount > previousCount {
             fireImportNotification(oldCount: previousCount, newCount: newCount)
         }
 
+        hasSeededCounters = true
         previousCount = newCount
         previousLastImport = newLastImport
         displayString = statusDisplayString(snapshot: snapshot, coreReachable: coreReachable)
         refreshLoginItemStatus()
 
-        if coreReachable, let paused = fetchPaused(socketPath: FramelogPaths.socket.path) {
+        // One status round-trip supplies paused state, backup state,
+        // capability flags, and the daemon version. Unreachable core → keep
+        // the previous displayed values.
+        guard coreReachable, let status = fetchStatus(socketPath: FramelogPaths.socket.path) else {
+            return
+        }
+
+        if let paused = status["paused"] as? Bool {
             isPaused = paused
         }
 
-        if coreReachable, !hasAutoInstalled, let expected = bundledVersion {
-            let running = fetchDaemonVersion(socketPath: FramelogPaths.socket.path)
-            if let running, running != expected {
-                hasAutoInstalled = true
-                installCore()
-            }
+        // A daemon predating these fields (no "capabilities" key) shows no
+        // backup line at all rather than a wrong "Backup not set up".
+        if let caps = status["capabilities"] as? [String: Any] {
+            backupLine = backupStatusLine(
+                rcloneAvailable: caps["backup"] as? Bool ?? true,
+                configured: status["backup_configured"] as? Bool ?? false,
+                mounted: status["backup_drive_mounted"] as? Bool ?? false
+            )
+            capabilityNotes = capabilityWarnings(caps)
+        }
+
+        if !hasAutoInstalled, let expected = bundledVersion,
+           let running = status["daemon_version"] as? String,
+           !running.isEmpty, running != expected {
+            hasAutoInstalled = true
+            installCore()
         }
     }
 
