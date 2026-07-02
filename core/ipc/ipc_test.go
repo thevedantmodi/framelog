@@ -594,3 +594,44 @@ func TestSetBackupPath_SetterError(t *testing.T) {
 		t.Errorf("error = %v, want internal_error", m["error"])
 	}
 }
+
+// TestIngestNow_RunLongerThanDeadlineStillGetsResponse pins the write-deadline
+// fix: ingest_now runs the pipeline synchronously, so a run longer than
+// ReadDeadline must still produce a response. Before the fix, handleConn set a
+// combined read+write deadline before invoking the runner; by the time the
+// runner returned the deadline had expired and the response write was silently
+// dropped — a successful ingest looked like a dead connection to the client.
+func TestIngestNow_RunLongerThanDeadlineStillGetsResponse(t *testing.T) {
+	fi := &fakeIngest{
+		counts:  ingest.Counts{Imported: 2, Skipped: 1},
+		blockCh: make(chan struct{}),
+	}
+	socketPath := filepath.Join(shortTempDir(t), "ipc.sock")
+	s := &Server{
+		SocketPath:   socketPath,
+		Ingest:       fi,
+		Outgest:      &fakeOutgest{},
+		Status:       &fakeStatus{},
+		Config:       &fakeConfig{},
+		Logger:       openTestLogger(t),
+		ReadDeadline: 100 * time.Millisecond,
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { s.Stop() })
+
+	// Release the "ingest" well after the 100ms deadline has expired.
+	go func() {
+		time.Sleep(400 * time.Millisecond)
+		close(fi.blockCh)
+	}()
+
+	m := dial(t, s.SocketPath, "ingest_now")
+	if m["ok"] != true {
+		t.Fatalf("ok = %v, want true; full response: %v", m["ok"], m)
+	}
+	if m["imported"] != float64(2) || m["skipped"] != float64(1) {
+		t.Errorf("counts = imported %v, skipped %v; want 2, 1", m["imported"], m["skipped"])
+	}
+}

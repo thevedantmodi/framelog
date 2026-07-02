@@ -182,7 +182,22 @@ type statusResp struct {
 	Paused             bool   `json:"paused"`
 }
 
-func writeResp(conn net.Conn, v any) {
+// deadline returns the configured ReadDeadline, defaulting to 5s.
+func (s *Server) deadline() time.Duration {
+	if s.ReadDeadline > 0 {
+		return s.ReadDeadline
+	}
+	return 5 * time.Second
+}
+
+// writeResp writes one JSON response line. The write deadline is set fresh
+// here, NOT inherited from the request-read deadline: ingest_now/outgest_now
+// run their pipeline synchronously and can take far longer than the read
+// window, so a deadline stamped before the run would already be expired by
+// the time the response is written — the client would see the connection
+// close with no reply and a successful run would look like a failure.
+func (s *Server) writeResp(conn net.Conn, v any) {
+	conn.SetWriteDeadline(time.Now().Add(s.deadline())) //nolint:errcheck
 	b, _ := json.Marshal(v)
 	b = append(b, '\n')
 	conn.Write(b) //nolint:errcheck — nothing useful to do if the write fails
@@ -191,11 +206,9 @@ func writeResp(conn net.Conn, v any) {
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 
-	rd := s.ReadDeadline
-	if rd <= 0 {
-		rd = 5 * time.Second
-	}
-	conn.SetDeadline(time.Now().Add(rd)) //nolint:errcheck
+	// Read deadline only — the write deadline is set per-response in writeResp
+	// (see comment there). A silent client is still dropped after this window.
+	conn.SetReadDeadline(time.Now().Add(s.deadline())) //nolint:errcheck
 
 	line, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
@@ -204,7 +217,7 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	var req request
 	if err := json.Unmarshal([]byte(line), &req); err != nil {
-		writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "bad_request"})
+		s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "bad_request"})
 		return
 	}
 
@@ -213,16 +226,16 @@ func (s *Server) handleConn(conn net.Conn) {
 		counts, err := s.Ingest.RunIngest()
 		if err != nil {
 			if errors.Is(err, ingest.ErrIngestAlreadyRunning) {
-				writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "ingest_already_running"})
+				s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "ingest_already_running"})
 			} else if errors.Is(err, ingest.ErrIngestPaused) {
-				writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "ingest_paused"})
+				s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "ingest_paused"})
 			} else {
 				s.Logger.Log(logging.PrefixCore, fmt.Sprintf("ipc ingest_now error: %v", err))
-				writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+				s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
 			}
 			return
 		}
-		writeResp(conn, ingestOKResp{
+		s.writeResp(conn, ingestOKResp{
 			ProtocolVersion: 1, OK: true,
 			Imported: counts.Imported, Skipped: counts.Skipped, Failed: counts.Failed,
 		})
@@ -231,16 +244,16 @@ func (s *Server) handleConn(conn net.Conn) {
 		counts, err := s.Outgest.RunOutgest()
 		if err != nil {
 			if errors.Is(err, outgest.ErrOutgestAlreadyRunning) {
-				writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "outgest_already_running"})
+				s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "outgest_already_running"})
 			} else if errors.Is(err, outgest.ErrOutgestPaused) {
-				writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "outgest_paused"})
+				s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "outgest_paused"})
 			} else {
 				s.Logger.Log(logging.PrefixCore, fmt.Sprintf("ipc outgest_now error: %v", err))
-				writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+				s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
 			}
 			return
 		}
-		writeResp(conn, outgestOKResp{
+		s.writeResp(conn, outgestOKResp{
 			ProtocolVersion: 1, OK: true,
 			Moved: counts.Moved, Skipped: counts.Skipped, Failed: counts.Failed,
 		})
@@ -251,16 +264,16 @@ func (s *Server) handleConn(conn net.Conn) {
 		photoCount, err := s.Status.PhotoCount()
 		if err != nil {
 			s.Logger.Log(logging.PrefixCore, fmt.Sprintf("ipc status PhotoCount: %v", err))
-			writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
 			return
 		}
 		lastImport, err := s.Status.LastImport()
 		if err != nil {
 			s.Logger.Log(logging.PrefixCore, fmt.Sprintf("ipc status LastImport: %v", err))
-			writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
 			return
 		}
-		writeResp(conn, statusResp{
+		s.writeResp(conn, statusResp{
 			ProtocolVersion:    1,
 			OK:                 true,
 			IngestRunning:      s.Status.IngestRunning(),
@@ -274,33 +287,33 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	case "pause":
 		if s.Pause == nil {
-			writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
 			return
 		}
 		s.Pause.Pause()
-		writeResp(conn, pauseOKResp{ProtocolVersion: 1, OK: true, Paused: true})
+		s.writeResp(conn, pauseOKResp{ProtocolVersion: 1, OK: true, Paused: true})
 
 	case "resume":
 		if s.Pause == nil {
-			writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
 			return
 		}
 		s.Pause.Resume()
-		writeResp(conn, pauseOKResp{ProtocolVersion: 1, OK: true, Paused: false})
+		s.writeResp(conn, pauseOKResp{ProtocolVersion: 1, OK: true, Paused: false})
 
 	case "set_backup_path":
 		if s.Config == nil {
-			writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
 			return
 		}
 		if err := s.Config.SetBackupPath(req.Path); err != nil {
 			s.Logger.Log(logging.PrefixCore, fmt.Sprintf("ipc set_backup_path error: %v", err))
-			writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
 			return
 		}
-		writeResp(conn, setBackupPathOKResp{ProtocolVersion: 1, OK: true})
+		s.writeResp(conn, setBackupPathOKResp{ProtocolVersion: 1, OK: true})
 
 	default:
-		writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "unknown_command"})
+		s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "unknown_command"})
 	}
 }

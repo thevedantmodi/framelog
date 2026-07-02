@@ -64,6 +64,10 @@ never leaves the frontend holding a dead connection.
 - Frontend dial timeout: 2 seconds.
 - No response / connection refused / socket file absent → core unreachable (see §4).
 - Server-side `ReadDeadline`: 5 seconds. Silent clients are dropped after this window.
+  This deadline covers only reading the request. `ingest_now` / `outgest_now` run the
+  pipeline synchronously and reply when it finishes — potentially minutes later. Clients
+  must not apply the 2-second dial timeout to the response read; read until newline or
+  connection close.
 - Socket permissions: 0600 (user-only). Stale socket files from unclean shutdowns are
   removed automatically on server startup.
 - Every response includes `"protocol_version": 1` for forward-compatibility detection.
