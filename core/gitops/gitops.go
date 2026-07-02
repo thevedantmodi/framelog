@@ -107,7 +107,14 @@ func Commit(gitPath, originalsPath, message string) (committed bool, err error) 
 // contains "AC Power". Takes the resolved binary path as a parameter so callers
 // can inject a fake script in tests — the real pmset is macOS-only and must
 // never be a hidden test dependency.
+//
+// An empty pmsetPath means pmset was not found at startup. Per PROTOCOL.md §6
+// the AC-power gate is skipped in that case: report on-AC so pushes always
+// proceed, matching the "will always attempt" promise logged by mainRun.
 func IsOnACPower(pmsetPath string) (bool, error) {
+	if pmsetPath == "" {
+		return true, nil // pmset absent — gate skipped, not an error
+	}
 	var stderr bytes.Buffer
 	cmd := exec.Command(pmsetPath, "-g", "batt")
 	cmd.Stderr = &stderr

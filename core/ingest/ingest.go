@@ -338,7 +338,11 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 	// tracks XMP sidecars; the photo bytes are safe in originals/ as soon as
 	// the import loop finishes, regardless of AC power or push outcome.
 	backupPath := p.getBackupPath()
-	if counts.Imported > 0 && backupPath != "" {
+	if counts.Imported > 0 && backupPath != "" && p.RclonePath == "" {
+		// rclone was not found at startup — a configured backup path cannot be
+		// synced. Say so explicitly instead of invoking exec.Command("").
+		p.Logger.Log(logging.PrefixBackup, "backup skipped: rclone not installed")
+	} else if counts.Imported > 0 && backupPath != "" {
 		p.Logger.Log(logging.PrefixBackup, fmt.Sprintf("syncing %d photos to %s", counts.Imported, backupPath))
 		synced, err := backup.Sync(p.RclonePath, p.OriginalsPath, backupPath)
 		if err != nil {

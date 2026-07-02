@@ -72,7 +72,14 @@ func FindPgrep() (string, error) {
 // process matched" and is not an error. Any other exit code or exec failure is
 // a genuine error. Taking the resolved binary as a parameter makes this
 // testable with a fake script, mirroring IsOnACPower.
+//
+// An empty pgrepPath means pgrep was not found at startup. Per PROTOCOL.md §6
+// the Lightroom-running gate is skipped in that case: report not-running so
+// commits always push, matching the "will always push" promise logged by mainRun.
 func IsLightroomRunning(pgrepPath string) (bool, error) {
+	if pgrepPath == "" {
+		return false, nil // pgrep absent — gate skipped, not an error
+	}
 	err := exec.Command(pgrepPath, "-i", "lightroom").Run()
 	if err == nil {
 		return true, nil

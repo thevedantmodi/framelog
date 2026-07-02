@@ -412,3 +412,15 @@ func TestDynamicSubdirectory(t *testing.T) {
 		t.Errorf("git log count = %d, want 2 (initial + 1 edit from dynamic subdir)", n)
 	}
 }
+
+func TestIsLightroomRunning_EmptyPathSkipsGate(t *testing.T) {
+	// pgrep absent (path resolved to "") — PROTOCOL.md §6: gate is skipped,
+	// which means "treat as not running" so commits always push.
+	got, err := IsLightroomRunning("")
+	if err != nil {
+		t.Fatalf("IsLightroomRunning(\"\"): %v", err)
+	}
+	if got {
+		t.Error("IsLightroomRunning(\"\")=true, want false (gate skipped when pgrep absent)")
+	}
+}

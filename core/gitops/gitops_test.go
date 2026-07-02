@@ -304,3 +304,15 @@ func TestIsOnACPower_Battery(t *testing.T) {
 		t.Error("IsOnACPower=true for Battery Power output, want false")
 	}
 }
+
+func TestIsOnACPower_EmptyPathSkipsGate(t *testing.T) {
+	// pmset absent (path resolved to "") — PROTOCOL.md §6: gate is skipped,
+	// which means "treat as on AC" so pushes always proceed.
+	on, err := IsOnACPower("")
+	if err != nil {
+		t.Fatalf("IsOnACPower(\"\"): %v", err)
+	}
+	if !on {
+		t.Error("IsOnACPower(\"\")=false, want true (gate skipped when pmset absent)")
+	}
+}
