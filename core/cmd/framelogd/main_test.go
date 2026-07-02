@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -348,5 +349,71 @@ func TestSmokeDaemon_StatusResponse(t *testing.T) {
 	}
 	if _, exists := m["photo_count"]; !exists {
 		t.Error("response missing photo_count field")
+	}
+}
+
+// TestRun_WatcherDeathIsFatal pins the bug-5 fix: a watcher goroutine dying
+// (here: xmpwatcher failing its startup walk on a nonexistent originals dir)
+// must make run() return an error instead of silently continuing with
+// auto-commit dead. A non-nil return exits the process non-zero, which is what
+// lets launchd's KeepAlive restart the daemon with all watchers alive.
+func TestRun_WatcherDeathIsFatal(t *testing.T) {
+	base := shortTempDir(t)
+	processed := filepath.Join(base, "processed")
+	if err := os.MkdirAll(processed, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	logger, err := logging.New(filepath.Join(base, "test.log"))
+	if err != nil {
+		t.Fatalf("logging.New: %v", err)
+	}
+	t.Cleanup(func() { logger.Close() })
+
+	ingestP := &ingest.Pipeline{Logger: logger}
+	outgestP := &outgest.Pipeline{Logger: logger, ProcessedPath: processed}
+	rc := &runConfig{
+		logger:          logger,
+		ingestPipeline:  ingestP,
+		outgestPipeline: outgestP,
+		ipcServer: &ipc.Server{
+			SocketPath: filepath.Join(base, "d.sock"),
+			Ingest:     ingestP, Outgest: outgestP,
+			Status: &statusProvider{ingestPipeline: ingestP, outgestPipeline: outgestP},
+			Logger: logger, ReadDeadline: time.Second,
+		},
+		triggerWatcher: &triggerwatcher.Watcher{
+			IngestTriggerPath:  filepath.Join(base, ".ingest_trigger"),
+			OutgestTriggerPath: filepath.Join(base, ".outgest_trigger"),
+			PollInterval:       50 * time.Millisecond,
+			Ingest:             ingestP, Outgest: outgestP, Logger: logger,
+		},
+		xmpW: &xmpwatcher.Watcher{
+			// Nonexistent directory: the startup walk fails and Run returns
+			// an error — the simulated watcher death.
+			OriginalsPath:    filepath.Join(base, "does-not-exist"),
+			Logger:           logger,
+			DebounceDuration: 50 * time.Millisecond,
+		},
+		outgestW: &outgestwatcher.Watcher{
+			ProcessedPath: processed, Outgest: outgestP, Logger: logger,
+			DebounceDuration: 50 * time.Millisecond,
+		},
+	}
+
+	stop := make(chan struct{}) // never closed — death must be detected without it
+	errCh := make(chan error, 1)
+	go func() { errCh <- run(rc, stop) }()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("run() returned nil after watcher death, want error")
+		}
+		if !strings.Contains(err.Error(), "xmp watcher died") {
+			t.Errorf("error %q does not identify the dead watcher", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run() did not return within 5s of watcher death — death went undetected")
 	}
 }

@@ -13,6 +13,7 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -453,11 +454,33 @@ func run(rc *runConfig, stop <-chan struct{}) error {
 		go rc.sdcardW.Run(stop)
 	}
 
-	<-stop
+	// A watcher returning before stop is closed means auto-commit or
+	// auto-outgest silently died (fsnotify failure, unreadable directory).
+	// Treat it as fatal: returning an error exits the process non-zero, and
+	// launchd's KeepAlive restarts the daemon with all watchers alive again.
+	// Ignoring it would leave the daemon running for weeks with a core
+	// feature off and nothing but a single log line to show for it.
+	var err error
+	select {
+	case <-stop:
+	case werr := <-xmpErrCh:
+		if werr == nil {
+			werr = errors.New("exited unexpectedly")
+		}
+		err = fmt.Errorf("xmp watcher died: %w", werr)
+	case werr := <-outgestErrCh:
+		if werr == nil {
+			werr = errors.New("exited unexpectedly")
+		}
+		err = fmt.Errorf("outgest watcher died: %w", werr)
+	}
 
 	close(twStop)
 	rc.xmpW.Stop()
 	rc.outgestW.Stop()
 
-	return nil
+	if err != nil {
+		rc.logger.Log(logging.PrefixCore, err.Error()+" — exiting for launchd restart")
+	}
+	return err
 }
