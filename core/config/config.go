@@ -54,6 +54,12 @@ var (
 // skips this directory so they are never re-scanned.
 const DuplicatesDirName = "duplicates"
 
+// FailedDirName is the subdirectory of inbox/ where ingest quarantines source
+// files that keep failing to import (zero-byte files, exiftool errors) so a
+// poison file cannot retry forever on every run (PROTOCOL.md §8). Like
+// DuplicatesDirName, the ingest walk skips it.
+const FailedDirName = "failed"
+
 // SupportedExtensions mirrors config.py's SUPPORTED_EXTENSIONS. Decide here,
 // in one place, which RAW/video formats this install cares about.
 var SupportedExtensions = map[string]bool{

@@ -85,7 +85,18 @@ type Pipeline struct {
 	running            bool
 	paused             atomic.Bool
 	backupPathOverride atomic.Pointer[string]
+	// failCounts tracks consecutive ImportFile failures per source path.
+	// In-memory only: a daemon restart grants a fresh set of attempts, which
+	// is deliberate — transient failures deserve retries, and a truly
+	// poisoned file just takes one more cycle to reach quarantine.
+	failCounts map[string]int
 }
+
+// maxImportAttempts is how many failed ImportFile attempts a source file gets
+// before being quarantined to inbox/failed/. Without a cap, a zero-byte or
+// corrupt file fails on every run forever, spamming the log and inflating the
+// failed count each time.
+const maxImportAttempts = 3
 
 // Pause prevents new RunIngest calls from starting. An in-flight run (if any)
 // completes normally — Pause only blocks future starts, it does not cancel
@@ -267,21 +278,20 @@ func (p *Pipeline) ImportFile(srcPath, batchID string) (Result, error) {
 	return ResultImported, nil
 }
 
-// moveToDuplicates relocates a confirmed-duplicate source file into
-// InboxPath/duplicates/ so subsequent runs don't re-hash and re-skip it
-// forever. Best-effort: on any error the file stays where it is (the old
-// behavior) and the error is logged. A basename collision gets a numeric
-// suffix — two different card folders can both hold an IMG_0001.JPG.
-func (p *Pipeline) moveToDuplicates(srcPath string) {
-	dupDir := filepath.Join(p.InboxPath, config.DuplicatesDirName)
-	if err := os.MkdirAll(dupDir, 0o755); err != nil {
+// parkFile relocates srcPath into InboxPath/<dirName>/ and reports whether
+// the move happened. Best-effort: on any error the file stays where it is and
+// the error is logged. A basename collision gets a numeric suffix — two
+// different card folders can both hold an IMG_0001.JPG.
+func (p *Pipeline) parkFile(srcPath, dirName string) bool {
+	parkDir := filepath.Join(p.InboxPath, dirName)
+	if err := os.MkdirAll(parkDir, 0o755); err != nil {
 		p.Logger.Log(logging.PrefixIngest,
-			fmt.Sprintf("WARN could not create %s: %v", dupDir, err))
-		return
+			fmt.Sprintf("WARN could not create %s: %v", parkDir, err))
+		return false
 	}
 
 	base := filepath.Base(srcPath)
-	dest := filepath.Join(dupDir, base)
+	dest := filepath.Join(parkDir, base)
 	ext := filepath.Ext(base)
 	stem := strings.TrimSuffix(base, ext)
 	for i := 1; ; i++ {
@@ -290,26 +300,62 @@ func (p *Pipeline) moveToDuplicates(srcPath string) {
 		}
 		if i > 100 {
 			p.Logger.Log(logging.PrefixIngest,
-				fmt.Sprintf("WARN too many name collisions for %s in %s, leaving in inbox", base, dupDir))
-			return
+				fmt.Sprintf("WARN too many name collisions for %s in %s, leaving in inbox", base, parkDir))
+			return false
 		}
-		dest = filepath.Join(dupDir, fmt.Sprintf("%s-%d%s", stem, i, ext))
+		dest = filepath.Join(parkDir, fmt.Sprintf("%s-%d%s", stem, i, ext))
 	}
 
 	if err := os.Rename(srcPath, dest); err != nil {
 		p.Logger.Log(logging.PrefixIngest,
-			fmt.Sprintf("WARN could not move duplicate %s to %s: %v", base, dupDir, err))
-		return
+			fmt.Sprintf("WARN could not move %s to %s: %v", base, parkDir, err))
+		return false
 	}
-	p.Logger.Log(logging.PrefixIngest,
-		fmt.Sprintf("duplicate %s moved to inbox/%s/", base, config.DuplicatesDirName))
+	return true
 }
 
-// fail logs the failure and returns ResultFailed without touching the source.
+// moveToDuplicates parks a confirmed-duplicate source in inbox/duplicates/ so
+// subsequent runs don't re-hash and re-skip it forever.
+func (p *Pipeline) moveToDuplicates(srcPath string) {
+	if p.parkFile(srcPath, config.DuplicatesDirName) {
+		p.Logger.Log(logging.PrefixIngest,
+			fmt.Sprintf("duplicate %s moved to inbox/%s/",
+				filepath.Base(srcPath), config.DuplicatesDirName))
+	}
+}
+
+// fail logs the failure and returns ResultFailed. The source stays in place
+// for a retry on the next run — until it has failed maxImportAttempts times,
+// at which point it is quarantined to inbox/failed/ so a poison file cannot
+// loop forever.
 func (p *Pipeline) fail(srcPath string, err error) (Result, error) {
 	p.Logger.Log(logging.PrefixIngest,
 		fmt.Sprintf("FAILED %s: %v", filepath.Base(srcPath), err))
+
+	p.mu.Lock()
+	if p.failCounts == nil {
+		p.failCounts = make(map[string]int)
+	}
+	p.failCounts[srcPath]++
+	attempts := p.failCounts[srcPath]
+	p.mu.Unlock()
+
+	if attempts >= maxImportAttempts && p.parkFile(srcPath, config.FailedDirName) {
+		p.Logger.Log(logging.PrefixIngest,
+			fmt.Sprintf("quarantined %s to inbox/%s/ after %d failed attempts",
+				filepath.Base(srcPath), config.FailedDirName, attempts))
+		p.clearFailCount(srcPath)
+	}
 	return ResultFailed, err
+}
+
+// clearFailCount forgets the failure tally for srcPath — called when the file
+// is quarantined or when a later attempt succeeds, so the map does not grow
+// with every path that ever failed once.
+func (p *Pipeline) clearFailCount(srcPath string) {
+	p.mu.Lock()
+	delete(p.failCounts, srcPath)
+	p.mu.Unlock()
 }
 
 // RunIngest walks InboxPath, imports every supported file, and commits+pushes
@@ -337,13 +383,15 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 	// sorted(rglob(...)).
 	var files []string
 	dupDir := filepath.Join(p.InboxPath, config.DuplicatesDirName)
+	failedDir := filepath.Join(p.InboxPath, config.FailedDirName)
 	err := filepath.WalkDir(p.InboxPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
-			// Parked duplicates must not be re-scanned on every run.
-			if path == dupDir {
+			// Parked duplicates and quarantined failures must not be
+			// re-scanned on every run.
+			if path == dupDir || path == failedDir {
 				return filepath.SkipDir
 			}
 			return nil
@@ -366,8 +414,10 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 		switch result, _ := p.ImportFile(f, batchID); result {
 		case ResultImported:
 			counts.Imported++
+			p.clearFailCount(f) // earlier transient failures are forgiven
 		case ResultSkipped:
 			counts.Skipped++
+			p.clearFailCount(f)
 		case ResultFailed:
 			counts.Failed++
 		}

@@ -228,8 +228,10 @@ Frontend tails this file for the log viewer. No bare `print()` anywhere in the c
 ```
 ~/Photos/
 ├── inbox/                    ← SD card landing zone, cleared after import
-│   └── duplicates/           ← sources whose hash is already in the catalog;
-│                               parked by ingest, never re-scanned, user-reviewable
+│   ├── duplicates/           ← sources whose hash is already in the catalog;
+│   │                           parked by ingest, never re-scanned, user-reviewable
+│   └── failed/               ← sources that failed import 3 times (zero-byte,
+│                               exiftool errors); quarantined, never re-scanned
 ├── originals/YYYY/MM/DD/     ← imported files + .xmp sidecars; git-tracked
 │   └── .git/                 ← tracks .xmp sidecars only (see gitignore above)
 ├── processed/YYYY/MM/        ← Lightroom exports, organised by outgest

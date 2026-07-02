@@ -683,3 +683,71 @@ func TestImportFile_OnFileWrittenReportsDestAndSidecar(t *testing.T) {
 		t.Errorf("OnFileWritten got %v, want %v", written, want)
 	}
 }
+
+// TestRunIngest_QuarantinesRepeatedlyFailingFile: a file that fails import
+// (exiftool error — same class as a zero-byte or corrupt file) retries for
+// maxImportAttempts runs, then moves to inbox/failed/ and disappears from the
+// scan. Without the quarantine it failed on every run forever.
+func TestRunIngest_QuarantinesRepeatedlyFailingFile(t *testing.T) {
+	p, inbox, _ := newPipeline(t, `echo "boom" >&2; exit 1`)
+	poison := writePhoto(t, inbox, "poison.raf")
+
+	for i := 1; i <= 3; i++ {
+		counts, err := p.RunIngest()
+		if err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+		if counts.Failed != 1 {
+			t.Fatalf("run %d: failed = %d, want 1", i, counts.Failed)
+		}
+	}
+
+	// After the third failure the file must be quarantined...
+	if _, err := os.Stat(poison); !os.IsNotExist(err) {
+		t.Error("poison file still in inbox root after 3 failed runs")
+	}
+	quarantined := filepath.Join(inbox, "failed", "poison.raf")
+	if _, err := os.Stat(quarantined); err != nil {
+		t.Errorf("poison file not quarantined at %s: %v", quarantined, err)
+	}
+
+	// ...and the next run must not see it at all.
+	counts, err := p.RunIngest()
+	if err != nil {
+		t.Fatalf("run 4: %v", err)
+	}
+	if counts != (Counts{}) {
+		t.Errorf("run 4 counts = %+v, want all zero — failed/ must not be scanned", counts)
+	}
+}
+
+// TestRunIngest_SuccessClearsFailCount: a transient failure must not count
+// toward quarantine once an attempt succeeds — only consecutive failures park
+// a file.
+func TestRunIngest_SuccessClearsFailCount(t *testing.T) {
+	p, inbox, _ := newPipeline(t, fakeExiftoolScript(testModel, testDate, testLat, testLon))
+	src := writePhoto(t, inbox, "photo.raf")
+
+	// Two failures recorded directly (as if from two earlier runs).
+	if _, err := p.fail(src, os.ErrPermission); err == nil {
+		t.Fatal("fail returned nil error")
+	}
+	if _, err := p.fail(src, os.ErrPermission); err == nil {
+		t.Fatal("fail returned nil error")
+	}
+
+	// A successful run imports the file and forgives the tally.
+	counts, err := p.RunIngest()
+	if err != nil {
+		t.Fatalf("RunIngest: %v", err)
+	}
+	if counts.Imported != 1 {
+		t.Fatalf("imported = %d, want 1", counts.Imported)
+	}
+	p.mu.Lock()
+	_, tracked := p.failCounts[src]
+	p.mu.Unlock()
+	if tracked {
+		t.Error("fail count for imported file not cleared — a later transient failure would quarantine too eagerly")
+	}
+}
