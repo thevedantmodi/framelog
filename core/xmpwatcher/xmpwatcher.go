@@ -106,15 +106,65 @@ type Watcher struct {
 	// Tests override to e.g. 50ms to run without real delays.
 	DebounceDuration time.Duration
 
-	mu      sync.Mutex
-	timer   *time.Timer
-	pending map[string]bool // distinct changed file paths since last commit
-	fw      *fsnotify.Watcher
+	mu         sync.Mutex
+	timer      *time.Timer
+	pending    map[string]bool // distinct changed file paths since last commit
+	suppressed map[string]time.Time // ingest-written paths ignored until expiry
+	fw         *fsnotify.Watcher
 
 	// onRunCommit is called at the start of runCommit for test observation only.
 	// Set before calling Run(); the goroutine-start happens-before guarantees
 	// the write is visible to the AfterFunc callback goroutine without a lock.
 	onRunCommit func()
+}
+
+// suppressTTL is how long a Suppress'd path stays ignored. Reuses
+// DebounceDuration: fsnotify delivers ingest's write events within
+// milliseconds, so the debounce window is already a generous upper bound,
+// and keeping the two tied means a legitimate Lightroom edit is never
+// ignored for longer than one debounce cycle.
+func (w *Watcher) suppressTTL() time.Duration {
+	if w.DebounceDuration > 0 {
+		return w.DebounceDuration
+	}
+	return time.Duration(config.DebounceSeconds) * time.Second
+}
+
+// Suppress marks path as written by ingest itself: fsnotify events for it are
+// ignored until the TTL expires. Without this, every file and sidecar ingest
+// copies into originals/ would trigger the watcher, which would then mark the
+// freshly imported photo "edited" (PROTOCOL.md §1 reserves that status for a
+// real Lightroom write). Wired in main: ingest.Pipeline.OnFileWritten → here.
+func (w *Watcher) Suppress(path string) {
+	now := time.Now()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.suppressed == nil {
+		w.suppressed = make(map[string]time.Time)
+	}
+	// Sweep expired entries so the map doesn't grow with every import ever made.
+	for p, exp := range w.suppressed {
+		if now.After(exp) {
+			delete(w.suppressed, p)
+		}
+	}
+	w.suppressed[path] = now.Add(w.suppressTTL())
+}
+
+// isSuppressed reports whether path is currently suppressed, clearing the
+// entry when it has expired.
+func (w *Watcher) isSuppressed(path string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	exp, ok := w.suppressed[path]
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		delete(w.suppressed, path)
+		return false
+	}
+	return true
 }
 
 // Stop closes the underlying fsnotify watcher, causing Run to return nil.
@@ -214,7 +264,7 @@ func (w *Watcher) handleEvent(fw *fsnotify.Watcher, event fsnotify.Event) {
 
 	if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
 		ext := strings.ToLower(filepath.Ext(path))
-		if watchedExts[ext] {
+		if watchedExts[ext] && !w.isSuppressed(path) {
 			w.mu.Lock()
 			w.pending[path] = true
 			w.mu.Unlock()

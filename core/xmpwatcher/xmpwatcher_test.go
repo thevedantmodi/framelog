@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/thevedantmodi/framelog/core/db"
 	"github.com/thevedantmodi/framelog/core/logging"
@@ -422,5 +423,66 @@ func TestIsLightroomRunning_EmptyPathSkipsGate(t *testing.T) {
 	}
 	if got {
 		t.Error("IsLightroomRunning(\"\")=true, want false (gate skipped when pgrep absent)")
+	}
+}
+
+// ---- Suppress (ingest-written paths) ----------------------------------------
+
+// TestSuppress_IgnoresIngestWrites asserts that a path registered via Suppress
+// does not land in pending when its fsnotify event arrives, while an
+// unsuppressed sibling still does. This is the guard that keeps ingest's own
+// copies/sidecars from flipping fresh imports to status "edited".
+func TestSuppress_IgnoresIngestWrites(t *testing.T) {
+	w := &Watcher{
+		DebounceDuration: time.Hour, // timer must never fire during the test
+		Logger:           openTestLogger(t),
+		pending:          make(map[string]bool),
+	}
+	suppressedPath := "/originals/2026/07/01/20260701_120000_aabbccdd.xmp"
+	editedPath := "/originals/2026/07/01/20260701_120000_11223344.xmp"
+
+	w.Suppress(suppressedPath)
+	w.handleEvent(nil, fsnotify.Event{Name: suppressedPath, Op: fsnotify.Create})
+	w.handleEvent(nil, fsnotify.Event{Name: editedPath, Op: fsnotify.Write})
+
+	w.mu.Lock()
+	gotSuppressed := w.pending[suppressedPath]
+	gotEdited := w.pending[editedPath]
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	w.mu.Unlock()
+
+	if gotSuppressed {
+		t.Error("suppressed path landed in pending; ingest write would be marked edited")
+	}
+	if !gotEdited {
+		t.Error("unsuppressed path missing from pending; real edits must still be seen")
+	}
+}
+
+// TestSuppress_Expires asserts that suppression is time-bounded: after the TTL
+// (tied to DebounceDuration) a write to the same path is treated as a real edit.
+func TestSuppress_Expires(t *testing.T) {
+	w := &Watcher{
+		DebounceDuration: 10 * time.Millisecond, // also the suppress TTL
+		Logger:           openTestLogger(t),
+		pending:          make(map[string]bool),
+	}
+	path := "/originals/2026/07/01/20260701_120000_aabbccdd.xmp"
+
+	w.Suppress(path)
+	time.Sleep(50 * time.Millisecond) // let the suppression expire
+	w.handleEvent(nil, fsnotify.Event{Name: path, Op: fsnotify.Write})
+
+	w.mu.Lock()
+	got := w.pending[path]
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	w.mu.Unlock()
+
+	if !got {
+		t.Error("write after suppression TTL not pending; later Lightroom edits would be lost")
 	}
 }

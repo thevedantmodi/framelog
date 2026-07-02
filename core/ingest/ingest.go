@@ -74,6 +74,13 @@ type Pipeline struct {
 	RclonePath    string
 	BackupPath    string // initial value; SetBackupPath overrides at runtime
 
+	// OnFileWritten, when non-nil, is called with the destination path of every
+	// file this pipeline writes into OriginalsPath (the copied photo and its XMP
+	// sidecar). main wires it to xmpwatcher.Watcher.Suppress so ingest's own
+	// writes don't trigger the watcher and flip fresh imports to status
+	// "edited" (PROTOCOL.md §1: edited means Lightroom wrote to the file).
+	OnFileWritten func(path string)
+
 	mu                 sync.Mutex
 	running            bool
 	paused             atomic.Bool
@@ -201,6 +208,11 @@ func (p *Pipeline) ImportFile(srcPath, batchID string) (Result, error) {
 	}
 
 	// 7. Copy (not rename/move — source stays in inbox until step 9 succeeds).
+	// Suppress the watcher before writing: fsnotify delivers the event moments
+	// after the write, so registering afterwards would race.
+	if p.OnFileWritten != nil {
+		p.OnFileWritten(dest)
+	}
 	if err := copyFile(srcPath, dest); err != nil {
 		return p.fail(srcPath, fmt.Errorf("copy to %s: %w", dest, err))
 	}
@@ -210,6 +222,9 @@ func (p *Pipeline) ImportFile(srcPath, batchID string) (Result, error) {
 	// those files causes Lightroom to read the sidecar and ignore the embedded
 	// data, hiding develop edits.
 	if !config.EmbeddedXMPExtensions[ext] {
+		if p.OnFileWritten != nil {
+			p.OnFileWritten(strings.TrimSuffix(dest, ext) + ".xmp")
+		}
 		if _, err := xmp.WriteXMP(dest, batchID, meta.CameraModel); err != nil {
 			return p.fail(srcPath, fmt.Errorf("xmp: %w", err))
 		}

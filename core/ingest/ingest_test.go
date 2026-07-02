@@ -587,3 +587,31 @@ func TestRunIngest_BackupPathMissing(t *testing.T) {
 	}
 }
 
+
+// TestImportFile_OnFileWrittenReportsDestAndSidecar asserts the hook main.go
+// wires to xmpwatcher.Suppress receives every path ingest writes into
+// originals/ — the copied photo and its XMP sidecar — so ingest's own writes
+// never masquerade as Lightroom edits (which would flip status to "edited").
+func TestImportFile_OnFileWrittenReportsDestAndSidecar(t *testing.T) {
+	p, inbox, _ := newPipeline(t, fakeExiftoolScript(testModel, testDate, testLat, testLon))
+
+	var written []string
+	p.OnFileWritten = func(path string) { written = append(written, path) }
+
+	src := writePhoto(t, inbox, "photo.raf")
+	hash, err := hasher.HashFile(src)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+
+	if result, err := p.ImportFile(src, "batch1"); err != nil || result != ResultImported {
+		t.Fatalf("ImportFile = %q, %v; want %q, nil", result, err, ResultImported)
+	}
+
+	base := filepath.Join(p.OriginalsPath, "2026", "06", "22",
+		fmt.Sprintf("20260622_140311_%s", hash[:8]))
+	want := []string{base + ".raf", base + ".xmp"}
+	if len(written) != 2 || written[0] != want[0] || written[1] != want[1] {
+		t.Errorf("OnFileWritten got %v, want %v", written, want)
+	}
+}

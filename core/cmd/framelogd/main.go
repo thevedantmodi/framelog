@@ -384,6 +384,10 @@ func mainRun() error {
 		DebounceDuration: time.Duration(config.DebounceSeconds) * time.Second,
 	}
 
+	// Ingest's own writes into originals/ must not look like Lightroom edits
+	// to the XMP watcher (they would flip fresh imports to status "edited").
+	ingestPipeline.OnFileWritten = xmpW.Suppress
+
 	// --- Outgest watcher ---
 	outgestW := &outgestwatcher.Watcher{
 		ProcessedPath:    config.Processed,
