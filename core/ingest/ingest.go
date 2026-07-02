@@ -171,12 +171,15 @@ func (p *Pipeline) ImportFile(srcPath, batchID string) (Result, error) {
 		return p.fail(srcPath, fmt.Errorf("hash: %w", err))
 	}
 
-	// 2. Dedup check — skip silently, leave source in inbox.
+	// 2. Dedup check — move the source to inbox/duplicates/ so it is not
+	// re-hashed and re-skipped on every future run (the photo bytes are
+	// already safe in originals/).
 	exists, err := db.HashExists(p.DB, hash)
 	if err != nil {
 		return p.fail(srcPath, fmt.Errorf("dedup check: %w", err))
 	}
 	if exists {
+		p.moveToDuplicates(srcPath)
 		return ResultSkipped, nil
 	}
 
@@ -246,7 +249,9 @@ func (p *Pipeline) ImportFile(srcPath, batchID string) (Result, error) {
 	if err := db.InsertPhoto(p.DB, photo); err != nil {
 		// UNIQUE constraint means a previous ingest already recorded this hash
 		// (e.g. originals/ was wiped but catalog.db was not). Treat as duplicate.
+		// The dest copy from step 7 stays — it restores the wiped original.
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			p.moveToDuplicates(srcPath)
 			return ResultSkipped, nil
 		}
 		return p.fail(srcPath, fmt.Errorf("db insert: %w", err))
@@ -260,6 +265,44 @@ func (p *Pipeline) ImportFile(srcPath, batchID string) (Result, error) {
 	}
 
 	return ResultImported, nil
+}
+
+// moveToDuplicates relocates a confirmed-duplicate source file into
+// InboxPath/duplicates/ so subsequent runs don't re-hash and re-skip it
+// forever. Best-effort: on any error the file stays where it is (the old
+// behavior) and the error is logged. A basename collision gets a numeric
+// suffix — two different card folders can both hold an IMG_0001.JPG.
+func (p *Pipeline) moveToDuplicates(srcPath string) {
+	dupDir := filepath.Join(p.InboxPath, config.DuplicatesDirName)
+	if err := os.MkdirAll(dupDir, 0o755); err != nil {
+		p.Logger.Log(logging.PrefixIngest,
+			fmt.Sprintf("WARN could not create %s: %v", dupDir, err))
+		return
+	}
+
+	base := filepath.Base(srcPath)
+	dest := filepath.Join(dupDir, base)
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	for i := 1; ; i++ {
+		if _, err := os.Stat(dest); os.IsNotExist(err) {
+			break
+		}
+		if i > 100 {
+			p.Logger.Log(logging.PrefixIngest,
+				fmt.Sprintf("WARN too many name collisions for %s in %s, leaving in inbox", base, dupDir))
+			return
+		}
+		dest = filepath.Join(dupDir, fmt.Sprintf("%s-%d%s", stem, i, ext))
+	}
+
+	if err := os.Rename(srcPath, dest); err != nil {
+		p.Logger.Log(logging.PrefixIngest,
+			fmt.Sprintf("WARN could not move duplicate %s to %s: %v", base, dupDir, err))
+		return
+	}
+	p.Logger.Log(logging.PrefixIngest,
+		fmt.Sprintf("duplicate %s moved to inbox/%s/", base, config.DuplicatesDirName))
 }
 
 // fail logs the failure and returns ResultFailed without touching the source.
@@ -293,11 +336,16 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 	// Collect supported files; sort for deterministic order matching Python's
 	// sorted(rglob(...)).
 	var files []string
+	dupDir := filepath.Join(p.InboxPath, config.DuplicatesDirName)
 	err := filepath.WalkDir(p.InboxPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
+			// Parked duplicates must not be re-scanned on every run.
+			if path == dupDir {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if config.SupportedExtensions[strings.ToLower(filepath.Ext(path))] {

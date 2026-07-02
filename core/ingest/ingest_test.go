@@ -277,6 +277,74 @@ func TestImportFile_Dedup(t *testing.T) {
 	if n != 1 {
 		t.Errorf("photo_count = %d, want 1 after duplicate import", n)
 	}
+
+	// The duplicate source must be parked in inbox/duplicates/, not left in
+	// the inbox root where every future run would re-hash and re-skip it.
+	if _, err := os.Stat(src2); !os.IsNotExist(err) {
+		t.Error("duplicate source still in inbox root after skip")
+	}
+	parked := filepath.Join(inbox, "duplicates", "photo_copy.raf")
+	if _, err := os.Stat(parked); err != nil {
+		t.Errorf("duplicate not parked at %s: %v", parked, err)
+	}
+}
+
+// TestImportFile_DuplicateNameCollisionGetsSuffix: two different duplicates
+// with the same basename (e.g. IMG_0001.JPG from two card folders) must both
+// survive the move into inbox/duplicates/.
+func TestImportFile_DuplicateNameCollisionGetsSuffix(t *testing.T) {
+	p, inbox, _ := newPipeline(t, fakeExiftoolScript(testModel, testDate, testLat, testLon))
+
+	src := writePhoto(t, inbox, "photo.raf")
+	if r, err := p.ImportFile(src, "b1"); err != nil || r != ResultImported {
+		t.Fatalf("first import: result=%q err=%v", r, err)
+	}
+
+	// Occupy the parked name, then import another duplicate with that basename.
+	if err := os.MkdirAll(filepath.Join(inbox, "duplicates"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inbox, "duplicates", "photo.raf"), []byte("earlier dup"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src2 := writePhoto(t, inbox, "photo.raf")
+	if err := os.WriteFile(src2, []byte("fake raw: photo.raf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if r, err := p.ImportFile(src2, "b2"); err != nil || r != ResultSkipped {
+		t.Fatalf("duplicate import: result=%q err=%v", r, err)
+	}
+	suffixed := filepath.Join(inbox, "duplicates", "photo-1.raf")
+	if _, err := os.Stat(suffixed); err != nil {
+		t.Errorf("colliding duplicate not parked at %s: %v", suffixed, err)
+	}
+}
+
+// TestRunIngest_SkipsDuplicatesDir: files parked in inbox/duplicates/ must be
+// invisible to the ingest walk — no re-hash, no skip tally, no removal.
+func TestRunIngest_SkipsDuplicatesDir(t *testing.T) {
+	p, inbox, _ := newPipeline(t, fakeExiftoolScript(testModel, testDate, testLat, testLon))
+
+	dupDir := filepath.Join(inbox, "duplicates")
+	if err := os.MkdirAll(dupDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parked := filepath.Join(dupDir, "old.raf")
+	if err := os.WriteFile(parked, []byte("parked duplicate"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	counts, err := p.RunIngest()
+	if err != nil {
+		t.Fatalf("RunIngest: %v", err)
+	}
+	if counts != (Counts{}) {
+		t.Errorf("counts = %+v, want all zero — duplicates/ must not be scanned", counts)
+	}
+	if _, err := os.Stat(parked); err != nil {
+		t.Errorf("parked file disturbed by RunIngest: %v", err)
+	}
 }
 
 func TestRunIngest_MixedExtensions(t *testing.T) {

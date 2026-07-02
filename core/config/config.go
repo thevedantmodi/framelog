@@ -48,6 +48,12 @@ var (
 	UserConfigPath = filepath.Join(home, "Library", "Application Support", "Framelog", "framelog_config.json")
 )
 
+// DuplicatesDirName is the subdirectory of inbox/ where ingest parks source
+// files whose hash already exists in the catalog (PROTOCOL.md §8). Keeping
+// them inside inbox/ makes them easy to find and review; the ingest walk
+// skips this directory so they are never re-scanned.
+const DuplicatesDirName = "duplicates"
+
 // SupportedExtensions mirrors config.py's SUPPORTED_EXTENSIONS. Decide here,
 // in one place, which RAW/video formats this install cares about.
 var SupportedExtensions = map[string]bool{
