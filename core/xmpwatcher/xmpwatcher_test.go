@@ -486,3 +486,30 @@ func TestSuppress_Expires(t *testing.T) {
 		t.Error("write after suppression TTL not pending; later Lightroom edits would be lost")
 	}
 }
+
+// TestRunCommit_StaleSeqIsNoOp pins the double-fire guard: when a later
+// scheduleCommit has superseded the timer that invoked runCommit (Stop
+// returned false because it had already fired), the stale invocation must
+// leave pending untouched and must not start a commit — otherwise two
+// runCommit goroutines race over the same git index.
+func TestRunCommit_StaleSeqIsNoOp(t *testing.T) {
+	commits := 0
+	w := &Watcher{
+		DebounceDuration: time.Hour,
+		Logger:           openTestLogger(t),
+		pending:          map[string]bool{"/originals/a.xmp": true},
+		onRunCommit:      func() { commits++ },
+	}
+	w.seq = 5
+
+	w.runCommit(4) // stale: superseded by a newer scheduleCommit
+
+	if commits != 0 {
+		t.Errorf("stale runCommit ran the commit path %d time(s), want 0", commits)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.pending["/originals/a.xmp"] {
+		t.Error("stale runCommit consumed pending; the live timer would commit an empty set")
+	}
+}

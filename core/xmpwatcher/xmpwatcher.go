@@ -110,6 +110,7 @@ type Watcher struct {
 	timer      *time.Timer
 	pending    map[string]bool // distinct changed file paths since last commit
 	suppressed map[string]time.Time // ingest-written paths ignored until expiry
+	seq        uint64 // incremented by scheduleCommit; runCommit skips if stale
 	fw         *fsnotify.Watcher
 
 	// onRunCommit is called at the start of runCommit for test observation only.
@@ -276,28 +277,42 @@ func (w *Watcher) handleEvent(fw *fsnotify.Watcher, event fsnotify.Event) {
 // scheduleCommit restarts the debounce timer. Each call resets the window so
 // rapid bursts (e.g. a Lightroom preset applied to 50 photos) collapse into
 // one commit.
+//
+// A sequence number is incremented on every call and captured by the timer
+// closure. If time.Timer.Stop returns false the old timer has already fired;
+// without the sequence check its runCommit would race the replacement timer's
+// — two concurrent git commits in the same repo fight over index.lock and one
+// commit is lost. The stale goroutine sees the mismatch and exits instead.
+// Same guard as outgestwatcher.scheduleRun.
 func (w *Watcher) scheduleCommit() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.timer != nil {
 		w.timer.Stop()
 	}
-	w.timer = time.AfterFunc(w.DebounceDuration, w.runCommit)
+	w.seq++
+	seq := w.seq
+	w.timer = time.AfterFunc(w.DebounceDuration, func() { w.runCommit(seq) })
 }
 
 // runCommit snapshots and clears pending, updates DB status for any file whose
 // name embeds a hash8 prefix, commits unconditionally, then pushes if on AC
-// power and Lightroom is closed.
-func (w *Watcher) runCommit() {
-	if hook := w.onRunCommit; hook != nil {
-		hook()
-	}
-
+// power and Lightroom is closed. A stale seq (a later scheduleCommit superseded
+// this timer) is a no-op.
+func (w *Watcher) runCommit(seq uint64) {
 	w.mu.Lock()
+	if w.seq != seq {
+		w.mu.Unlock()
+		return
+	}
 	snapshot := w.pending
 	w.pending = make(map[string]bool)
 	w.timer = nil
 	w.mu.Unlock()
+
+	if hook := w.onRunCommit; hook != nil {
+		hook()
+	}
 
 	if len(snapshot) == 0 {
 		return
