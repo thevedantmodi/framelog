@@ -219,7 +219,7 @@ func (w *Watcher) tick() {
 
 	current := make(map[string]bool, len(entries))
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
 			current[e.Name()] = true
 		}
 	}
