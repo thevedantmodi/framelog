@@ -11,11 +11,11 @@ import UserNotifications
 // .requiresApproval shows a visible indicator so the user knows to act.
 func loginItemLabelString(status: SMAppService.Status) -> String {
     switch status {
-    case .notRegistered:    return "Launch at Login"
-    case .enabled:          return "Launch at Login"
+    case .notRegistered: return "Launch at Login"
+    case .enabled: return "Launch at Login"
     case .requiresApproval: return "Launch at Login (check System Settings)"
-    case .notFound:         return "Launch at Login"
-    @unknown default:       return "Launch at Login"
+    case .notFound: return "Launch at Login"
+    @unknown default: return "Launch at Login"
     }
 }
 
@@ -48,7 +48,7 @@ func isCoreReachable(socketPath: String) -> Bool {
     defer { Darwin.close(fd) }
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
-    let pathBytes = socketPath.utf8.prefix(103) // 104-byte macOS limit
+    let pathBytes = socketPath.utf8.prefix(103)  // 104-byte macOS limit
     withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
         pathBytes.withContiguousStorageIfAvailable { src in
             UnsafeMutableRawPointer(ptr).copyMemory(from: src.baseAddress!, byteCount: src.count)
@@ -76,7 +76,8 @@ func statusDisplayString(snapshot: CatalogSnapshot?, coreReachable: Bool) -> Str
     let n = snapshot.photoCount
     let countPart = "\(n) photo\(n == 1 ? "" : "s")"
     guard let lastStr = snapshot.lastImport,
-          let date = ISO8601DateFormatter().date(from: lastStr) else { return countPart }
+        let date = ISO8601DateFormatter().date(from: lastStr)
+    else { return countPart }
     let fmt = RelativeDateTimeFormatter()
     fmt.unitsStyle = .full
     return "\(countPart) · last import: \(fmt.localizedString(for: date, relativeTo: Date()))"
@@ -90,7 +91,9 @@ func statusDisplayString(snapshot: CatalogSnapshot?, coreReachable: Bool) -> Str
 // Send/receive timeouts are set on the socket so a stalled daemon can never
 // hang the caller indefinitely (the status handler stats the backup volume,
 // which can block on a dead network mount).
-func sendSocketCommand(socketPath: String, payload: String, timeout: TimeInterval = 5) -> [String: Any]? {
+func sendSocketCommand(socketPath: String, payload: String, timeout: TimeInterval = 5) -> [String:
+    Any]?
+{
     let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else { return nil }
     defer { Darwin.close(fd) }
@@ -101,7 +104,7 @@ func sendSocketCommand(socketPath: String, payload: String, timeout: TimeInterva
 
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
-    let pathBytes = socketPath.utf8.prefix(103) // 104-byte macOS limit
+    let pathBytes = socketPath.utf8.prefix(103)  // 104-byte macOS limit
     withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
         pathBytes.withContiguousStorageIfAvailable { src in
             UnsafeMutableRawPointer(ptr).copyMemory(from: src.baseAddress!, byteCount: src.count)
@@ -144,7 +147,8 @@ func fetchStatus(socketPath: String) -> [String: Any]? {
 func sendPauseResume(socketPath: String, pause: Bool) -> Bool? {
     let payload = "{\"command\":\"\(pause ? "pause" : "resume")\"}"
     guard let json = sendSocketCommand(socketPath: socketPath, payload: payload),
-          json["ok"] as? Bool == true else { return nil }
+        json["ok"] as? Bool == true
+    else { return nil }
     return json["paused"] as? Bool
 }
 
@@ -153,11 +157,13 @@ func sendPauseResume(socketPath: String, pause: Bool) -> Bool? {
 func sendSetBackupPath(socketPath: String, path: String) {
     // Escape path for JSON (backslashes and quotes are the only chars that need it
     // on macOS volume paths, but a full escape is safer).
-    let escaped = path
+    let escaped =
+        path
         .replacingOccurrences(of: "\\", with: "\\\\")
         .replacingOccurrences(of: "\"", with: "\\\"")
-    _ = sendSocketCommand(socketPath: socketPath,
-                          payload: "{\"command\":\"set_backup_path\",\"path\":\"\(escaped)\"}")
+    _ = sendSocketCommand(
+        socketPath: socketPath,
+        payload: "{\"command\":\"set_backup_path\",\"path\":\"\(escaped)\"}")
 }
 
 // MARK: - Degraded-capability display (PROTOCOL.md §3 capabilities)
@@ -190,14 +196,15 @@ func capabilityWarnings(_ caps: [String: Any]?) -> [String] {
 }
 
 enum CoreInstallState {
-    case idle, installing, success, error(String)
+    case idle, installing, success
+    case error(String)
 
     var label: String {
         switch self {
-        case .idle:            return "Install Core…"
-        case .installing:      return "Installing…"
-        case .success:         return "Installed ✓"
-        case .error:           return "Install Failed"
+        case .idle: return "Install Core…"
+        case .installing: return "Installing…"
+        case .success: return "Installed ✓"
+        case .error: return "Install Failed"
         }
     }
     var isInProgress: Bool {
@@ -286,9 +293,10 @@ final class FramelogStatus: ObservableObject {
         // Reuse this tick for import notifications (FL-405) — no second timer.
         // Skipped on the seeding poll: the pre-existing library is not "new".
         if hasSeededCounters,
-           let newLast = newLastImport,
-           newLast != previousLastImport,
-           newCount > previousCount {
+            let newLast = newLastImport,
+            newLast != previousLastImport,
+            newCount > previousCount
+        {
             fireImportNotification(oldCount: previousCount, newCount: newCount)
         }
 
@@ -321,8 +329,9 @@ final class FramelogStatus: ObservableObject {
         }
 
         if !hasAutoInstalled, let expected = bundledVersion,
-           let running = status["daemon_version"] as? String,
-           !running.isEmpty, running != expected {
+            let running = status["daemon_version"] as? String,
+            !running.isEmpty, running != expected
+        {
             hasAutoInstalled = true
             installCore()
         }
@@ -344,7 +353,8 @@ final class FramelogStatus: ObservableObject {
         let content = UNMutableNotificationContent()
         content.title = "Framelog"
         content.body = importDeltaMessage(oldCount: oldCount, newCount: newCount)
-        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        let req = UNNotificationRequest(
+            identifier: UUID().uuidString, content: content, trigger: nil)
         Task { try? await UNUserNotificationCenter.current().add(req) }
     }
 
@@ -352,7 +362,8 @@ final class FramelogStatus: ObservableObject {
 
     func requestIngest() {
         guard !ingestRequested,
-              (try? touchTriggerFile(at: FramelogPaths.ingestTrigger)) != nil else { return }
+            (try? touchTriggerFile(at: FramelogPaths.ingestTrigger)) != nil
+        else { return }
         ingestRequested = true
         Task {
             try? await Task.sleep(for: .seconds(2))
@@ -362,7 +373,8 @@ final class FramelogStatus: ObservableObject {
 
     func requestOutgest() {
         guard !outgestRequested,
-              (try? touchTriggerFile(at: FramelogPaths.outgestTrigger)) != nil else { return }
+            (try? touchTriggerFile(at: FramelogPaths.outgestTrigger)) != nil
+        else { return }
         outgestRequested = true
         Task {
             try? await Task.sleep(for: .seconds(2))
@@ -453,7 +465,8 @@ final class FramelogStatus: ObservableObject {
     func configureGitRemote() {
         let alert = NSAlert()
         alert.messageText = "Git Remote URL"
-        alert.informativeText = "Where framelogd pushes originals/ to (e.g. git@github.com:user/photos.git). Leave blank to unset."
+        alert.informativeText =
+            "Where framelogd pushes originals/ to (e.g. git@github.com:user/photos.git). Leave blank to unset."
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
@@ -486,8 +499,14 @@ final class FramelogStatus: ObservableObject {
     }
 
     // MARK: View bindings
+    var versionString: String {
+        if let version = bundledVersion {
+            return "Version \(version)"
+        }
+        return "Version unknown"
+    }
 
-    var loginItemLabel: String   { loginItemLabelString(status: loginItemStatus) }
-    var loginItemIsOn: Bool      { loginItemIsChecked(status: loginItemStatus) }
+    var loginItemLabel: String { loginItemLabelString(status: loginItemStatus) }
+    var loginItemIsOn: Bool { loginItemIsChecked(status: loginItemStatus) }
     var loginItemIsEnabled: Bool { loginItemIsInteractive(status: loginItemStatus) }
 }

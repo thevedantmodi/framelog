@@ -23,10 +23,12 @@ struct ContentView: View {
         Divider()
 
         // FL-402: Login item toggle. .requiresApproval shows "(check System Settings)" suffix.
-        Toggle(isOn: Binding(
-            get: { status.loginItemIsOn },
-            set: { _ in status.toggleLoginItem() }
-        )) {
+        Toggle(
+            isOn: Binding(
+                get: { status.loginItemIsOn },
+                set: { _ in status.toggleLoginItem() }
+            )
+        ) {
             Text(status.loginItemLabel)
         }
         .disabled(!status.loginItemIsEnabled)
@@ -68,11 +70,16 @@ struct ContentView: View {
         Divider()
 
         // FL-406
-        Button("Open Log File")       { status.openLogFile() }
-        Button("Set Backup Drive…")   { status.chooseAndSetBackupDrive() }
-        Button("Run Setup")           { status.runSetup() }
+        Button("Open Log File") { status.openLogFile() }
+        Button("Set Backup Drive…") { status.chooseAndSetBackupDrive() }
+        Button("Run Setup") { status.runSetup() }
 
         Divider()
+
+        // Display the app version string
+        Text(status.versionString)
+            .font(.footnote)
+            .foregroundStyle(.tertiary)
 
         Button("Quit Framelog") {
             NSApplication.shared.terminate(nil)
