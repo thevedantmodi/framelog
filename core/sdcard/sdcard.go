@@ -11,13 +11,12 @@
 // therefore pass a fake shell script with no real diskutil or rclone present
 // — which matters because diskutil only exists on macOS and rclone may not
 // be installed. rclone is a hard dependency for the SD card watcher (like
-// diskutil): main.go only constructs a Watcher when both are found.
+// diskutil): main.go only constructs a Watcher when both are found. CopyDCIM
+// delegates the actual rclone invocation and JSON-log progress parsing to
+// core/rclonerun, shared with core/backup's Sync.
 package sdcard
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -31,6 +30,7 @@ import (
 	"github.com/thevedantmodi/framelog/core/config"
 	"github.com/thevedantmodi/framelog/core/ingest"
 	"github.com/thevedantmodi/framelog/core/logging"
+	"github.com/thevedantmodi/framelog/core/rclonerun"
 )
 
 // diskutilCandidates is the ordered list of known diskutil locations on macOS.
@@ -115,12 +115,6 @@ func FindSDCard(diskutilPath, volumesRoot string) (string, error) {
 	return "", nil
 }
 
-// rcloneLogEntry is one line of rclone's --use-json-log output.
-type rcloneLogEntry struct {
-	Msg    string `json:"msg"`
-	Object string `json:"object"`
-}
-
 // CopyDCIM recursively copies the contents of sdDCIMPath into inboxPath via
 // `rclone copy`, preserving relative directory structure
 // (DCIM/100CANON/IMG_0001.JPG → inbox/100CANON/IMG_0001.JPG).
@@ -133,59 +127,20 @@ type rcloneLogEntry struct {
 //
 // The optional onCopy callback is invoked after each successful file copy with
 // the source file's base name and the running copied-so-far count, parsed
-// from rclone's JSON log stream. Pass nil (or omit) when progress reporting
-// is not needed.
+// from rclone's JSON log stream by rclonerun.Copy. Pass nil (or omit) when
+// progress reporting is not needed.
 func CopyDCIM(rclonePath, sdDCIMPath, inboxPath string, onCopy ...func(filename string, n int)) (int, error) {
 	var cb func(string, int)
 	if len(onCopy) > 0 {
 		cb = onCopy[0]
 	}
 
-	args := []string{"copy", sdDCIMPath, inboxPath,
-		"--ignore-existing", "--ignore-case", "--use-json-log", "-v"}
+	args := []string{"copy", sdDCIMPath, inboxPath, "--ignore-existing", "--ignore-case"}
 	for _, ext := range sortedSupportedExtensions() {
 		args = append(args, "--include", "*"+ext)
 	}
 
-	cmd := exec.Command(rclonePath, args...)
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return 0, fmt.Errorf("rclone copy: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("rclone copy: %w", err)
-	}
-
-	var count int
-	var stderrBuf bytes.Buffer
-	scanner := bufio.NewScanner(stderr)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		stderrBuf.Write(line)
-		stderrBuf.WriteByte('\n')
-
-		var entry rcloneLogEntry
-		if err := json.Unmarshal(line, &entry); err != nil {
-			continue // non-JSON noise line
-		}
-		// "Copied (new)" for a normal data transfer, "Copied (server-side
-		// copy)" when src/dst share a filesystem and rclone uses a
-		// reflink/clonefile instead — match both, but not "Copied (replaced
-		// existing)" (shouldn't occur with --ignore-existing, but exclude
-		// defensively since a replace isn't a fresh copy for count purposes).
-		if strings.HasPrefix(entry.Msg, "Copied (") && !strings.Contains(entry.Msg, "replaced existing") {
-			count++
-			if cb != nil {
-				cb(filepath.Base(entry.Object), count)
-			}
-		}
-	}
-
-	if err := cmd.Wait(); err != nil {
-		return count, fmt.Errorf("rclone copy: %w; stderr: %s",
-			err, bytes.TrimSpace(stderrBuf.Bytes()))
-	}
-	return count, nil
+	return rclonerun.Copy(rclonePath, args, cb)
 }
 
 // sortedSupportedExtensions returns config.SupportedExtensions keys sorted,
