@@ -23,6 +23,33 @@ func writeFakeBin(t *testing.T, dir, name, body string) string {
 	return p
 }
 
+// fakeRcloneCopyBody is a fake rclone binary body that mimics the subset of
+// `rclone copy SRC DST --ignore-existing ... --use-json-log` behavior CopyDCIM
+// depends on: recursively copy files from $2 into $3, skip a file if the
+// destination already exists (--ignore-existing), and emit one JSON log line
+// per copied file to stderr so CopyDCIM's count/callback parsing has real
+// data to parse.
+const fakeRcloneCopyBody = `
+src="$2"
+dst="$3"
+mkdir -p "$dst"
+find "$src" -type f | while IFS= read -r f; do
+  rel=$(echo "$f" | sed "s|^$src/||")
+  target="$dst/$rel"
+  if [ -e "$target" ]; then
+    continue
+  fi
+  mkdir -p "$(dirname "$target")"
+  cp "$f" "$target"
+  printf '{"level":"info","msg":"Copied (new)","object":"%s"}\n' "$rel" >&2
+done
+`
+
+func writeFakeRclone(t *testing.T, dir string) string {
+	t.Helper()
+	return writeFakeBin(t, dir, "rclone", fakeRcloneCopyBody)
+}
+
 func openTestLogger(t *testing.T) *logging.Logger {
 	t.Helper()
 	l, err := logging.New(filepath.Join(t.TempDir(), "test.log"))
@@ -218,6 +245,7 @@ func TestFindSDCard_NoneMatch_ReturnsEmpty(t *testing.T) {
 func TestCopyDCIM_CopiesStructureAndCount(t *testing.T) {
 	src := t.TempDir()
 	dst := t.TempDir()
+	rclone := writeFakeRclone(t, t.TempDir())
 
 	// DCIM/100CANON/IMG_0001.JPG and IMG_0002.JPG
 	canon := filepath.Join(src, "100CANON")
@@ -231,7 +259,7 @@ func TestCopyDCIM_CopiesStructureAndCount(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	n, err := CopyDCIM(src, dst)
+	n, err := CopyDCIM(rclone, src, dst)
 	if err != nil {
 		t.Fatalf("CopyDCIM: %v", err)
 	}
@@ -251,6 +279,7 @@ func TestCopyDCIM_CopiesStructureAndCount(t *testing.T) {
 func TestCopyDCIM_NoClobber(t *testing.T) {
 	src := t.TempDir()
 	dst := t.TempDir()
+	rclone := writeFakeRclone(t, t.TempDir())
 
 	canon := filepath.Join(src, "100CANON")
 	if err := os.Mkdir(canon, 0o755); err != nil {
@@ -264,7 +293,7 @@ func TestCopyDCIM_NoClobber(t *testing.T) {
 	}
 
 	// First copy — both files land.
-	if _, err := CopyDCIM(src, dst); err != nil {
+	if _, err := CopyDCIM(rclone, src, dst); err != nil {
 		t.Fatalf("first CopyDCIM: %v", err)
 	}
 
@@ -280,7 +309,7 @@ func TestCopyDCIM_NoClobber(t *testing.T) {
 	}
 
 	// Second copy — only the new file should be copied.
-	n, err := CopyDCIM(src, dst)
+	n, err := CopyDCIM(rclone, src, dst)
 	if err != nil {
 		t.Fatalf("second CopyDCIM: %v", err)
 	}
@@ -320,6 +349,7 @@ func TestWatcher_Integration(t *testing.T) {
 	// HasDCIM controls the final gate for the second (no-DCIM) directory.
 	diskutil := writeFakeBin(t, binDir, "diskutil",
 		`echo "   Removable Media:           Removable"`)
+	rclone := writeFakeRclone(t, binDir)
 
 	notifyCh := make(chan struct{}, 1)
 	runner := &fakeRunner{notifyCh: notifyCh}
@@ -328,6 +358,7 @@ func TestWatcher_Integration(t *testing.T) {
 	stop := make(chan struct{})
 	w := &Watcher{
 		DiskutilPath: diskutil,
+		RclonePath:   rclone,
 		VolumesRoot:  volumes,
 		InboxPath:    inbox,
 		PollInterval: 100 * time.Millisecond,
@@ -406,6 +437,7 @@ func TestWatcher_PausedRetriesOnResume(t *testing.T) {
 
 	diskutil := writeFakeBin(t, binDir, "diskutil",
 		`echo "   Removable Media:           Removable"`)
+	rclone := writeFakeRclone(t, binDir)
 
 	notifyCh := make(chan struct{}, 1)
 	runner := &fakeRunner{notifyCh: notifyCh}
@@ -417,6 +449,7 @@ func TestWatcher_PausedRetriesOnResume(t *testing.T) {
 	stop := make(chan struct{})
 	w := &Watcher{
 		DiskutilPath: diskutil,
+		RclonePath:   rclone,
 		VolumesRoot:  volumes,
 		InboxPath:    inbox,
 		PollInterval: 100 * time.Millisecond,

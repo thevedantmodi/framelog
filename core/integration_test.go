@@ -175,6 +175,25 @@ func TestConcurrent(t *testing.T) {
 	// diskutil: reports Removable for any volume path, satisfying IsRemovableMedia.
 	diskutil := itWriteFakeBin(t, binDir, "diskutil",
 		`echo "   Removable Media:          Removable"`)
+	// rclone: mimics `rclone copy SRC DST --ignore-existing --use-json-log` —
+	// recursively copies $2 into $3, skips files that already exist at the
+	// destination, and emits one JSON "Copied (new)" log line per file to
+	// stderr so sdcard.CopyDCIM's count/callback parsing has real data.
+	rclone := itWriteFakeBin(t, binDir, "rclone", `
+src="$2"
+dst="$3"
+mkdir -p "$dst"
+find "$src" -type f | while IFS= read -r f; do
+  rel=$(echo "$f" | sed "s|^$src/||")
+  target="$dst/$rel"
+  if [ -e "$target" ]; then
+    continue
+  fi
+  mkdir -p "$(dirname "$target")"
+  cp "$f" "$target"
+  printf '{"level":"info","msg":"Copied (new)","object":"%s"}\n' "$rel" >&2
+done
+`)
 
 	// ---- shared DB and logger -----------------------------------------------
 	dbPath := filepath.Join(t.TempDir(), "catalog.db")
@@ -229,6 +248,7 @@ func TestConcurrent(t *testing.T) {
 	// ---- watchers -----------------------------------------------------------
 	sdW := &sdcard.Watcher{
 		DiskutilPath: diskutil,
+		RclonePath:   rclone,
 		VolumesRoot:  volumes,
 		InboxPath:    inbox,
 		PollInterval: 100 * time.Millisecond,

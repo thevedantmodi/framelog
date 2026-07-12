@@ -307,7 +307,7 @@ func mainRun() error {
 	if rclonePath != "" {
 		logger.Log(logging.PrefixCore, fmt.Sprintf("rclone: %s", rclonePath))
 	} else {
-		logger.Log(logging.PrefixCore, "rclone not found — backup disabled")
+		logger.Log(logging.PrefixCore, "rclone not found — backup and SD card watcher disabled")
 	}
 
 	// --- Work directories + git repo ---
@@ -365,7 +365,7 @@ func mainRun() error {
 		// Same facts the startup log lines above record, but machine-readable
 		// so the menu bar can show "backup disabled" without a log tail.
 		Caps: ipc.Capabilities{
-			SDCardWatch:    diskutilErr == nil,
+			SDCardWatch:    diskutilErr == nil && rclonePath != "",
 			Backup:         rclonePath != "",
 			ACPowerGate:    pmsetPath != "",
 			LightroomCheck: pgrepPath != "",
@@ -407,10 +407,14 @@ func mainRun() error {
 	}
 
 	// --- SD card watcher (optional) ---
+	// Requires both diskutil (removable-media detection) and rclone (DCIM
+	// copy) — DCIM copy shells out to `rclone copy`, so the watcher cannot
+	// function without it.
 	var sdcardW *sdcard.Watcher
-	if diskutilErr == nil {
+	if diskutilErr == nil && rclonePath != "" {
 		sdcardW = &sdcard.Watcher{
 			DiskutilPath: diskutilPath,
+			RclonePath:   rclonePath,
 			VolumesRoot:  "/Volumes",
 			InboxPath:    config.Inbox,
 			Runner:       ingestPipeline,

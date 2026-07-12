@@ -1,23 +1,29 @@
 // Package sdcard detects SD cards mounted under /Volumes, copies their DCIM
-// contents into inbox/, and fires RunIngest. It ports the detection logic from
-// on_sd_mount.sh — the dual check (diskutil says removable AND a DCIM directory
-// is present) naturally excludes other things that mount under /Volumes (backup
-// drives, network shares) without any explicit special-casing.
+// contents into inbox/ via rclone, and fires RunIngest. It ports the
+// detection logic from on_sd_mount.sh — the dual check (diskutil says
+// removable AND a DCIM directory is present) naturally excludes other things
+// that mount under /Volumes (backup drives, network shares) without any
+// explicit special-casing.
 //
-// The injectable-binary-path pattern from core/exif and core/gitops is applied
-// here for diskutil: FindDiskutil returns the path, IsRemovableMedia takes it
-// as a parameter. Tests can therefore pass a fake shell script with no real
-// diskutil present — which matters because diskutil only exists on macOS.
+// The injectable-binary-path pattern from core/exif and core/gitops is
+// applied here for both diskutil and rclone: FindDiskutil/backup.FindRclone
+// return paths, IsRemovableMedia/CopyDCIM take them as parameters. Tests can
+// therefore pass a fake shell script with no real diskutil or rclone present
+// — which matters because diskutil only exists on macOS and rclone may not
+// be installed. rclone is a hard dependency for the SD card watcher (like
+// diskutil): main.go only constructs a Watcher when both are found.
 package sdcard
 
 import (
+	"bufio"
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -109,57 +115,89 @@ func FindSDCard(diskutilPath, volumesRoot string) (string, error) {
 	return "", nil
 }
 
-// CopyDCIM recursively copies the contents of sdDCIMPath into inboxPath,
-// preserving relative directory structure (DCIM/100CANON/IMG_0001.JPG →
-// inbox/100CANON/IMG_0001.JPG). This matches `cp -rn DCIM/* inbox/`:
-// non-clobbering — if a file already exists at the destination it is skipped
-// entirely, protecting a file left over from a previous interrupted run.
+// rcloneLogEntry is one line of rclone's --use-json-log output.
+type rcloneLogEntry struct {
+	Msg    string `json:"msg"`
+	Object string `json:"object"`
+}
+
+// CopyDCIM recursively copies the contents of sdDCIMPath into inboxPath via
+// `rclone copy`, preserving relative directory structure
+// (DCIM/100CANON/IMG_0001.JPG → inbox/100CANON/IMG_0001.JPG).
+// --ignore-existing matches the old `cp -rn` semantics: non-clobbering — if a
+// file already exists at the destination it is skipped entirely, protecting a
+// file left over from a previous interrupted run. --include restricts the
+// copy to config.SupportedExtensions; --ignore-case makes that match
+// regardless of the card's filename casing (IMG_0001.JPG vs .jpg).
 // Returns the count of files actually copied (not counting skips).
 //
 // The optional onCopy callback is invoked after each successful file copy with
-// the source file's base name and the running copied-so-far count. Pass nil
-// (or omit) when progress reporting is not needed.
-func CopyDCIM(sdDCIMPath, inboxPath string, onCopy ...func(filename string, n int)) (int, error) {
+// the source file's base name and the running copied-so-far count, parsed
+// from rclone's JSON log stream. Pass nil (or omit) when progress reporting
+// is not needed.
+func CopyDCIM(rclonePath, sdDCIMPath, inboxPath string, onCopy ...func(filename string, n int)) (int, error) {
 	var cb func(string, int)
 	if len(onCopy) > 0 {
 		cb = onCopy[0]
 	}
 
+	args := []string{"copy", sdDCIMPath, inboxPath,
+		"--ignore-existing", "--ignore-case", "--use-json-log", "-v"}
+	for _, ext := range sortedSupportedExtensions() {
+		args = append(args, "--include", "*"+ext)
+	}
+
+	cmd := exec.Command(rclonePath, args...)
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return 0, fmt.Errorf("rclone copy: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return 0, fmt.Errorf("rclone copy: %w", err)
+	}
+
 	var count int
-	err := filepath.WalkDir(sdDCIMPath, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if !config.SupportedExtensions[strings.ToLower(filepath.Ext(path))] {
-			return nil
-		}
-		rel, err := filepath.Rel(sdDCIMPath, path)
-		if err != nil {
-			return err
-		}
-		dst := filepath.Join(inboxPath, rel)
+	var stderrBuf bytes.Buffer
+	scanner := bufio.NewScanner(stderr)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		stderrBuf.Write(line)
+		stderrBuf.WriteByte('\n')
 
-		// Non-clobbering: skip if destination already exists.
-		if _, err := os.Stat(dst); err == nil {
-			return nil
+		var entry rcloneLogEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			continue // non-JSON noise line
 		}
+		// "Copied (new)" for a normal data transfer, "Copied (server-side
+		// copy)" when src/dst share a filesystem and rclone uses a
+		// reflink/clonefile instead — match both, but not "Copied (replaced
+		// existing)" (shouldn't occur with --ignore-existing, but exclude
+		// defensively since a replace isn't a fresh copy for count purposes).
+		if strings.HasPrefix(entry.Msg, "Copied (") && !strings.Contains(entry.Msg, "replaced existing") {
+			count++
+			if cb != nil {
+				cb(filepath.Base(entry.Object), count)
+			}
+		}
+	}
 
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return err
-		}
-		if err := copyFile(path, dst); err != nil {
-			return err
-		}
-		count++
-		if cb != nil {
-			cb(filepath.Base(path), count)
-		}
-		return nil
-	})
-	return count, err
+	if err := cmd.Wait(); err != nil {
+		return count, fmt.Errorf("rclone copy: %w; stderr: %s",
+			err, bytes.TrimSpace(stderrBuf.Bytes()))
+	}
+	return count, nil
+}
+
+// sortedSupportedExtensions returns config.SupportedExtensions keys sorted,
+// so the rclone --include argument list is deterministic (map iteration
+// order is not, and non-deterministic args make failures hard to reproduce).
+func sortedSupportedExtensions() []string {
+	exts := make([]string, 0, len(config.SupportedExtensions))
+	for ext := range config.SupportedExtensions {
+		exts = append(exts, ext)
+	}
+	sort.Strings(exts)
+	return exts
 }
 
 // Watcher polls VolumesRoot for new mounts, detects SD cards, and fires
@@ -170,6 +208,7 @@ func CopyDCIM(sdDCIMPath, inboxPath string, onCopy ...func(filename string, n in
 // fix. Cost is negligible — os.ReadDir on a directory with ~5 entries.
 type Watcher struct {
 	DiskutilPath string
+	RclonePath   string
 	VolumesRoot  string
 	InboxPath    string
 	PollInterval time.Duration
@@ -274,7 +313,7 @@ func (w *Watcher) tick() {
 			w.Logger.Log(logging.PrefixCore,
 				fmt.Sprintf("copying [%d] %s → inbox/", n, filename))
 		}
-		n, copyErr := CopyDCIM(filepath.Join(volPath, "DCIM"), w.InboxPath, logProgress)
+		n, copyErr := CopyDCIM(w.RclonePath, filepath.Join(volPath, "DCIM"), w.InboxPath, logProgress)
 		if copyErr != nil {
 			w.Logger.Log(logging.PrefixCore,
 				fmt.Sprintf("DCIM copy error: %v", copyErr))
@@ -305,22 +344,4 @@ func (w *Watcher) tick() {
 	w.mu.Lock()
 	w.seen = current
 	w.mu.Unlock()
-}
-
-// copyFile copies src to dst with a sync before returning.
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	return out.Sync()
 }
