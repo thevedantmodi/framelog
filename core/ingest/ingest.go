@@ -410,7 +410,7 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 	var counts Counts
 	for i, f := range files {
 		p.Logger.Log(logging.PrefixIngest,
-			fmt.Sprintf("copying [%d/%d] %s", i+1, total, filepath.Base(f)))
+			fmt.Sprintf("copying [%05d/%05d] %s", i+1, total, filepath.Base(f)))
 		switch result, _ := p.ImportFile(f, batchID); result {
 		case ResultImported:
 			counts.Imported++
@@ -459,7 +459,7 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 		p.Logger.Log(logging.PrefixBackup, fmt.Sprintf("syncing %d photos to %s", counts.Imported, backupPath))
 		logSyncProgress := func(filename string, n int) {
 			p.Logger.Log(logging.PrefixBackup,
-				fmt.Sprintf("syncing [%d] %s → %s", n, filename, backupPath))
+				fmt.Sprintf("syncing [%05d] %s → %s", n, filename, backupPath))
 		}
 		synced, err := backup.Sync(p.RclonePath, p.OriginalsPath, backupPath, logSyncProgress)
 		if err != nil {

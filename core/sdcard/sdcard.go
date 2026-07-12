@@ -266,7 +266,7 @@ func (w *Watcher) tick() {
 
 		logProgress := func(filename string, n int) {
 			w.Logger.Log(logging.PrefixCore,
-				fmt.Sprintf("copying [%d] %s → inbox/", n, filename))
+				fmt.Sprintf("copying [%05d] %s → inbox/", n, filename))
 		}
 		n, copyErr := CopyDCIM(w.RclonePath, filepath.Join(volPath, "DCIM"), w.InboxPath, logProgress)
 		if copyErr != nil {
