@@ -11,11 +11,14 @@
 package backup
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 // rcloneCandidates is the ordered list of known rclone binary locations.
@@ -50,23 +53,68 @@ func IsDriveMounted(backupPath string) bool {
 	return err == nil && fi.IsDir()
 }
 
+// rcloneLogEntry is one line of rclone's --use-json-log output.
+type rcloneLogEntry struct {
+	Msg    string `json:"msg"`
+	Object string `json:"object"`
+}
+
 // Sync copies originalsPath into backupPath/originals/ using rclone copy.
 // Returns (false, nil) without invoking rclone when backupPath does not exist
 // or is not a directory — an unmounted backup drive is expected, not an error.
 // Returns (false, err) when rclone exits non-zero; err wraps stderr output.
-func Sync(rclonePath, originalsPath, backupPath string) (bool, error) {
+//
+// The optional onCopy callback is invoked after each file rclone reports
+// copied, with the file's base name and the running copied-so-far count,
+// parsed from rclone's JSON log stream. Pass nil (or omit) when progress
+// reporting is not needed.
+func Sync(rclonePath, originalsPath, backupPath string, onCopy ...func(filename string, n int)) (bool, error) {
 	if !IsDriveMounted(backupPath) {
 		return false, nil
 	}
 
+	var cb func(string, int)
+	if len(onCopy) > 0 {
+		cb = onCopy[0]
+	}
+
 	dest := filepath.Join(backupPath, "originals")
 
-	var stderr bytes.Buffer
-	cmd := exec.Command(rclonePath, "copy", originalsPath, dest)
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	cmd := exec.Command(rclonePath, "copy", originalsPath, dest, "--use-json-log", "-v")
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return false, fmt.Errorf("rclone copy: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return false, fmt.Errorf("rclone copy: %w", err)
+	}
+
+	var count int
+	var stderrBuf bytes.Buffer
+	scanner := bufio.NewScanner(stderr)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		stderrBuf.Write(line)
+		stderrBuf.WriteByte('\n')
+
+		var entry rcloneLogEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			continue // non-JSON noise line
+		}
+		// "Copied (new)" for a normal transfer, "Copied (server-side copy)"
+		// when src/dst share a filesystem — match both, but not "Copied
+		// (replaced existing)" since that isn't a fresh copy.
+		if strings.HasPrefix(entry.Msg, "Copied (") && !strings.Contains(entry.Msg, "replaced existing") {
+			count++
+			if cb != nil {
+				cb(filepath.Base(entry.Object), count)
+			}
+		}
+	}
+
+	if err := cmd.Wait(); err != nil {
 		return false, fmt.Errorf("rclone copy: %w; stderr: %s",
-			err, bytes.TrimSpace(stderr.Bytes()))
+			err, bytes.TrimSpace(stderrBuf.Bytes()))
 	}
 	return true, nil
 }

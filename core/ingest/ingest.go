@@ -457,7 +457,11 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 		p.Logger.Log(logging.PrefixBackup, "backup skipped: rclone not installed")
 	} else if counts.Imported > 0 && backupPath != "" {
 		p.Logger.Log(logging.PrefixBackup, fmt.Sprintf("syncing %d photos to %s", counts.Imported, backupPath))
-		synced, err := backup.Sync(p.RclonePath, p.OriginalsPath, backupPath)
+		logSyncProgress := func(filename string, n int) {
+			p.Logger.Log(logging.PrefixBackup,
+				fmt.Sprintf("syncing [%d] %s → %s", n, filename, backupPath))
+		}
+		synced, err := backup.Sync(p.RclonePath, p.OriginalsPath, backupPath, logSyncProgress)
 		if err != nil {
 			p.Logger.Log(logging.PrefixBackup, fmt.Sprintf("sync error: %v", err))
 		} else if synced {
