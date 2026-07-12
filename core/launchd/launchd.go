@@ -5,11 +5,14 @@ package launchd
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"text/template"
+
+	"github.com/thevedantmodi/framelog/core/binpath"
 )
 
 // Label is the launchd job label used in both the plist and launchctl commands.
@@ -18,15 +21,8 @@ const Label = "com.framelog.core"
 // FindLaunchctl returns the path to launchctl. Checks /bin/launchctl first
 // (the canonical macOS location), then falls back to PATH lookup.
 func FindLaunchctl() (string, error) {
-	const canonical = "/bin/launchctl"
-	if _, err := os.Stat(canonical); err == nil {
-		return canonical, nil
-	}
-	path, err := exec.LookPath("launchctl")
-	if err != nil {
-		return "", fmt.Errorf("launchctl not found: %w", err)
-	}
-	return path, nil
+	return binpath.Find([]string{"/bin/launchctl"}, "launchctl",
+		errors.New("launchctl not found"))
 }
 
 // plistData is the template data for GeneratePlist.

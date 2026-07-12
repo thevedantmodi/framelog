@@ -9,10 +9,13 @@ package exif
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"time"
+
+	"github.com/thevedantmodi/framelog/core/binpath"
 )
 
 // Metadata holds the fields this pipeline reads from a photo's EXIF data.
@@ -42,15 +45,8 @@ var candidatePaths = []string{
 // any other directory on PATH. Returns an actionable error message if nothing
 // is found.
 func FindExiftool() (string, error) {
-	for _, p := range candidatePaths {
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
-	}
-	if p, err := exec.LookPath("exiftool"); err == nil {
-		return p, nil
-	}
-	return "", fmt.Errorf("exiftool not found; install it with: brew install exiftool")
+	return binpath.Find(candidatePaths, "exiftool",
+		errors.New("exiftool not found; install it with: brew install exiftool"))
 }
 
 // exiftoolJSON is the per-file JSON shape exiftool emits with the -json flag.

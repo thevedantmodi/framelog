@@ -13,11 +13,11 @@
 package backup
 
 import (
-	"fmt"
+	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 
+	"github.com/thevedantmodi/framelog/core/binpath"
 	"github.com/thevedantmodi/framelog/core/rclonerun"
 )
 
@@ -32,15 +32,8 @@ var rcloneCandidates = []string{
 // install locations first, then falls back to exec.LookPath. Returns an
 // actionable error if neither resolves.
 func FindRclone() (string, error) {
-	for _, p := range rcloneCandidates {
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
-	}
-	if p, err := exec.LookPath("rclone"); err == nil {
-		return p, nil
-	}
-	return "", fmt.Errorf("rclone not found. Install it with: brew install rclone")
+	return binpath.Find(rcloneCandidates, "rclone",
+		errors.New("rclone not found. Install it with: brew install rclone"))
 }
 
 // IsDriveMounted reports whether backupPath exists and is a directory.

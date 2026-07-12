@@ -147,6 +147,9 @@ func (s *Server) acceptLoop() {
 	}
 }
 
+// protocolVersion is stamped into every response (PROTOCOL.md §3).
+const protocolVersion = 1
+
 // request is parsed from the client line. Path is only used by set_backup_path.
 type request struct {
 	Command string `json:"command"`
@@ -224,6 +227,12 @@ func (s *Server) writeResp(conn net.Conn, v any) {
 	conn.Write(b) //nolint:errcheck — nothing useful to do if the write fails
 }
 
+// writeErr writes a v1 error response carrying code as the wire "error" field
+// (e.g. "internal_error", "bad_request" — see PROTOCOL.md §3 for the full list).
+func (s *Server) writeErr(conn net.Conn, code string) {
+	s.writeResp(conn, errResp{ProtocolVersion: protocolVersion, OK: false, Error: code})
+}
+
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 
@@ -238,7 +247,7 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	var req request
 	if err := json.Unmarshal([]byte(line), &req); err != nil {
-		s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "bad_request"})
+		s.writeErr(conn, "bad_request")
 		return
 	}
 
@@ -247,17 +256,17 @@ func (s *Server) handleConn(conn net.Conn) {
 		counts, err := s.Ingest.RunIngest()
 		if err != nil {
 			if errors.Is(err, ingest.ErrIngestAlreadyRunning) {
-				s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "ingest_already_running"})
+				s.writeErr(conn, "ingest_already_running")
 			} else if errors.Is(err, ingest.ErrIngestPaused) {
-				s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "ingest_paused"})
+				s.writeErr(conn, "ingest_paused")
 			} else {
 				s.Logger.Log(logging.PrefixCore, fmt.Sprintf("ipc ingest_now error: %v", err))
-				s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+				s.writeErr(conn, "internal_error")
 			}
 			return
 		}
 		s.writeResp(conn, ingestOKResp{
-			ProtocolVersion: 1, OK: true,
+			ProtocolVersion: protocolVersion, OK: true,
 			Imported: counts.Imported, Skipped: counts.Skipped, Failed: counts.Failed,
 		})
 
@@ -265,17 +274,17 @@ func (s *Server) handleConn(conn net.Conn) {
 		counts, err := s.Outgest.RunOutgest()
 		if err != nil {
 			if errors.Is(err, outgest.ErrOutgestAlreadyRunning) {
-				s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "outgest_already_running"})
+				s.writeErr(conn, "outgest_already_running")
 			} else if errors.Is(err, outgest.ErrOutgestPaused) {
-				s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "outgest_paused"})
+				s.writeErr(conn, "outgest_paused")
 			} else {
 				s.Logger.Log(logging.PrefixCore, fmt.Sprintf("ipc outgest_now error: %v", err))
-				s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+				s.writeErr(conn, "internal_error")
 			}
 			return
 		}
 		s.writeResp(conn, outgestOKResp{
-			ProtocolVersion: 1, OK: true,
+			ProtocolVersion: protocolVersion, OK: true,
 			Moved: counts.Moved, Skipped: counts.Skipped, Failed: counts.Failed,
 		})
 
@@ -285,17 +294,17 @@ func (s *Server) handleConn(conn net.Conn) {
 		photoCount, err := s.Status.PhotoCount()
 		if err != nil {
 			s.Logger.Log(logging.PrefixCore, fmt.Sprintf("ipc status PhotoCount: %v", err))
-			s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			s.writeErr(conn, "internal_error")
 			return
 		}
 		lastImport, err := s.Status.LastImport()
 		if err != nil {
 			s.Logger.Log(logging.PrefixCore, fmt.Sprintf("ipc status LastImport: %v", err))
-			s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			s.writeErr(conn, "internal_error")
 			return
 		}
 		s.writeResp(conn, statusResp{
-			ProtocolVersion:    1,
+			ProtocolVersion:    protocolVersion,
 			OK:                 true,
 			IngestRunning:      s.Status.IngestRunning(),
 			OutgestRunning:     s.Status.OutgestRunning(),
@@ -310,33 +319,33 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	case "pause":
 		if s.Pause == nil {
-			s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			s.writeErr(conn, "internal_error")
 			return
 		}
 		s.Pause.Pause()
-		s.writeResp(conn, pauseOKResp{ProtocolVersion: 1, OK: true, Paused: true})
+		s.writeResp(conn, pauseOKResp{ProtocolVersion: protocolVersion, OK: true, Paused: true})
 
 	case "resume":
 		if s.Pause == nil {
-			s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			s.writeErr(conn, "internal_error")
 			return
 		}
 		s.Pause.Resume()
-		s.writeResp(conn, pauseOKResp{ProtocolVersion: 1, OK: true, Paused: false})
+		s.writeResp(conn, pauseOKResp{ProtocolVersion: protocolVersion, OK: true, Paused: false})
 
 	case "set_backup_path":
 		if s.Config == nil {
-			s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			s.writeErr(conn, "internal_error")
 			return
 		}
 		if err := s.Config.SetBackupPath(req.Path); err != nil {
 			s.Logger.Log(logging.PrefixCore, fmt.Sprintf("ipc set_backup_path error: %v", err))
-			s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			s.writeErr(conn, "internal_error")
 			return
 		}
-		s.writeResp(conn, setBackupPathOKResp{ProtocolVersion: 1, OK: true})
+		s.writeResp(conn, setBackupPathOKResp{ProtocolVersion: protocolVersion, OK: true})
 
 	default:
-		s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "unknown_command"})
+		s.writeErr(conn, "unknown_command")
 	}
 }

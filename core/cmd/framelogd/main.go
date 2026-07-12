@@ -83,6 +83,12 @@ func initWorkspace(inbox, originals, processed, gitPath string) error {
 	return nil
 }
 
+// die prints "framelogd <cmd>: <err>" to stderr and exits 1.
+func die(cmd string, err error) {
+	fmt.Fprintf(os.Stderr, "framelogd %s: %v\n", cmd, err)
+	os.Exit(1)
+}
+
 func main() {
 	args := os.Args[1:]
 
@@ -111,51 +117,43 @@ func main() {
 
 		launchctlPath, err := launchd.FindLaunchctl()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "framelogd install: %v\n", err)
-			os.Exit(1)
+			die("install", err)
 		}
 		execPath, err := os.Executable()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "framelogd install: %v\n", err)
-			os.Exit(1)
+			die("install", err)
 		}
 		home, _ := os.UserHomeDir()
 
 		gitPath, err := gitops.FindGit()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "framelogd install: %v\n", err)
-			os.Exit(1)
+			die("install", err)
 		}
 		if err := initWorkspace(config.Inbox, config.Originals, config.Processed, gitPath); err != nil {
-			fmt.Fprintf(os.Stderr, "framelogd install: %v\n", err)
-			os.Exit(1)
+			die("install", err)
 		}
 
 		if remoteURL != "" {
 			if ok, _ := gitops.HasRemote(gitPath, config.Originals); !ok {
 				out, err := exec.Command(gitPath, "-C", config.Originals, "remote", "add", "origin", remoteURL).CombinedOutput()
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "framelogd install: git remote add: %v\n%s", err, out)
-					os.Exit(1)
+					die("install", fmt.Errorf("git remote add: %w\n%s", err, out))
 				}
 			}
 		}
 
 		if err := launchd.Install(launchctlPath, plistPath(), execPath, home); err != nil {
-			fmt.Fprintf(os.Stderr, "framelogd install: %v\n", err)
-			os.Exit(1)
+			die("install", err)
 		}
 		fmt.Println("framelogd: installed and bootstrapped")
 
 	case "uninstall":
 		launchctlPath, err := launchd.FindLaunchctl()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "framelogd uninstall: %v\n", err)
-			os.Exit(1)
+			die("uninstall", err)
 		}
 		if err := launchd.Uninstall(launchctlPath, plistPath()); err != nil {
-			fmt.Fprintf(os.Stderr, "framelogd uninstall: %v\n", err)
-			os.Exit(1)
+			die("uninstall", err)
 		}
 		fmt.Println("framelogd: uninstalled")
 

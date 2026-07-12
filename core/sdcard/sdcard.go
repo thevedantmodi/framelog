@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thevedantmodi/framelog/core/binpath"
 	"github.com/thevedantmodi/framelog/core/config"
 	"github.com/thevedantmodi/framelog/core/ingest"
 	"github.com/thevedantmodi/framelog/core/logging"
@@ -44,15 +45,8 @@ var diskutilCandidates = []string{
 // macOS locations first, then falls back to exec.LookPath. Returns an
 // actionable error if neither finds it.
 func FindDiskutil() (string, error) {
-	for _, p := range diskutilCandidates {
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
-	}
-	if p, err := exec.LookPath("diskutil"); err == nil {
-		return p, nil
-	}
-	return "", fmt.Errorf("diskutil not found (expected on macOS at /usr/sbin/diskutil)")
+	return binpath.Find(diskutilCandidates, "diskutil",
+		errors.New("diskutil not found (expected on macOS at /usr/sbin/diskutil)"))
 }
 
 // IsRemovableMedia runs `<diskutilPath> info <volPath>` and reports whether

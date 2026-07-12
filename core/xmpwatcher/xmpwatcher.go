@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/thevedantmodi/framelog/core/binpath"
 	"github.com/thevedantmodi/framelog/core/config"
 	"github.com/thevedantmodi/framelog/core/db"
 	"github.com/thevedantmodi/framelog/core/gitops"
@@ -56,15 +57,8 @@ var watchedExts = map[string]bool{
 // locations first, then falls back to exec.LookPath. Returns an actionable
 // error if neither finds it.
 func FindPgrep() (string, error) {
-	for _, p := range pgrepCandidates {
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
-	}
-	if p, err := exec.LookPath("pgrep"); err == nil {
-		return p, nil
-	}
-	return "", fmt.Errorf("pgrep not found (expected on macOS at /usr/bin/pgrep)")
+	return binpath.Find(pgrepCandidates, "pgrep",
+		errors.New("pgrep not found (expected on macOS at /usr/bin/pgrep)"))
 }
 
 // IsLightroomRunning runs `<pgrepPath> -i lightroom`. Exit code 0 means pgrep

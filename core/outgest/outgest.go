@@ -108,10 +108,6 @@ func (p *Pipeline) OutgestRunning() bool {
 	return p.running
 }
 
-// captureLayout is exiftool's DateTimeOriginal format, identical to what
-// ingest.go uses — both packages parse the same exif.Metadata.CaptureDate.
-const captureLayout = "2006:01:02 15:04:05"
-
 // OrganizeFile moves path into a YYYY/MM subdirectory derived from its EXIF
 // capture date, then marks the matching catalog row as "published" using the
 // 8-char hash prefix embedded in the filename.
@@ -134,7 +130,7 @@ func (p *Pipeline) OrganizeFile(path string) (Result, error) {
 	if err != nil {
 		return p.fail(path, fmt.Errorf("exif: %w", err))
 	}
-	captureTime, err := time.ParseInLocation(captureLayout, meta.CaptureDate, time.Local)
+	captureTime, err := time.ParseInLocation(exif.ExifTimeFormat, meta.CaptureDate, time.Local)
 	if err != nil {
 		return p.fail(path, fmt.Errorf("parse capture date %q: %w", meta.CaptureDate, err))
 	}

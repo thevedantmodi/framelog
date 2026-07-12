@@ -13,10 +13,13 @@ package gitops
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
-	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+
+	"github.com/thevedantmodi/framelog/core/binpath"
 )
 
 // gitCandidates is the ordered list of known git binary locations on macOS.
@@ -42,30 +45,32 @@ var pmsetCandidates = []string{
 // locations first, then falls back to exec.LookPath. Returns an actionable
 // error if nothing is found.
 func FindGit() (string, error) {
-	for _, p := range gitCandidates {
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
-	}
-	if p, err := exec.LookPath("git"); err == nil {
-		return p, nil
-	}
-	return "", fmt.Errorf("git not found. Install Xcode Command Line Tools: xcode-select --install")
+	return binpath.Find(gitCandidates, "git",
+		errors.New("git not found. Install Xcode Command Line Tools: xcode-select --install"))
 }
 
 // FindPmset returns the absolute path to the pmset binary. Checks known macOS
 // locations first, then falls back to exec.LookPath. Returns an actionable
 // error if nothing is found.
 func FindPmset() (string, error) {
-	for _, p := range pmsetCandidates {
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
+	return binpath.Find(pmsetCandidates, "pmset",
+		errors.New("pmset not found (expected on macOS at /usr/bin/pmset)"))
+}
+
+// runCmd runs path with args (in dir, or the current directory if dir is
+// empty) and returns trimmed stdout. On failure the error wraps captured
+// stderr, using the binary's basename so messages stay uniform across every
+// git/pmset invocation in this package.
+func runCmd(path, dir string, args ...string) (string, error) {
+	var stderr bytes.Buffer
+	cmd := exec.Command(path, args...)
+	cmd.Dir = dir
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("%s %s: %w; stderr: %s", filepath.Base(path), strings.Join(args, " "), err, bytes.TrimSpace(stderr.Bytes()))
 	}
-	if p, err := exec.LookPath("pmset"); err == nil {
-		return p, nil
-	}
-	return "", fmt.Errorf("pmset not found (expected on macOS at /usr/bin/pmset)")
+	return string(out), nil
 }
 
 // Commit stages all changes in originalsPath and commits them with message.
@@ -73,23 +78,11 @@ func FindPmset() (string, error) {
 // that is a normal outcome after an ingest that produced no new files.
 // The empty-status check mirrors the Python predecessor's git_commit behavior.
 func Commit(gitPath, originalsPath, message string) (committed bool, err error) {
-	run := func(args ...string) (string, error) {
-		var stderr bytes.Buffer
-		cmd := exec.Command(gitPath, args...)
-		cmd.Dir = originalsPath
-		cmd.Stderr = &stderr
-		out, err := cmd.Output()
-		if err != nil {
-			return "", fmt.Errorf("git %s: %w; stderr: %s", strings.Join(args, " "), err, bytes.TrimSpace(stderr.Bytes()))
-		}
-		return string(out), nil
-	}
-
-	if _, err := run("add", "-A"); err != nil {
+	if _, err := runCmd(gitPath, originalsPath, "add", "-A"); err != nil {
 		return false, err
 	}
 
-	status, err := run("status", "--porcelain")
+	status, err := runCmd(gitPath, originalsPath, "status", "--porcelain")
 	if err != nil {
 		return false, err
 	}
@@ -97,7 +90,7 @@ func Commit(gitPath, originalsPath, message string) (committed bool, err error) 
 		return false, nil // nothing staged — not an error
 	}
 
-	if _, err := run("commit", "-m", message); err != nil {
+	if _, err := runCmd(gitPath, originalsPath, "commit", "-m", message); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -115,29 +108,22 @@ func IsOnACPower(pmsetPath string) (bool, error) {
 	if pmsetPath == "" {
 		return true, nil // pmset absent — gate skipped, not an error
 	}
-	var stderr bytes.Buffer
-	cmd := exec.Command(pmsetPath, "-g", "batt")
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, err := runCmd(pmsetPath, "", "-g", "batt")
 	if err != nil {
-		return false, fmt.Errorf("pmset -g batt: %w; stderr: %s", err, bytes.TrimSpace(stderr.Bytes()))
+		return false, err
 	}
-	return strings.Contains(string(out), "AC Power"), nil
+	return strings.Contains(out, "AC Power"), nil
 }
 
 // HasRemote reports whether originalsPath has at least one git remote configured.
 // Push calls this before attempting to push — a repo with no remote is a normal
 // first-run state, not an error.
 func HasRemote(gitPath, originalsPath string) (bool, error) {
-	var stderr bytes.Buffer
-	cmd := exec.Command(gitPath, "remote")
-	cmd.Dir = originalsPath
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, err := runCmd(gitPath, originalsPath, "remote")
 	if err != nil {
-		return false, fmt.Errorf("git remote: %w; stderr: %s", err, bytes.TrimSpace(stderr.Bytes()))
+		return false, err
 	}
-	return strings.TrimSpace(string(out)) != "", nil
+	return strings.TrimSpace(out) != "", nil
 }
 
 // Push pushes originalsPath to its configured remote when onACPower is true.
@@ -168,12 +154,8 @@ func Push(gitPath, originalsPath string, onACPower bool) (pushed bool, err error
 		args = []string{"push", "-u", "origin", branch}
 	}
 
-	var stderr bytes.Buffer
-	cmd := exec.Command(gitPath, args...)
-	cmd.Dir = originalsPath
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return false, fmt.Errorf("git %s: %w; stderr: %s", strings.Join(args, " "), err, bytes.TrimSpace(stderr.Bytes()))
+	if _, err := runCmd(gitPath, originalsPath, args...); err != nil {
+		return false, err
 	}
 	return true, nil
 }
@@ -190,13 +172,9 @@ func hasUpstream(gitPath, originalsPath string) bool {
 
 // currentBranch returns the name of the checked-out branch in originalsPath.
 func currentBranch(gitPath, originalsPath string) (string, error) {
-	var stderr bytes.Buffer
-	cmd := exec.Command(gitPath, "rev-parse", "--abbrev-ref", "HEAD")
-	cmd.Dir = originalsPath
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, err := runCmd(gitPath, originalsPath, "rev-parse", "--abbrev-ref", "HEAD")
 	if err != nil {
-		return "", fmt.Errorf("git rev-parse --abbrev-ref HEAD: %w; stderr: %s", err, bytes.TrimSpace(stderr.Bytes()))
+		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(out), nil
 }

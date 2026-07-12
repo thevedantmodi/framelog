@@ -168,10 +168,6 @@ const (
 // Counts tallies the per-run outcomes.
 type Counts struct{ Imported, Skipped, Failed int }
 
-// captureLayout is exiftool's DateTimeOriginal format. exif.go guarantees
-// Metadata.CaptureDate is always in this layout (mtime fallback uses the same).
-const captureLayout = "2006:01:02 15:04:05"
-
 // ImportFile imports one file from inbox to originals following the
 // copy-before-delete sequence. Steps are numbered to match the spec so
 // reviewers can verify ordering at a glance.
@@ -201,7 +197,7 @@ func (p *Pipeline) ImportFile(srcPath, batchID string) (Result, error) {
 	}
 
 	// 4. Parse CaptureDate to get calendar components for the dest path.
-	captureTime, err := time.ParseInLocation(captureLayout, meta.CaptureDate, time.Local)
+	captureTime, err := time.ParseInLocation(exif.ExifTimeFormat, meta.CaptureDate, time.Local)
 	if err != nil {
 		return p.fail(srcPath, fmt.Errorf("parse capture date %q: %w", meta.CaptureDate, err))
 	}
