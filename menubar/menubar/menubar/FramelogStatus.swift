@@ -83,6 +83,21 @@ func statusDisplayString(snapshot: CatalogSnapshot?, coreReachable: Bool) -> Str
     return "\(countPart) · last import: \(fmt.localizedString(for: date, relativeTo: Date()))"
 }
 
+// Returns a short crash reason parsed from crash.log content, or nil when
+// the log is empty/absent. An empty crash.log is the normal case (see
+// CLAUDE.md's KeepAlive + CrashLogPath section) — only non-empty content is
+// a real signal, so this is what backs the "Reason: ..." line shown next to
+// "Core restarting…".
+func crashReason(logContent: String?) -> String? {
+    guard let logContent else { return nil }
+    let lines =
+        logContent
+        .split(separator: "\n", omittingEmptySubsequences: true)
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+    return lines.last
+}
+
 // MARK: - Socket client (PROTOCOL.md §3)
 
 // Dials the Unix socket, writes one JSON command line, reads one JSON line
@@ -213,6 +228,24 @@ enum CoreInstallState {
     }
 }
 
+enum CoreRestartState {
+    case idle, restarting, success
+    case error(String)
+
+    var label: String {
+        switch self {
+        case .idle: return "Restart Core"
+        case .restarting: return "Restarting…"
+        case .success: return "Restarted ✓"
+        case .error: return "Restart Failed"
+        }
+    }
+    var isInProgress: Bool {
+        if case .restarting = self { return true }
+        return false
+    }
+}
+
 // MARK: - FramelogStatus
 
 @MainActor
@@ -222,6 +255,10 @@ final class FramelogStatus: ObservableObject {
     @Published var ingestRequested = false
     @Published var outgestRequested = false
     @Published private(set) var coreInstallState: CoreInstallState = .idle
+    @Published private(set) var coreRestartState: CoreRestartState = .idle
+    // Parsed from crash.log while the core is unreachable — see crashReason().
+    // nil whenever the core is reachable or crash.log has no content.
+    @Published private(set) var lastCrashReason: String?
     @Published private(set) var isPaused = false
     @Published private(set) var pauseToggleInFlight = false
     // Backup line + degraded-capability warnings from the daemon's status
@@ -304,6 +341,15 @@ final class FramelogStatus: ObservableObject {
         previousCount = newCount
         previousLastImport = newLastImport
         displayString = statusDisplayString(snapshot: snapshot, coreReachable: coreReachable)
+        // "Core restarting…" (socket down, db exists) is the only state where a
+        // crash reason is meaningful — read crash.log fresh each poll while down
+        // so a stale reason from a prior crash doesn't linger once fixed.
+        if coreReachable {
+            lastCrashReason = nil
+        } else if snapshot != nil {
+            let content = try? String(contentsOf: FramelogPaths.crashLog, encoding: .utf8)
+            lastCrashReason = crashReason(logContent: content)
+        }
         refreshLoginItemStatus()
 
         // One status round-trip supplies paused state, backup state,
@@ -444,6 +490,61 @@ final class FramelogStatus: ObservableObject {
         Task {
             try? await Task.sleep(for: .seconds(3))
             coreInstallState = .idle
+        }
+    }
+
+    // MARK: Core restart
+
+    // Restarts the daemon via `launchctl kickstart -k`, which kills and
+    // relaunches the existing launchd job without touching the plist —
+    // cheaper than installCore()'s bootout+bootstrap+rewrite when the job is
+    // already correctly registered and just needs a kick (e.g. it's hung or
+    // the operator wants a clean restart after changing config on disk).
+    func restartCore() {
+        guard !coreRestartState.isInProgress else { return }
+        coreRestartState = .restarting
+        let uid = Darwin.getuid()
+        // Must match launchd.Label in the Go core (core/launchd/launchd.go).
+        // Captured as a local instead of a static let so it's a plain
+        // non-isolated value the detached Task can read without hopping
+        // back to the main actor.
+        let label = "com.framelog.core"
+        Task.detached {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            proc.arguments = ["kickstart", "-k", "gui/\(uid)/\(label)"]
+            let stderrPipe = Pipe()
+            proc.standardError = stderrPipe
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+                let ok = proc.terminationStatus == 0
+                await MainActor.run {
+                    if ok {
+                        self.coreRestartState = .success
+                    } else {
+                        let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                        let errText = String(data: errData, encoding: .utf8)?
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        self.coreRestartState = .error(
+                            (errText?.isEmpty == false ? errText : nil)
+                                ?? "exit \(proc.terminationStatus)")
+                    }
+                    self.resetRestartState()
+                }
+            } catch {
+                await MainActor.run {
+                    self.coreRestartState = .error(error.localizedDescription)
+                    self.resetRestartState()
+                }
+            }
+        }
+    }
+
+    private func resetRestartState() {
+        Task {
+            try? await Task.sleep(for: .seconds(3))
+            coreRestartState = .idle
         }
     }
 

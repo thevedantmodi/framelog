@@ -10,6 +10,14 @@ enum FramelogPaths {
     static var ingestTrigger: URL  { photosDir.appendingPathComponent(".ingest_trigger") }
     static var outgestTrigger: URL { photosDir.appendingPathComponent(".outgest_trigger") }
 
+    // Must match launchd.GeneratePlist's CrashLogPath in the Go core — the
+    // plist's StandardOutPath/StandardErrorPath, which only receives uncaught
+    // panics or pre-logger startup failures (empty in normal operation).
+    static var crashLog: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/Framelog/crash.log")
+    }
+
     // Must match config.SocketPath in the Go core.
     static var socket: URL {
         FileManager.default.homeDirectoryForCurrentUser

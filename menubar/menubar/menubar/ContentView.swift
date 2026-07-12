@@ -8,6 +8,15 @@ struct ContentView: View {
         Text(status.displayString)
             .foregroundStyle(.secondary)
 
+        // Only populated during "Core restarting…" when crash.log has
+        // content — see crashReason(). Most restarts (launchd RunAtLoad,
+        // machine reboot) leave this nil, which is normal, not a bug.
+        if let reason = status.lastCrashReason {
+            Text("Reason: \(reason)")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+
         // Backup state + degraded-capability warnings from the daemon's
         // status response — surfaced here so a missing rclone or unplugged
         // backup drive is visible without tailing framelog.log.
@@ -65,6 +74,10 @@ struct ContentView: View {
         // FL-603: Install the Go daemon as a launchd agent.
         Button(status.coreInstallState.label) { status.installCore() }
             .disabled(status.coreInstallState.isInProgress)
+        // launchctl kickstart -k — cheaper than reinstalling when the daemon
+        // just needs a kick (hung, or picking up an on-disk config change).
+        Button(status.coreRestartState.label) { status.restartCore() }
+            .disabled(status.coreRestartState.isInProgress)
         Button("Set Git Remote…") { status.configureGitRemote() }
 
         Divider()
