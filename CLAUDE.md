@@ -131,12 +131,15 @@ than `t.TempDir()` (which produces long paths under the test cache). See
   This ensures the plist always references the current executable path even if
   you moved or rebuilt the binary.
 
-## What's not done yet (Phase 5/6)
+## What's not done yet (Phase 6)
 
 - **FL-404 socket migration:** Swift app buttons still use trigger files.
   Once migrated, both `.ingest_trigger` and `.outgest_trigger` can be retired
   from the protocol.
-- **FL-501 runbook execution:** `docs/PHASE5_RUNBOOK.md` is written; manual
-  steps (SD card, Lightroom, launchd install) are pending execution.
-- **FL-601–604:** Codesigning, version number end-to-end check, installer DMG,
-  crash/restart policy.
+- **FL-601 codesigning/notarization:** deferred — requires a $99 Apple
+  Developer account. App runs unsigned; Homebrew users install with
+  `--no-quarantine`.
+
+Phase 5 (migration/cutover) and the rest of Phase 6 (FL-602/603/604/605 —
+version stamping, installer DMG, crash/restart policy, release CI) are done.
+See `docs/ROADMAP.md` for the authoritative status.

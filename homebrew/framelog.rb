@@ -7,6 +7,10 @@ cask "framelog" do
   desc "Automated photo pipeline with SD card import, Lightroom XMP versioning, and git backup"
   homepage "https://github.com/thevedantmodi/framelog"
 
+  depends_on formula: "exiftool"
+  depends_on formula: "git"
+  depends_on formula: "rclone"
+
   app "Framelog.app"
 
   postflight do
