@@ -88,6 +88,31 @@ func setupRepoWithRemote(t *testing.T, git, repoDir, bareDir string) {
 	gitCmd(t, git, repoDir, "push", "-u", "origin", "HEAD")
 }
 
+// waitTimeout is the ceiling for waitFor polls. Generous on purpose: it is a
+// failure deadline, not an expected duration, and the whole point is to
+// tolerate a loaded machine.
+const waitTimeout = 10 * time.Second
+
+// waitFor polls cond until it returns true or timeout elapses.
+//
+// It replaces the fixed time.Sleep waits these tests used to do. Under a full
+// `go test ./... -race` the Go tool runs packages in parallel, and on a loaded
+// machine a debounced commit can land well after a fixed sleep expires. That
+// made the tests flaky, and worse: the commit would fire after the test body
+// returned, once t.TempDir() cleanup had already deleted the fake binaries it
+// needed. Polling ties the wait to the thing being waited for.
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return cond()
+}
+
 func gitLogCount(t *testing.T, git, dir string) int {
 	t.Helper()
 	out := gitCmd(t, git, dir, "log", "--oneline")
@@ -201,8 +226,14 @@ func TestDebounce_CollapsesBurst(t *testing.T) {
 		}
 	}
 
-	// Wait for debounce (100ms) + git commit time + margin.
-	time.Sleep(800 * time.Millisecond)
+	// Wait for the debounced commit to land, then settle: a second,
+	// incorrectly un-collapsed commit would need another debounce window to
+	// appear, so give it several before concluding the burst really collapsed.
+	if !waitFor(t, waitTimeout, func() bool { return gitLogCount(t, git, originals) >= 2 }) {
+		t.Fatalf("no edit commit within %v (git log count = %d)",
+			waitTimeout, gitLogCount(t, git, originals))
+	}
+	time.Sleep(5 * w.DebounceDuration)
 	w.Stop()
 
 	if n := gitLogCount(t, git, originals); n != 2 {
@@ -251,14 +282,16 @@ func TestStatusUpdate_EditedOnHash(t *testing.T) {
 	if err := os.WriteFile(xmpPath, []byte("xmp data"), 0o644); err != nil {
 		t.Fatalf("write xmp: %v", err)
 	}
-	time.Sleep(800 * time.Millisecond)
+	var status string
+	reached := waitFor(t, waitTimeout, func() bool {
+		if err := conn.QueryRow("SELECT status FROM photos WHERE hash = ?", fullHash).Scan(&status); err != nil {
+			t.Fatalf("query status: %v", err)
+		}
+		return status == db.StatusEdited
+	})
 	w.Stop()
 
-	var status string
-	if err := conn.QueryRow("SELECT status FROM photos WHERE hash = ?", fullHash).Scan(&status); err != nil {
-		t.Fatalf("query status: %v", err)
-	}
-	if status != db.StatusEdited {
+	if !reached {
 		t.Errorf("status = %q, want %q", status, db.StatusEdited)
 	}
 }
@@ -296,7 +329,14 @@ func TestStatusUpdate_NoHashNoChange(t *testing.T) {
 	if err := os.WriteFile(noHash, []byte("no hash here"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	time.Sleep(800 * time.Millisecond)
+	// The write still produces a commit (it is a watched .xmp); waiting for
+	// that proves the watcher processed the event, which is what makes the
+	// "status did not change" assertion below meaningful rather than merely
+	// early.
+	if !waitFor(t, waitTimeout, func() bool { return gitLogCount(t, git, originals) >= 2 }) {
+		t.Fatalf("watcher never committed within %v — cannot conclude "+
+			"anything about the status", waitTimeout)
+	}
 	w.Stop()
 
 	var status string
@@ -348,7 +388,23 @@ func TestPushGating(t *testing.T) {
 			if err := os.WriteFile(xmpPath, []byte("edit"), 0o644); err != nil {
 				t.Fatalf("write xmp: %v", err)
 			}
-			time.Sleep(800 * time.Millisecond)
+			// Wait for the local commit first — the push, if any, follows it.
+			if !waitFor(t, waitTimeout, func() bool {
+				return strings.Contains(gitCmd(t, git, originals, "log", "-1", "--format=%s"), "edit:")
+			}) {
+				t.Fatalf("no local edit commit within %v", waitTimeout)
+			}
+			// Then give the push its own window. When a push is expected this
+			// returns as soon as the bare HEAD moves; when it is not, it burns
+			// the full settle window proving the HEAD stays put.
+			pushSettle := 10 * w.DebounceDuration
+			if wantPushed {
+				waitFor(t, waitTimeout, func() bool {
+					return strings.TrimSpace(gitCmd(t, git, bare, "log", "-1", "--format=%H")) != bareHead
+				})
+			} else {
+				time.Sleep(pushSettle)
+			}
 			w.Stop()
 
 			// Local commit must always exist.
@@ -405,8 +461,11 @@ func TestDynamicSubdirectory(t *testing.T) {
 		t.Fatalf("write xmp: %v", err)
 	}
 
-	// Wait for debounce + commit.
-	time.Sleep(800 * time.Millisecond)
+	// Wait for the commit rather than a fixed span.
+	if !waitFor(t, waitTimeout, func() bool { return gitLogCount(t, git, originals) >= 2 }) {
+		t.Fatalf("no commit from dynamic subdir within %v (git log count = %d)",
+			waitTimeout, gitLogCount(t, git, originals))
+	}
 	w.Stop()
 
 	if n := gitLogCount(t, git, originals); n != 2 {

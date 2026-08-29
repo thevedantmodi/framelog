@@ -69,6 +69,32 @@ func readLines(t *testing.T, path string) []string {
 	return lines
 }
 
+// waitTimeout is the ceiling for waitFor polls. Generous on purpose: it is a
+// failure deadline, not an expected duration, and the whole point is to
+// tolerate a loaded machine.
+const waitTimeout = 10 * time.Second
+
+// waitFor polls cond until it returns true or timeout elapses.
+//
+// It replaces the fixed time.Sleep waits these tests used to do. Under a full
+// `go test ./... -race` the Go tool runs packages in parallel, and on a loaded
+// machine a debounced RunOutgest can land well after a fixed sleep expires.
+// That made the tests flaky, and worse: the run would fire after the test body
+// returned, once t.TempDir() cleanup had already deleted the fake exiftool it
+// needed, producing a confusing "exit status 127" long after the failure.
+// Polling ties the wait to the thing being waited for.
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return cond()
+}
+
 // countingRunner is a fake OutgestRunner that just increments a counter.
 type countingRunner struct {
 	mu    sync.Mutex
@@ -127,8 +153,13 @@ func TestDebounce_CollapsesBurst(t *testing.T) {
 		}
 	}
 
-	// Wait for debounce (100ms) + runOnce overhead + margin.
-	time.Sleep(600 * time.Millisecond)
+	// Wait for the debounced run to land, then settle: a second, incorrectly
+	// un-collapsed run would need another debounce window to show up, so give
+	// it several before concluding the burst really did collapse.
+	if !waitFor(t, waitTimeout, func() bool { return runner.count() >= 1 }) {
+		t.Fatalf("RunOutgest never called within %v", waitTimeout)
+	}
+	time.Sleep(5 * w.DebounceDuration)
 	w.Stop()
 
 	if n := runner.count(); n != 1 {
@@ -296,8 +327,23 @@ func TestIntegration_RealPipeline(t *testing.T) {
 		}
 	}
 
-	// Wait for debounce + RunOutgest + filesystem moves.
-	time.Sleep(800 * time.Millisecond)
+	// Wait for the moves to actually land rather than for a fixed span. Stop()
+	// must come after: stopping first would race the debounced run and could
+	// tear the fake exiftool out from under it.
+	organized := func() bool {
+		for _, name := range []string{
+			"20260622_140311_aabbccdd.jpg",
+			"20260622_140311_11223344.jpg",
+		} {
+			if _, err := os.Stat(filepath.Join(processed, "2026", "06", name)); err != nil {
+				return false
+			}
+		}
+		return true
+	}
+	if !waitFor(t, waitTimeout, organized) {
+		t.Errorf("exports not organized into 2026/06 within %v", waitTimeout)
+	}
 	w.Stop()
 
 	select {
@@ -348,7 +394,10 @@ func TestExportOnlyExtension_TriggersRun(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	time.Sleep(500 * time.Millisecond)
+	if !waitFor(t, waitTimeout, func() bool { return runner.count() >= 1 }) {
+		t.Fatalf("RunOutgest never called for .png export within %v", waitTimeout)
+	}
+	time.Sleep(5 * w.DebounceDuration)
 	w.Stop()
 
 	if n := runner.count(); n != 1 {
