@@ -94,8 +94,10 @@ func (w *Watcher) Run() error {
 }
 
 // handleEvent processes one fsnotify event. Directories are ignored entirely —
-// no Add(), no debounce trigger. Only Create/Write events on files with
-// supported extensions reach scheduleRun.
+// no Add(), no debounce trigger. Only Create/Write events on files whose
+// extension is in config.OutgestExtensions reach scheduleRun — the same set
+// RunOutgest filters on, so the watcher never schedules a run that would find
+// nothing to do.
 func (w *Watcher) handleEvent(event fsnotify.Event) {
 	path := event.Name
 
@@ -109,7 +111,7 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 
 	if event.Op&(fsnotify.Create|fsnotify.Write) != 0 {
 		ext := strings.ToLower(filepath.Ext(path))
-		if config.SupportedExtensions[ext] {
+		if config.OutgestExtensions[ext] {
 			w.scheduleRun()
 		}
 	}

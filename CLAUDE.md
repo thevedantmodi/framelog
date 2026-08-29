@@ -120,6 +120,16 @@ than `t.TempDir()` (which produces long paths under the test cache). See
 - `outgestwatcher` watches only the top-level `processed/` directory, never
   subdirectories. Deliberate: `YYYY/MM/` folders created by a prior outgest run
   must not trigger a re-scan of already-organised files.
+- `outgest` and `outgestwatcher` filter on `config.OutgestExtensions`, while
+  `ingest` and `sdcard` filter on `config.SupportedExtensions`. Deliberate: the
+  export list is a superset (currently just PNG). PNG exports must be filed
+  into `processed/YYYY/MM/` but must never be imported into `originals/` and
+  git-tracked. Kept narrow on purpose: outgest sets `status="published"`, so
+  working files (`.psb`/`.psd`) and intermediates (`.jxl`) stay out — they
+  share the export's hash8 prefix and would republish the same row.
+  `OutgestExtensions` is derived from `SupportedExtensions` in an `init`, so
+  the two can't drift; export-only entries go in `outgestOnlyExtensions`.
+  Tests in `core/config/config_test.go` pin both directions.
 - The XMP watcher skips `.git/` during its initial walk. Deliberate: watching
   git internals would leak fsnotify watches on every commit the watcher itself
   makes.

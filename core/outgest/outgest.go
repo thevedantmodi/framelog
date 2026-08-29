@@ -184,8 +184,10 @@ func (p *Pipeline) fail(path string, err error) (Result, error) {
 
 // RunOutgest reads the top level of ProcessedPath (non-recursive — files
 // already organized into YYYY/MM subdirs must not be re-scanned), filters to
-// supported extensions, and calls OrganizeFile on each. Returns
-// ErrOutgestAlreadyRunning immediately if another call is in progress.
+// config.OutgestExtensions (a superset of SupportedExtensions — see the note
+// there on why the export list is wider than the import list), and calls
+// OrganizeFile on each. Returns ErrOutgestAlreadyRunning immediately if
+// another call is in progress.
 func (p *Pipeline) RunOutgest() (Counts, error) {
 	if p.Paused() {
 		return Counts{}, ErrOutgestPaused
@@ -200,14 +202,14 @@ func (p *Pipeline) RunOutgest() (Counts, error) {
 		return Counts{}, fmt.Errorf("outgest: readdir %s: %w", p.ProcessedPath, err)
 	}
 
-	// Collect plain files with supported extensions, sorted for deterministic
+	// Collect plain files with outgest-eligible extensions, sorted for deterministic
 	// order matching Python's sorted(processed.iterdir()).
 	var files []string
 	for _, e := range entries {
 		if e.IsDir() {
 			continue // YYYY/MM subdirs — already organized, skip.
 		}
-		if config.SupportedExtensions[strings.ToLower(filepath.Ext(e.Name()))] {
+		if config.OutgestExtensions[strings.ToLower(filepath.Ext(e.Name()))] {
 			files = append(files, filepath.Join(p.ProcessedPath, e.Name()))
 		}
 	}

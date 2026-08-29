@@ -259,6 +259,16 @@ Frontend tails this file for the log viewer. No bare `print()` anywhere in the c
 - **`outgestwatcher` watches only the top-level `processed/` directory**, never
   subdirectories. `YYYY/MM/` folders created by a prior outgest run must not trigger a
   re-scan of already-organised files.
+- **Outgest filters on `config.OutgestExtensions`, not `config.SupportedExtensions`.**
+  The import list and the export list are deliberately different: ingest decides what
+  enters `originals/` and gets git-tracked, outgest decides what counts as a finished
+  export. A PNG export must be filed into `processed/YYYY/MM/` but must never be
+  ingested. The export-only list stays narrow because outgest sets
+  `status="published"`: Photoshop working files and archival intermediates share the
+  export's hash8 prefix and would republish the same catalog row.
+  `OutgestExtensions` is built from `SupportedExtensions` at init, so the import formats
+  can never drift out of the export set; export-only additions go in
+  `outgestOnlyExtensions`.
 - **XMP watcher skips `.git/`** during initial walk. Watching git internals would leak
   fsnotify watches on every commit the watcher itself makes.
 - **Socket path is capped at 104 bytes** (macOS `sockaddr_un` limit). Tests use

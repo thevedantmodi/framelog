@@ -97,3 +97,52 @@ func TestInvariant_ConcurrentRunRejected(t *testing.T) {
 
 	p.Release()
 }
+
+// TestInvariant_ExportOnlyExtensionsOrganized covers both halves of the
+// import/export split. A PNG — in config.OutgestExtensions but NOT in
+// config.SupportedExtensions — must be filed into YYYY/MM; before the sets
+// were split, RunOutgest filtered on the ingest list and silently left every
+// PNG export in processed/ root while reporting "0 moved, 0 skipped,
+// 0 failed". Working files and intermediates must stay put.
+func TestInvariant_ExportOnlyExtensionsOrganized(t *testing.T) {
+	p, processed := newPipeline(t, testDate)
+
+	const export = "20260622_140311_aabbccdd.png"
+	writeFile(t, processed, export, "export")
+	// These share the export's hash8 prefix. Filing them would publish the same
+	// catalog row again and park multi-GB scratch files in YYYY/MM. The last is
+	// exiftool's in-place backup suffix.
+	leaveAlone := []string{
+		"20260622_140311_aabbccdd.psb",
+		"20260622_140311_aabbccdd.jxl",
+		"20260622_140311_aabbccdd.acr",
+		"20260622_140311_aabbccdd.png_original",
+	}
+	var untouched []string
+	for _, name := range leaveAlone {
+		untouched = append(untouched, writeFile(t, processed, name, "not an export"))
+	}
+
+	counts, err := p.RunOutgest()
+	if err != nil {
+		t.Fatalf("RunOutgest: %v", err)
+	}
+	if counts.Moved != 1 {
+		t.Errorf("Moved = %d, want 1", counts.Moved)
+	}
+	if counts.Failed != 0 {
+		t.Errorf("Failed = %d, want 0", counts.Failed)
+	}
+
+	dest := filepath.Join(processed, "2026", "06", export)
+	if _, err := os.Stat(dest); err != nil {
+		t.Errorf("%s not organized into 2026/06: %v", export, err)
+	}
+
+	for _, path := range untouched {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s was moved, want left in processed/ root: %v",
+				filepath.Base(path), err)
+		}
+	}
+}

@@ -183,7 +183,7 @@ func TestUnsupportedExtension_Ignored(t *testing.T) {
 	go w.Run()
 	time.Sleep(200 * time.Millisecond)
 
-	// .txt is not in config.SupportedExtensions.
+	// .txt is not in config.OutgestExtensions.
 	if err := os.WriteFile(filepath.Join(processed, "notes.txt"), []byte("text"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -323,5 +323,35 @@ func TestIntegration_RealPipeline(t *testing.T) {
 		if _, err := os.Stat(src); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("source still present at %s after outgest", src)
 		}
+	}
+}
+
+// ---- Export-only extension triggers a run -----------------------------------
+
+// TestExportOnlyExtension_TriggersRun asserts the watcher fires on a PNG — an
+// extension in config.OutgestExtensions but not config.SupportedExtensions.
+// The watcher and RunOutgest must filter on the same set; if the watcher used
+// the narrower ingest list, a Lightroom PNG export would never wake it.
+func TestExportOnlyExtension_TriggersRun(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping watcher integration test: requires fsnotify timing")
+	}
+
+	processed := t.TempDir()
+	runner := &countingRunner{}
+	w, _ := newWatcher(t, processed, runner, 100*time.Millisecond)
+
+	go w.Run()
+	time.Sleep(200 * time.Millisecond)
+
+	if err := os.WriteFile(filepath.Join(processed, "20260622_140311_aabbccdd.png"), []byte("png"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	w.Stop()
+
+	if n := runner.count(); n != 1 {
+		t.Errorf("RunOutgest called %d times for .png export, want 1", n)
 	}
 }

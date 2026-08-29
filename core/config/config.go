@@ -74,6 +74,38 @@ var SupportedExtensions = map[string]bool{
 	".mov":  true,
 }
 
+// OutgestExtensions is the set of extensions RunOutgest and outgestwatcher
+// accept in processed/. Deliberately a superset of SupportedExtensions: ingest
+// decides what enters the library, outgest decides what counts as a finished
+// export, and the two lists diverge. A PNG export must be filed into YYYY/MM
+// but must never be ingested into originals/ and git-tracked.
+//
+// Built from SupportedExtensions at init so the ingest formats can never drift
+// out of the outgest set. Add export-only formats to outgestOnlyExtensions.
+//
+// Kept deliberately narrow: outgest sets status="published", so only finished
+// deliverables belong here. Photoshop working files (.psb/.psd) and archival
+// intermediates (.jxl) share the same hash8 prefix as the export they came
+// from — filing them would publish one photo several times and park multi-GB
+// scratch files next to the deliverable in YYYY/MM. Add .tif and friends if
+// and when exports of that format actually appear.
+var OutgestExtensions = map[string]bool{}
+
+// outgestOnlyExtensions are formats outgest files but ingest never imports.
+// Kept separate so it is obvious which entries widen only the outgest side.
+var outgestOnlyExtensions = map[string]bool{
+	".png": true,
+}
+
+func init() {
+	for ext := range SupportedExtensions {
+		OutgestExtensions[ext] = true
+	}
+	for ext := range outgestOnlyExtensions {
+		OutgestExtensions[ext] = true
+	}
+}
+
 // EmbeddedXMPExtensions is the set of formats that store XMP metadata embedded
 // inside the file rather than in a separate sidecar. Writing a .xmp sidecar
 // next to these files causes Lightroom to read the sidecar and ignore the
