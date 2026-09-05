@@ -1,9 +1,11 @@
-// Package sdcard detects SD cards mounted under /Volumes, copies their DCIM
-// contents into inbox/ via rclone, and fires RunIngest. It ports the
-// detection logic from on_sd_mount.sh — the dual check (diskutil says
-// removable AND a DCIM directory is present) naturally excludes other things
-// that mount under /Volumes (backup drives, network shares) without any
-// explicit special-casing.
+// Package sdcard detects SD cards mounted under /Volumes, copies their camera
+// media into inbox/ via rclone, and fires RunIngest. It ports the detection
+// logic from on_sd_mount.sh — the dual check (diskutil says removable AND
+// camera media is present) naturally excludes other things that mount under
+// /Volumes (backup drives, network shares) without any explicit
+// special-casing. "Camera media" is DCIM or Sony's PRIVATE/M4ROOT/CLIP: XAVC
+// bodies keep video out of DCIM entirely, so a video-only card has no DCIM
+// and would otherwise never be picked up.
 //
 // The injectable-binary-path pattern from core/exif and core/gitops is
 // applied here for both diskutil and rclone: FindDiskutil/backup.FindRclone
@@ -84,14 +86,34 @@ func IsRemovableMedia(diskutilPath, volPath string) (bool, error) {
 // HasDCIM reports whether volPath contains a DCIM subdirectory. Not injected
 // because it is just a directory check — no external binary involved.
 func HasDCIM(volPath string) bool {
-	fi, err := os.Stat(filepath.Join(volPath, "DCIM"))
+	return isDir(filepath.Join(volPath, config.DCIMDirName))
+}
+
+// HasClips reports whether volPath contains a Sony XAVC clip directory
+// (PRIVATE/M4ROOT/CLIP). Sony bodies write video there, not under DCIM, so a
+// card that has only been used for video has no DCIM at all — checking for
+// DCIM alone would leave it undetected.
+func HasClips(volPath string) bool {
+	return isDir(filepath.Join(volPath, config.ClipDirRelPath))
+}
+
+// IsCameraCard reports whether volPath looks like a camera card: it holds
+// stills (DCIM), clips (PRIVATE/M4ROOT/CLIP), or both. Paired with the
+// diskutil removable check, this is the dual test that keeps backup drives
+// and network shares out without special-casing them.
+func IsCameraCard(volPath string) bool {
+	return HasDCIM(volPath) || HasClips(volPath)
+}
+
+func isDir(path string) bool {
+	fi, err := os.Stat(path)
 	return err == nil && fi.IsDir()
 }
 
 // FindSDCard lists the immediate subdirectories of volumesRoot, and returns
 // the first one (in name order) that is both removable media and contains a
-// DCIM directory. Returns "", nil when no match is found — "no SD card
-// present" is a normal outcome, not a failure.
+// camera media (DCIM and/or PRIVATE/M4ROOT/CLIP). Returns "", nil when no
+// match is found — "no SD card present" is a normal outcome, not a failure.
 func FindSDCard(diskutilPath, volumesRoot string) (string, error) {
 	entries, err := os.ReadDir(volumesRoot)
 	if err != nil {
@@ -108,7 +130,7 @@ func FindSDCard(diskutilPath, volumesRoot string) (string, error) {
 		if err != nil {
 			continue // diskutil error for one volume shouldn't stop the scan
 		}
-		if removable && HasDCIM(volPath) {
+		if removable && IsCameraCard(volPath) {
 			return volPath, nil
 		}
 	}
@@ -130,13 +152,29 @@ func FindSDCard(diskutilPath, volumesRoot string) (string, error) {
 // from rclone's JSON log stream by rclonerun.Copy. Pass nil (or omit) when
 // progress reporting is not needed.
 func CopyDCIM(rclonePath, sdDCIMPath, inboxPath string, onCopy ...func(filename string, n int)) (int, error) {
+	return copyMedia(rclonePath, sdDCIMPath, inboxPath, sortedSupportedExtensions(), onCopy...)
+}
+
+// CopyClips copies a Sony XAVC clip directory (PRIVATE/M4ROOT/CLIP) into
+// inboxPath with the same non-clobbering semantics as CopyDCIM. The include
+// list is SupportedExtensions plus config.NRTMetaExtension: the C####M01.XML
+// sidecar must land in inbox next to its clip, because it — not the MP4
+// container — carries the local capture time, body, and lens that ingest
+// files the clip by. Nothing else on the card's PRIVATE tree is copied.
+func CopyClips(rclonePath, sdClipPath, inboxPath string, onCopy ...func(filename string, n int)) (int, error) {
+	exts := append(sortedSupportedExtensions(), config.NRTMetaExtension)
+	return copyMedia(rclonePath, sdClipPath, inboxPath, exts, onCopy...)
+}
+
+// copyMedia is the shared rclone invocation behind CopyDCIM and CopyClips.
+func copyMedia(rclonePath, srcPath, inboxPath string, exts []string, onCopy ...func(filename string, n int)) (int, error) {
 	var cb func(string, int)
 	if len(onCopy) > 0 {
 		cb = onCopy[0]
 	}
 
-	args := []string{"copy", sdDCIMPath, inboxPath, "--ignore-existing", "--ignore-case"}
-	for _, ext := range sortedSupportedExtensions() {
+	args := []string{"copy", srcPath, inboxPath, "--ignore-existing", "--ignore-case"}
+	for _, ext := range exts {
 		args = append(args, "--include", "*"+ext)
 	}
 
@@ -250,7 +288,7 @@ func (w *Watcher) tick() {
 				fmt.Sprintf("diskutil error for %s: %v", name, err))
 			continue
 		}
-		if !removable || !HasDCIM(volPath) {
+		if !removable || !IsCameraCard(volPath) {
 			continue
 		}
 		if w.Runner.Paused() {
@@ -262,19 +300,40 @@ func (w *Watcher) tick() {
 
 		processed[name] = true
 		w.Logger.Log(logging.PrefixCore, "SD card detected: "+volPath)
-		w.Logger.Log(logging.PrefixCore, "scanning DCIM (may take a moment on slow card readers)...")
+		w.Logger.Log(logging.PrefixCore, "scanning card (may take a moment on slow card readers)...")
 
 		logProgress := func(filename string, n int) {
 			w.Logger.Log(logging.PrefixCore,
 				fmt.Sprintf("copying [%05d] %s → inbox/", n, filename))
 		}
-		n, copyErr := CopyDCIM(w.RclonePath, filepath.Join(volPath, "DCIM"), w.InboxPath, logProgress)
-		if copyErr != nil {
+
+		// DCIM and PRIVATE/M4ROOT/CLIP are copied independently: a card can
+		// hold either or both, and a failure reading one must not skip the
+		// other. Both land flat in inbox/ so a clip's XML sidecar stays next
+		// to it, which is what ingest's sidecar lookup relies on.
+		var n int
+		if HasDCIM(volPath) {
+			copied, copyErr := CopyDCIM(w.RclonePath, filepath.Join(volPath, config.DCIMDirName), w.InboxPath, logProgress)
+			if copyErr != nil {
+				w.Logger.Log(logging.PrefixCore,
+					fmt.Sprintf("DCIM copy error: %v", copyErr))
+			}
 			w.Logger.Log(logging.PrefixCore,
-				fmt.Sprintf("DCIM copy error: %v", copyErr))
+				fmt.Sprintf("copied %d files from DCIM", copied))
+			n += copied
+		}
+		if HasClips(volPath) {
+			copied, copyErr := CopyClips(w.RclonePath, filepath.Join(volPath, config.ClipDirRelPath), w.InboxPath, logProgress)
+			if copyErr != nil {
+				w.Logger.Log(logging.PrefixCore,
+					fmt.Sprintf("CLIP copy error: %v", copyErr))
+			}
+			w.Logger.Log(logging.PrefixCore,
+				fmt.Sprintf("copied %d files from %s", copied, config.ClipDirRelPath))
+			n += copied
 		}
 		w.Logger.Log(logging.PrefixCore,
-			fmt.Sprintf("copied %d files from DCIM", n))
+			fmt.Sprintf("copied %d files from card", n))
 
 		counts, err := w.Runner.RunIngest()
 		if err != nil {

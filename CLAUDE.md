@@ -23,9 +23,10 @@ core/         Go module (github.com/thevedantmodi/framelog/core)
   ipc/              Unix socket server; status/ingest_now/outgest_now
   launchd/          plist generation; Install/Uninstall
   logging/          structured logger (PREFIX, fsync on every write)
+  nrtmeta/          Sony NonRealTimeMeta XML sidecar parser (XAVC clips)
   outgest/          RunOutgest; concurrency guard
   outgestwatcher/   fsnotify watcher for processed/; debounce
-  sdcard/           /Volumes watcher; diskutil check; DCIM copy
+  sdcard/           /Volumes watcher; diskutil check; DCIM + XAVC CLIP copy
   triggerwatcher/   2s poll for .ingest_trigger / .outgest_trigger
   xmp/              sidecar writer
   xmpwatcher/       fsnotify watcher for originals/; debounce+commit
@@ -130,6 +131,13 @@ than `t.TempDir()` (which produces long paths under the test cache). See
   `OutgestExtensions` is derived from `SupportedExtensions` in an `init`, so
   the two can't drift; export-only entries go in `outgestOnlyExtensions`.
   Tests in `core/config/config_test.go` pin both directions.
+- Sony XAVC clips are read from `PRIVATE/M4ROOT/CLIP/`, not `DCIM/`, and their
+  `C####M01.XML` sidecar overrides exiftool for capture date and camera model.
+  Deliberate: the MP4 container stores only a UTC `CreateDate` with no offset,
+  which files an evening shoot under the next day, and names no camera body.
+  The sidecar is copied next to the imported clip (`.gitignore` tracks only
+  `*.xmp`, so it stays untracked) and deleted from `inbox/` with the clip —
+  nothing else in the pipeline collects `.xml`, so one left behind is stuck.
 - The XMP watcher skips `.git/` during its initial walk. Deliberate: watching
   git internals would leak fsnotify watches on every commit the watcher itself
   makes.

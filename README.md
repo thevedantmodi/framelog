@@ -43,6 +43,11 @@ Once installed, Framelog runs itself:
    files are hashed (to catch duplicates), renamed, and sorted into
    `~/Photos/originals/YYYY/MM/DD/`.
     - Each file is named as `YYYYMMDD_HHMMSS_[8letterhash]`.
+    - Sony XAVC video is also picked up from `PRIVATE/M4ROOT/CLIP/`, where
+      those cameras write clips instead of `DCIM/`. Each clip's
+      `C####M01.XML` sidecar comes along: it supplies the local capture time
+      (the MP4 itself only stores UTC) and the camera body, and is kept
+      untracked next to the imported clip for its lens and LUT details.
 2. **Edit in Lightroom.** Point Lightroom at `~/Photos/originals/` as your
    catalog folder. Edit as normal.
 3. **Your edits are saved to history automatically.** A few seconds after
@@ -219,7 +224,7 @@ including the Homebrew tap update.
 
 ```
 framelogd (Go daemon)
-├── SD card watcher      polls /Volumes every 2s; copies DCIM → inbox/ via rclone on mount
+├── SD card watcher      polls /Volumes every 2s; copies DCIM + PRIVATE/M4ROOT/CLIP → inbox/ via rclone on mount
 ├── ingest               hash → dedup/quarantine → rename → originals/ → catalog.db → git commit → backup
 ├── XMP watcher          fsnotify on originals/; debounce → git commit → push (gated on AC power + Lightroom closed)
 │   └── DNG handling     exiftool -xmp -b extracts embedded XMP to .xmp sidecar
