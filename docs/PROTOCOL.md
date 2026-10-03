@@ -94,7 +94,8 @@ together — there is no separate "pause ingest only" mode. While paused:
   of running.
 - The trigger-file watcher (§2) leaves `.ingest_trigger` / `.outgest_trigger` in
   place instead of consuming them, so the pending request fires once resumed.
-- The SD card watcher does not copy DCIM contents or mark the card processed;
+- The SD card watcher does not copy card contents (`DCIM/`,
+  `PRIVATE/M4ROOT/CLIP/`) or mark the card processed;
   it re-checks the card on every poll tick until resumed, so no physical
   unmount/remount is needed to retry.
 - The XMP-triggered outgest watcher (`outgestwatcher`) still logs the fsnotify

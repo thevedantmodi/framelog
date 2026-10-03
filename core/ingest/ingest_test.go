@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/thevedantmodi/framelog/core/config"
 	"github.com/thevedantmodi/framelog/core/db"
 	"github.com/thevedantmodi/framelog/core/hasher"
 	"github.com/thevedantmodi/framelog/core/logging"
@@ -655,7 +656,6 @@ func TestRunIngest_BackupPathMissing(t *testing.T) {
 	}
 }
 
-
 // TestImportFile_OnFileWrittenReportsDestAndSidecar asserts the hook main.go
 // wires to xmpwatcher.Suppress receives every path ingest writes into
 // originals/ — the copied photo and its XMP sidecar — so ingest's own writes
@@ -749,5 +749,200 @@ func TestRunIngest_SuccessClearsFailCount(t *testing.T) {
 	p.mu.Unlock()
 	if tracked {
 		t.Error("fail count for imported file not cleared — a later transient failure would quarantine too eagerly")
+	}
+}
+
+// ---- Sony XAVC clips + NonRealTimeMeta sidecars -----------------------------
+
+// nrtSidecarXML is the shape the camera writes; only CreationDate, Device and
+// Lens are read by the pipeline.
+func nrtSidecarXML(creationDate, model string) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<NonRealTimeMeta xmlns="urn:schemas-professionalDisc:nonRealTimeMeta:ver.2.20">
+    <Duration value="435"/>
+    <CreationDate value="%s"/>
+    <Device manufacturer="Sony" modelName="%s" serialNo="01380224"/>
+    <Lens modelName="SAMYANG AF 35mm F1.8"/>
+</NonRealTimeMeta>
+`, creationDate, model)
+}
+
+// writeClipWithSidecar creates inbox/<stem>.MP4 and inbox/<stem>M01.XML.
+func writeClipWithSidecar(t *testing.T, inbox, stem, creationDate, model string) (string, string) {
+	t.Helper()
+	clip := filepath.Join(inbox, stem+".MP4")
+	if err := os.WriteFile(clip, []byte("fake clip: "+stem), 0o644); err != nil {
+		t.Fatalf("write clip: %v", err)
+	}
+	sidecar := filepath.Join(inbox, stem+"M01.XML")
+	if err := os.WriteFile(sidecar, []byte(nrtSidecarXML(creationDate, model)), 0o644); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+	return clip, sidecar
+}
+
+// The sidecar's local CreationDate must win over exiftool. This is the whole
+// point of reading it: the Sony MP4 container carries a UTC CreateDate, which
+// files an evening shoot under the following day.
+func TestImportFile_SidecarOverridesCaptureDateAndModel(t *testing.T) {
+	// exiftool reports the UTC instant of the same recording — one day later.
+	p, inbox, _ := newPipeline(t, fakeExiftoolNoGPS("", "2026:07:27 00:35:25"))
+
+	clip, sidecar := writeClipWithSidecar(t, inbox, "C0001", "2026-07-26T17:35:25-07:00", "ILCE-7CM2")
+	hash, err := hasher.HashFile(clip)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if r, err := p.ImportFile(clip, "b1"); err != nil || r != ResultImported {
+		t.Fatalf("import: result=%q err=%v", r, err)
+	}
+
+	// Filed under the camera's local date, not exiftool's UTC one.
+	dest := filepath.Join(p.OriginalsPath, "2026", "07", "26",
+		"20260726_173525_"+hash[:8]+".mp4")
+	if _, err := os.Stat(dest); err != nil {
+		t.Fatalf("clip not filed at %s: %v", dest, err)
+	}
+
+	row := p.DB.QueryRow(`SELECT capture_date, camera_model FROM photos WHERE hash = ?`, hash)
+	var captureDate, cameraModel string
+	if err := row.Scan(&captureDate, &cameraModel); err != nil {
+		t.Fatalf("scan row: %v", err)
+	}
+	if captureDate != "2026:07:26 17:35:25" {
+		t.Errorf("capture_date = %q, want the sidecar's local time", captureDate)
+	}
+	if cameraModel != "ILCE-7CM2" {
+		t.Errorf("camera_model = %q, want ILCE-7CM2 from the sidecar", cameraModel)
+	}
+
+	// The sidecar rides along into originals/ and leaves inbox/ empty — no
+	// other walk in the pipeline collects .xml, so a leftover would be stuck.
+	destSidecar := filepath.Join(p.OriginalsPath, "2026", "07", "26",
+		"20260726_173525_"+hash[:8]+".xml")
+	if _, err := os.Stat(destSidecar); err != nil {
+		t.Errorf("sidecar not carried to %s: %v", destSidecar, err)
+	}
+	if _, err := os.Stat(sidecar); !os.IsNotExist(err) {
+		t.Error("sidecar left behind in inbox after a successful import")
+	}
+}
+
+// exiftool still supplies what the sidecar omits.
+func TestImportFile_SidecarWithoutFieldsKeepsExifData(t *testing.T) {
+	p, inbox, _ := newPipeline(t, fakeExiftoolScript(testModel, testDate, testLat, testLon))
+
+	clip := filepath.Join(inbox, "C0002.MP4")
+	if err := os.WriteFile(clip, []byte("fake clip"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inbox, "C0002M01.XML"),
+		[]byte(`<NonRealTimeMeta><Duration value="1"/></NonRealTimeMeta>`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := hasher.HashFile(clip)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if r, err := p.ImportFile(clip, "b1"); err != nil || r != ResultImported {
+		t.Fatalf("import: result=%q err=%v", r, err)
+	}
+
+	row := p.DB.QueryRow(`SELECT capture_date, camera_model FROM photos WHERE hash = ?`, hash)
+	var captureDate, cameraModel string
+	if err := row.Scan(&captureDate, &cameraModel); err != nil {
+		t.Fatalf("scan row: %v", err)
+	}
+	if captureDate != testDate || cameraModel != testModel {
+		t.Errorf("got capture_date=%q camera_model=%q, want exiftool's %q/%q",
+			captureDate, cameraModel, testDate, testModel)
+	}
+}
+
+// A corrupt sidecar is a warning, not an import failure.
+func TestImportFile_MalformedSidecarStillImports(t *testing.T) {
+	p, inbox, logPath := newPipeline(t, fakeExiftoolScript(testModel, testDate, testLat, testLon))
+
+	clip := filepath.Join(inbox, "C0003.MP4")
+	if err := os.WriteFile(clip, []byte("fake clip"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inbox, "C0003M01.XML"),
+		[]byte("<NonRealTimeMeta><unclosed>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if r, err := p.ImportFile(clip, "b1"); err != nil || r != ResultImported {
+		t.Fatalf("import: result=%q err=%v", r, err)
+	}
+
+	var warned bool
+	for _, line := range readLines(t, logPath) {
+		if strings.Contains(line, "ignoring sidecar") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Error("no WARN logged for the malformed sidecar")
+	}
+}
+
+// A parked duplicate takes its sidecar with it; leaving the .xml in the inbox
+// root would orphan it there permanently.
+func TestImportFile_DuplicateClipParksSidecarToo(t *testing.T) {
+	p, inbox, _ := newPipeline(t, fakeExiftoolNoGPS(testModel, testDate))
+
+	clip, _ := writeClipWithSidecar(t, inbox, "C0001", "2026-07-26T17:35:25-07:00", "ILCE-7CM2")
+	if r, err := p.ImportFile(clip, "b1"); err != nil || r != ResultImported {
+		t.Fatalf("first import: result=%q err=%v", r, err)
+	}
+
+	// Same bytes back in the inbox, with its sidecar.
+	clip2, sidecar2 := writeClipWithSidecar(t, inbox, "C0001", "2026-07-26T17:35:25-07:00", "ILCE-7CM2")
+	if err := os.WriteFile(clip2, []byte("fake clip: C0001"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if r, err := p.ImportFile(clip2, "b2"); err != nil || r != ResultSkipped {
+		t.Fatalf("second import: result=%q err=%v", r, err)
+	}
+
+	parkedClip := filepath.Join(inbox, config.DuplicatesDirName, "C0001.MP4")
+	parkedSidecar := filepath.Join(inbox, config.DuplicatesDirName, "C0001.xml")
+	if _, err := os.Stat(parkedClip); err != nil {
+		t.Errorf("duplicate clip not parked: %v", err)
+	}
+	if _, err := os.Stat(parkedSidecar); err != nil {
+		t.Errorf("duplicate sidecar not parked at %s: %v", parkedSidecar, err)
+	}
+	if _, err := os.Stat(sidecar2); !os.IsNotExist(err) {
+		t.Error("sidecar left in inbox root after the clip was parked")
+	}
+}
+
+// RunIngest walks the inbox for clips the same as for stills, and never treats
+// the .xml sidecar as an importable file of its own.
+func TestRunIngest_ImportsClipsAndIgnoresSidecarAsPhoto(t *testing.T) {
+	p, inbox, _ := newPipeline(t, fakeExiftoolNoGPS(testModel, testDate))
+
+	writeClipWithSidecar(t, inbox, "C0001", "2026-07-26T17:35:25-07:00", "ILCE-7CM2")
+	writePhoto(t, inbox, "DSC00001.arw")
+
+	counts, err := p.RunIngest()
+	if err != nil {
+		t.Fatalf("RunIngest: %v", err)
+	}
+	if counts.Imported != 2 || counts.Failed != 0 {
+		t.Errorf("counts = %+v, want 2 imported / 0 failed (clip + raw, sidecar not counted)", counts)
+	}
+
+	n, err := db.PhotoCount(p.DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("photo_count = %d, want 2 — the sidecar must not become a row", n)
 	}
 }

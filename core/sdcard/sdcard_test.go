@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/thevedantmodi/framelog/core/config"
 	"github.com/thevedantmodi/framelog/core/ingest"
 	"github.com/thevedantmodi/framelog/core/logging"
 )
@@ -497,5 +499,217 @@ func TestWatcher_PausedRetriesOnResume(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Error("Run() did not return after stop channel closed")
+	}
+}
+
+// ---- Sony XAVC clip directory ----------------------------------------------
+
+func TestHasClips(t *testing.T) {
+	withClips := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(withClips, config.ClipDirRelPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !HasClips(withClips) {
+		t.Errorf("HasClips = false for a volume with %s", config.ClipDirRelPath)
+	}
+
+	// PRIVATE without the M4ROOT/CLIP tail is not a clip card.
+	partial := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(partial, "PRIVATE"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if HasClips(partial) {
+		t.Error("HasClips = true for a volume with only PRIVATE/")
+	}
+
+	if HasClips(t.TempDir()) {
+		t.Error("HasClips = true for an empty volume")
+	}
+}
+
+func TestIsCameraCard(t *testing.T) {
+	dcimOnly := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dcimOnly, "DCIM"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	clipsOnly := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(clipsOnly, config.ClipDirRelPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	both := t.TempDir()
+	if err := os.Mkdir(filepath.Join(both, "DCIM"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(both, config.ClipDirRelPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, d := range []string{dcimOnly, clipsOnly, both} {
+		if !IsCameraCard(d) {
+			t.Errorf("IsCameraCard = false for %s", d)
+		}
+	}
+	if IsCameraCard(t.TempDir()) {
+		t.Error("IsCameraCard = true for a volume with neither DCIM nor CLIP")
+	}
+}
+
+// A card used only for video has no DCIM at all — the pre-clip detection would
+// have walked straight past it.
+func TestFindSDCard_VideoOnlyCard(t *testing.T) {
+	volumes := t.TempDir()
+	binDir := t.TempDir()
+
+	sdCard := filepath.Join(volumes, "SDCard")
+	if err := os.MkdirAll(filepath.Join(sdCard, config.ClipDirRelPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fake := writeFakeBin(t, binDir, "diskutil",
+		`echo "   Removable Media:           Removable"`)
+
+	got, err := FindSDCard(fake, volumes)
+	if err != nil {
+		t.Fatalf("FindSDCard: %v", err)
+	}
+	if got != sdCard {
+		t.Errorf("FindSDCard = %q, want %q", got, sdCard)
+	}
+}
+
+// The fake rclone ignores --include, so the filter itself is asserted on the
+// argv the real rclone would receive.
+func TestCopyClips_IncludesSidecarExtension(t *testing.T) {
+	binDir := t.TempDir()
+	argsFile := filepath.Join(binDir, "args.txt")
+	rclone := writeFakeBin(t, binDir, "rclone",
+		fmt.Sprintf(`echo "$@" > %q`, argsFile))
+
+	if _, err := CopyClips(rclone, t.TempDir(), t.TempDir()); err != nil {
+		t.Fatalf("CopyClips: %v", err)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(args)
+
+	for _, want := range []string{"--include *" + config.NRTMetaExtension, "--include *.mp4", "--ignore-existing", "--ignore-case"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("CopyClips args %q missing %q", got, want)
+		}
+	}
+
+	// CopyDCIM must not pull XML off the card: a still card's DCIM has no
+	// NonRealTimeMeta, and widening it would sweep up unrelated XML.
+	if _, err := CopyDCIM(rclone, t.TempDir(), t.TempDir()); err != nil {
+		t.Fatalf("CopyDCIM: %v", err)
+	}
+	args, err = os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(args), config.NRTMetaExtension) {
+		t.Errorf("CopyDCIM args %q must not include %s", args, config.NRTMetaExtension)
+	}
+}
+
+func TestCopyClips_CopiesClipAndSidecar(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	rclone := writeFakeRclone(t, t.TempDir())
+
+	for _, f := range []string{"C0001.MP4", "C0001M01.XML"} {
+		if err := os.WriteFile(filepath.Join(src, f), []byte(f), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n, err := CopyClips(rclone, src, dst)
+	if err != nil {
+		t.Fatalf("CopyClips: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("copied count = %d, want 2 (clip + sidecar)", n)
+	}
+	// Flat copy: the sidecar must land next to its clip, which is what
+	// nrtmeta.FindSidecar relies on during ingest.
+	for _, f := range []string{"C0001.MP4", "C0001M01.XML"} {
+		if _, err := os.Stat(filepath.Join(dst, f)); err != nil {
+			t.Errorf("missing %s in dest: %v", f, err)
+		}
+	}
+}
+
+// A card holding both stills and clips must copy both trees and fire ingest
+// exactly once.
+func TestWatcher_CopiesDCIMAndClips(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping watcher integration test: requires poll settle delays")
+	}
+
+	volumes := t.TempDir()
+	inbox := t.TempDir()
+	binDir := t.TempDir()
+
+	diskutil := writeFakeBin(t, binDir, "diskutil",
+		`echo "   Removable Media:           Removable"`)
+	rclone := writeFakeRclone(t, binDir)
+
+	notifyCh := make(chan struct{}, 1)
+	runner := &fakeRunner{notifyCh: notifyCh}
+
+	stop := make(chan struct{})
+	w := &Watcher{
+		DiskutilPath: diskutil,
+		RclonePath:   rclone,
+		VolumesRoot:  volumes,
+		InboxPath:    inbox,
+		PollInterval: 100 * time.Millisecond,
+		Runner:       runner,
+		Logger:       openTestLogger(t),
+	}
+	runErr := make(chan error, 1)
+	go func() { runErr <- w.Run(stop) }()
+	defer func() {
+		close(stop)
+		<-runErr
+	}()
+
+	sdPath := filepath.Join(volumes, "SDCARD")
+	clipDir := filepath.Join(sdPath, config.ClipDirRelPath)
+	if err := os.MkdirAll(filepath.Join(sdPath, "DCIM", "100MSDCF"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(clipDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sdPath, "DCIM", "100MSDCF", "DSC00001.ARW"),
+		[]byte("raw"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"C0001.MP4", "C0001M01.XML"} {
+		if err := os.WriteFile(filepath.Join(clipDir, f), []byte(f), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	select {
+	case <-notifyCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout: RunIngest was not called within 3s of SD card creation")
+	}
+
+	for _, rel := range []string{
+		filepath.Join("100MSDCF", "DSC00001.ARW"),
+		"C0001.MP4",
+		"C0001M01.XML",
+	} {
+		if _, err := os.Stat(filepath.Join(inbox, rel)); err != nil {
+			t.Errorf("missing %s in inbox: %v", rel, err)
+		}
+	}
+
+	if got := runner.callCount(); got != 1 {
+		t.Errorf("runner called %d times, want 1", got)
 	}
 }

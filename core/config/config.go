@@ -60,6 +60,23 @@ const DuplicatesDirName = "duplicates"
 // DuplicatesDirName, the ingest walk skips it.
 const FailedDirName = "failed"
 
+// DCIMDirName is the standard camera image directory on a card. Stills (and,
+// on most cameras, video) live under it in numbered subfolders.
+const DCIMDirName = "DCIM"
+
+// ClipDirRelPath is where Sony XAVC-S/XAVC-HS cameras write their video
+// clips — outside DCIM entirely. Each C####.MP4 there is accompanied by a
+// C####M01.XML NonRealTimeMeta sidecar carrying the real capture timestamp,
+// camera body, and lens; see core/nrtmeta.
+var ClipDirRelPath = filepath.Join("PRIVATE", "M4ROOT", "CLIP")
+
+// NRTMetaExtension is the extension of the Sony NonRealTimeMeta sidecar.
+// Deliberately NOT in SupportedExtensions: the sidecar is metadata for a
+// clip, never an importable file in its own right. Ingest reads it, copies
+// it next to the imported clip (where .gitignore keeps it untracked), and
+// deletes the inbox copy along with the clip.
+const NRTMetaExtension = ".xml"
+
 // SupportedExtensions mirrors config.py's SUPPORTED_EXTENSIONS. Decide here,
 // in one place, which RAW/video formats this install cares about.
 var SupportedExtensions = map[string]bool{

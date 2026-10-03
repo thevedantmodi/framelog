@@ -32,6 +32,7 @@ import (
 	"github.com/thevedantmodi/framelog/core/gitops"
 	"github.com/thevedantmodi/framelog/core/hasher"
 	"github.com/thevedantmodi/framelog/core/logging"
+	"github.com/thevedantmodi/framelog/core/nrtmeta"
 	"github.com/thevedantmodi/framelog/core/xmp"
 )
 
@@ -200,6 +201,29 @@ func (p *Pipeline) ImportFile(srcPath, batchID string) (Result, error) {
 		return p.fail(srcPath, fmt.Errorf("exif: %w", err))
 	}
 
+	// 3b. Sony NonRealTimeMeta sidecar, when the clip came off a card's
+	// PRIVATE/M4ROOT/CLIP directory. It wins over exiftool for both fields it
+	// provides: the MP4's QuickTime CreateDate is UTC with no offset (so it
+	// files an evening shoot under the wrong day), and the container names no
+	// camera body at all. A missing or malformed sidecar is not a failure —
+	// the clip still imports on whatever exiftool returned.
+	sidecarPath := nrtmeta.FindSidecar(srcPath)
+	if sidecarPath != "" {
+		nrt, nrtErr := nrtmeta.Parse(sidecarPath)
+		if nrtErr != nil {
+			p.Logger.Log(logging.PrefixIngest,
+				fmt.Sprintf("WARN ignoring sidecar %s: %v", filepath.Base(sidecarPath), nrtErr))
+		} else {
+			if !nrt.CreationDate.IsZero() {
+				meta.CaptureDate = nrt.CreationDate.Format(captureLayout)
+			}
+			if nrt.CameraModel != "" {
+				model := nrt.CameraModel
+				meta.CameraModel = &model
+			}
+		}
+	}
+
 	// 4. Parse CaptureDate to get calendar components for the dest path.
 	captureTime, err := time.ParseInLocation(captureLayout, meta.CaptureDate, time.Local)
 	if err != nil {
@@ -229,6 +253,19 @@ func (p *Pipeline) ImportFile(srcPath, batchID string) (Result, error) {
 	}
 	if err := copyFile(srcPath, dest); err != nil {
 		return p.fail(srcPath, fmt.Errorf("copy to %s: %w", dest, err))
+	}
+
+	// 7b. Carry the NonRealTimeMeta sidecar over next to the imported clip.
+	// originals/.gitignore tracks only *.xmp, so this stays untracked — it is
+	// kept for what exiftool and the XMP cannot express (lens, LUT reference,
+	// gyro/gamma acquisition records) if the clip is ever re-examined.
+	// Best-effort: a failed sidecar copy must not fail an otherwise good import.
+	if sidecarPath != "" {
+		destSidecar := strings.TrimSuffix(dest, filepath.Ext(dest)) + config.NRTMetaExtension
+		if err := copyFile(sidecarPath, destSidecar); err != nil {
+			p.Logger.Log(logging.PrefixIngest,
+				fmt.Sprintf("WARN could not copy sidecar %s: %v", filepath.Base(sidecarPath), err))
+		}
 	}
 
 	// 8. XMP sidecar next to the dest file — skipped for formats that embed XMP
@@ -268,11 +305,19 @@ func (p *Pipeline) ImportFile(srcPath, batchID string) (Result, error) {
 		return p.fail(srcPath, fmt.Errorf("db insert: %w", err))
 	}
 
-	// 10. Source removal — only reached when every prior step succeeded.
+	// 10. Source removal — only reached when every prior step succeeded. The
+	// NonRealTimeMeta sidecar goes with the clip: nothing else in the pipeline
+	// picks up .xml files, so one left behind would sit in inbox/ forever.
 	if err := os.Remove(srcPath); err != nil {
 		// Non-fatal: import is complete; log the cleanup failure and move on.
 		p.Logger.Log(logging.PrefixIngest,
 			fmt.Sprintf("WARN could not remove source %s: %v", filepath.Base(srcPath), err))
+	}
+	if sidecarPath != "" {
+		if err := os.Remove(sidecarPath); err != nil && !os.IsNotExist(err) {
+			p.Logger.Log(logging.PrefixIngest,
+				fmt.Sprintf("WARN could not remove sidecar %s: %v", filepath.Base(sidecarPath), err))
+		}
 	}
 
 	return ResultImported, nil
@@ -310,6 +355,18 @@ func (p *Pipeline) parkFile(srcPath, dirName string) bool {
 		p.Logger.Log(logging.PrefixIngest,
 			fmt.Sprintf("WARN could not move %s to %s: %v", base, parkDir, err))
 		return false
+	}
+
+	// A parked clip takes its NonRealTimeMeta sidecar with it, renamed to match
+	// the (possibly de-collided) destination stem so the pair stays associated.
+	// Left in inbox/ the sidecar would be orphaned: no walk ever collects .xml.
+	if sidecar := nrtmeta.FindSidecar(srcPath); sidecar != "" {
+		destSidecar := strings.TrimSuffix(dest, filepath.Ext(dest)) + config.NRTMetaExtension
+		if err := os.Rename(sidecar, destSidecar); err != nil {
+			p.Logger.Log(logging.PrefixIngest,
+				fmt.Sprintf("WARN could not move sidecar %s to %s: %v",
+					filepath.Base(sidecar), parkDir, err))
+		}
 	}
 	return true
 }
