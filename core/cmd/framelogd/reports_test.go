@@ -1,10 +1,12 @@
 package main
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 
 	"github.com/thevedantmodi/framelog/core/activity"
+	"github.com/thevedantmodi/framelog/core/config"
 	"github.com/thevedantmodi/framelog/core/db"
 	"github.com/thevedantmodi/framelog/core/ingest"
 	"github.com/thevedantmodi/framelog/core/logging"
@@ -56,7 +58,7 @@ func TestReportProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := struct {
-		pending bool
+		pending                         bool
 		outcome, errText, last, success string
 	}{true, "failed", "Backup drive is full", "2026-11-02T00:00:00Z", "2026-11-01T00:00:00Z"}
 	if sum.Pending != want.pending || sum.LastOutcome != want.outcome || sum.LastError != want.errText ||
@@ -77,5 +79,61 @@ func TestReportProvider(t *testing.T) {
 	tr.Start(activity.PhaseCopying, "Untitled", 3)
 	if a := rp.Activity(); a.Phase != activity.PhaseCopying || a.Volume != "Untitled" {
 		t.Errorf("Activity() = %+v", a)
+	}
+}
+
+// Saving one setting must never reset another: before UpdateUserConfig,
+// set_backup_path wrote a fresh UserConfig and would have dropped the
+// import types.
+func TestConfigSetter_SettingsDoNotClobberEachOther(t *testing.T) {
+	orig := config.UserConfigPath
+	config.UserConfigPath = filepath.Join(t.TempDir(), "framelog_config.json")
+	t.Cleanup(func() {
+		config.UserConfigPath = orig
+		config.SetImportExtensions(nil)
+	})
+
+	dir := t.TempDir()
+	conn, err := db.Open(filepath.Join(dir, "c.db"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	cs := &configSetter{pipeline: &ingest.Pipeline{DB: conn}}
+
+	if err := cs.SetImportTypes([]string{"ARW", "mp4"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.SetBackupPath("/Volumes/Backup"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := config.ReadUserConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BackupPath != "/Volumes/Backup" || len(got.ImportTypes) != 2 || got.ImportTypes[0] != ".arw" {
+		t.Errorf("persisted = %+v", got)
+	}
+	if config.IsImportable(".jpg") || !config.IsImportable(".mp4") {
+		t.Error("import set not applied")
+	}
+
+	// Invalid types are rejected before anything is persisted.
+	if err := cs.SetImportTypes([]string{".xmp"}); !errors.Is(err, config.ErrInvalidFileType) {
+		t.Errorf("err = %v", err)
+	}
+	if got, _ := config.ReadUserConfig(); len(got.ImportTypes) != 2 {
+		t.Errorf("rejected change was persisted: %+v", got)
+	}
+
+	// nil resets to defaults and is stored as "never chosen".
+	if err := cs.SetImportTypes(nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := config.ReadUserConfig(); got.ImportTypes != nil || got.BackupPath != "/Volumes/Backup" {
+		t.Errorf("after reset = %+v", got)
+	}
+	if !config.IsImportable(".jpg") {
+		t.Error("defaults not restored")
 	}
 }

@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -184,7 +183,7 @@ func (p *Pipeline) fail(path string, err error) (Result, error) {
 
 // RunOutgest reads the top level of ProcessedPath (non-recursive — files
 // already organized into YYYY/MM subdirs must not be re-scanned), filters to
-// config.OutgestExtensions (a superset of SupportedExtensions — see the note
+// config.IsOutgestExtension (a superset of the import types — see the note
 // there on why the export list is wider than the import list), and calls
 // OrganizeFile on each. Returns ErrOutgestAlreadyRunning immediately if
 // another call is in progress.
@@ -209,7 +208,7 @@ func (p *Pipeline) RunOutgest() (Counts, error) {
 		if e.IsDir() {
 			continue // YYYY/MM subdirs — already organized, skip.
 		}
-		if config.OutgestExtensions[strings.ToLower(filepath.Ext(e.Name()))] {
+		if config.IsOutgestExtension(filepath.Ext(e.Name())) {
 			files = append(files, filepath.Join(p.ProcessedPath, e.Name()))
 		}
 	}

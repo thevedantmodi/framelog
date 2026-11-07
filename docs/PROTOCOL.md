@@ -22,8 +22,11 @@ CREATE TABLE IF NOT EXISTS photos (
     import_timestamp  TEXT,     -- ISO 8601, UTC
     gps_lat           REAL,
     gps_lon           REAL,
-    status            TEXT DEFAULT 'raw'  -- raw | edited | published
+    status            TEXT DEFAULT 'raw',  -- raw | edited | published
+    quick_hash        TEXT     -- SHA-256 of size + first/last 64 KiB; see §11.
+                               -- NULL = not computed yet, '' = file unreadable
 );
+CREATE INDEX IF NOT EXISTS idx_photos_quick_hash ON photos(quick_hash);
 
 -- One row per end-to-end SD card verification (see §10).
 CREATE TABLE IF NOT EXISTS card_reports (
@@ -35,7 +38,8 @@ CREATE TABLE IF NOT EXISTS card_reports (
     files_total      INTEGER,  -- importable media files on the card
     bytes_total      INTEGER,
     files_verified   INTEGER,
-    files_problem    INTEGER,  -- every listed file that is not "verified"
+    files_problem    INTEGER,  -- listed files that are neither "verified" nor "ignored"
+    files_ignored    INTEGER,  -- known types switched off in File Types (§12)
     files_new        INTEGER,  -- verified, imported during this card session
     files_existing   INTEGER,  -- verified, already in the library beforehand
     file_types       TEXT,     -- "ARW 312 · JPG 312 · MP4 4"
@@ -129,7 +133,16 @@ never leaves the frontend holding a dead connection.
 {"command": "resume"}
 {"command": "verify_card"}
 {"command": "backup_now"}
+{"command": "set_import_types", "types": [".arw", ".hif", ".mp4"]}
+{"command": "set_import_types", "types": null}
 ```
+
+`set_import_types` replaces the set of file types imported from cards (§12) and
+persists it in `framelog_config.json` (`"import_types"`). `null` or a missing `types`
+restores the defaults (stored as "never chosen"); `[]` is rejected. Extensions are
+case-insensitive, with or without the dot. Reply: `{"ok": true, "file_types": […]}` (same
+shape as in `status`), or `invalid_file_type` for an empty list, a malformed extension, or
+a never-importable type (`.xml`, `.xmp`, `.png`). Applies immediately, no restart.
 
 `verify_card` re-runs the §10 end-to-end check on the currently mounted
 camera card — no copy, no import — and replies when it finishes (as long as
@@ -205,6 +218,7 @@ Pause state is in-memory only — it resets to unpaused on every daemon restart
 {"protocol_version": 1, "ok": false, "error": "card_busy"}
 {"protocol_version": 1, "ok": false, "error": "verify_unavailable"}
 {"protocol_version": 1, "ok": false, "error": "backup_not_configured"}
+{"protocol_version": 1, "ok": false, "error": "invalid_file_type"}
 {"protocol_version": 1, "ok": false, "error": "unknown_command"}
 {"protocol_version": 1, "ok": false, "error": "bad_request"}
 {"protocol_version": 1, "ok": false, "error": "internal_error"}
@@ -225,7 +239,13 @@ unplugged" — both report `backup_drive_mounted: false` but call for different 
 
 **Report fields in `status`** (all additive; a client must tolerate their absence,
 which is what an older daemon sends):
-- `activity` — live progress. `phase` is one of `idle` · `copying` (card → inbox) ·
+- `file_types` — always present: every known camera type in display order, then custom
+  types. Each `{"ext": ".arw", "label": "Sony RAW", "enabled": true, "custom": false}`.
+- `card_preview` — present while a card that has been scanned is still mounted (§11):
+  `{"volume_name", "checked_at", "files_total", "bytes_total", "files_new", "bytes_new",
+  "files_in_library", "files_ignored", "files_unhandled", "new_file_types"}`. The frontend
+  shows it until a `last_card` with a later `finished_at` arrives.
+- `activity` — live progress. `phase` is one of `idle` · `scanning` (quick preview) · `copying` (card → inbox) ·
   `importing` (inbox → originals) · `backing_up` · `verifying`. `total: 0` means
   unknown (backup doesn't know its total up front). `volume` is set for card phases.
 - `backup` — the most recent `backup_runs` row plus `pending` (see "Automatic backup
@@ -377,16 +397,16 @@ Frontend tails this file for the log viewer. No bare `print()` anywhere in the c
 - **`outgestwatcher` watches only the top-level `processed/` directory**, never
   subdirectories. `YYYY/MM/` folders created by a prior outgest run must not trigger a
   re-scan of already-organised files.
-- **Outgest filters on `config.OutgestExtensions`, not `config.SupportedExtensions`.**
+- **Outgest filters on `config.IsOutgestExtension`, not `config.IsImportable`.**
   The import list and the export list are deliberately different: ingest decides what
   enters `originals/` and gets git-tracked, outgest decides what counts as a finished
   export. A PNG export must be filed into `processed/YYYY/MM/` but must never be
   ingested. The export-only list stays narrow because outgest sets
   `status="published"`: Photoshop working files and archival intermediates share the
   export's hash8 prefix and would republish the same catalog row.
-  `OutgestExtensions` is built from `SupportedExtensions` at init, so the import formats
-  can never drift out of the export set; export-only additions go in
-  `outgestOnlyExtensions`.
+  The export set is every known camera type, every type currently imported, and the
+  export-only types (`outgestOnlyExtensions`), so it can never miss an import format and
+  switching JPEG import off never stops JPEG exports being filed.
 - **XMP watcher skips `.git/`** during initial walk. Watching git internals would leak
   fsnotify watches on every commit the watcher itself makes.
 - **Socket path is capped at 104 bytes** (macOS `sockaddr_un` limit). Tests use
@@ -403,9 +423,11 @@ same check on demand. Implemented in `core/cardverify`.
 inventoried (hidden `._*` / `.DS_Store` / `.Trashes` are Mac-created and skipped; other
 card directories — Sony thumbnails, proxies, databases — are regenerated by the camera
 and not inventoried). Each file is classified:
-- **media** — extension in `config.SupportedExtensions`; must be verified.
+- **media** — extension currently imported (`config.IsImportable`); must be verified.
 - **sidecar** — `.xml` inside the clip directory (Sony NonRealTimeMeta); copied with its
   clip, counted, not separately verified.
+- **ignored** — a known camera type (§12) the user switched off. Listed with state
+  `ignored` and noted on the report; does not block (the user chose to drop it).
 - **unhandled** — anything else in a media directory. Formatting would destroy it, so
   it blocks the verdict.
 
@@ -417,7 +439,7 @@ matter which import put it there (this session, an earlier insert, another card)
 
 **File states** (`card_report_files.state`): `verified` · `not_in_library` ·
 `library_missing` · `library_mismatch` · `backup_missing` · `backup_mismatch` ·
-`card_unreadable` · `unhandled`.
+`card_unreadable` · `unhandled` · `ignored`.
 
 **Backup states** (`card_reports.backup_state`): `verified` · `not_configured` (library
 is the only copy — reported as a note, does not block) · `drive_missing` (blocks: the
@@ -435,4 +457,45 @@ every file with its state, problem files first.
 
 **Identity.** Card volume names are not unique (every Sony card is "Untitled"), so
 reports carry diskutil's Volume UUID, which also changes when the card is reformatted.
+
+## 11. Instant card preview
+
+Before copying anything, the SD card watcher fingerprints each media file on the card
+with a **quick hash** — SHA-256 over the file size, its first 64 KiB, and its last 64 KiB
+(`hasher.QuickHash`; the whole file if under 128 KiB) — and looks it up in
+`photos.quick_hash`. At most 128 KiB is read per file, so a full card is previewed in
+seconds. The result ("312 new · 1,040 already imported") is logged, exposed as
+`card_preview` in `status`, and decides what is copied:
+
+- Only the files the preview calls new are copied, via
+  `rclone copy <DCIM|CLIP> inbox/ --files-from-raw <list> --ignore-existing`, plus the
+  `C####M01.XML` sidecar of every new clip. Re-inserting an imported card copies nothing.
+- A quick hash is a hint, never proof. §10 verification still uses full SHA-256 and alone
+  decides `safe_to_format`. If verification finds a file `not_in_library` that the preview
+  had skipped (a wrong quick match), the run copies those files, imports, and verifies
+  again — once — before saving the report.
+- Ingest stores the quick hash of every file it imports. Rows imported earlier are filled in
+  by a background backfill at daemon start (`cardverify.BackfillQuickHashes`); until then
+  those photos look new to the preview and are copied again, then parked by ingest as
+  duplicates — slower, never unsafe.
+- Without a catalog (verification disabled) or if the preview fails, the watcher falls back
+  to copying every importable file.
+
+## 12. File types
+
+`config.KnownMediaTypes` lists every camera format Framelog recognises (Sony ARW and HIF,
+Canon CR3/CR2, Nikon NEF, Fujifilm RAF, OM System ORF, Panasonic RW2, DNG, HEIC, JPEG,
+MP4, MOV, WAV). **All are imported by default.** The user can switch any off and add
+custom extensions (`set_import_types`, persisted as `import_types` in
+`framelog_config.json`). On a card:
+
+| Type | Copied & imported | On the report | Blocks "safe to format"? |
+|---|---|---|---|
+| switched on (known or custom) | yes | verified / problem | if not verified |
+| known, switched off | no | `ignored`, plus a note | no |
+| anything else in `DCIM/` or the clip folder | no | `unhandled` | yes |
+
+Every known type defaults to on so nothing becomes `ignored` without the user choosing it.
+`.xml`, `.xmp` and `.png` can never be imported. Turning a type off does not affect
+outgest: exports of every known type are still filed.
 

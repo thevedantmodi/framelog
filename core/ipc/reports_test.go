@@ -7,11 +7,14 @@ import (
 	"time"
 
 	"github.com/thevedantmodi/framelog/core/activity"
+	"github.com/thevedantmodi/framelog/core/cardverify"
+	"github.com/thevedantmodi/framelog/core/config"
 	"github.com/thevedantmodi/framelog/core/db"
 	"github.com/thevedantmodi/framelog/core/ingest"
 )
 
 type fakeReports struct {
+	preview   *cardverify.Preview
 	act       activity.Snapshot
 	backup    BackupSummary
 	backupErr error
@@ -22,6 +25,7 @@ type fakeReports struct {
 func (f *fakeReports) Activity() activity.Snapshot       { return f.act }
 func (f *fakeReports) Backup() (BackupSummary, error)    { return f.backup, f.backupErr }
 func (f *fakeReports) LastCard() (*db.CardReport, error) { return f.card, f.cardErr }
+func (f *fakeReports) CardPreview() *cardverify.Preview  { return f.preview }
 
 type fakeCard struct {
 	rep db.CardReport
@@ -172,5 +176,81 @@ func TestBackupNow(t *testing.T) {
 		if m := dial(t, s.SocketPath, "backup_now"); m["ok"] != false || m["error"] != code {
 			t.Errorf("%v → %v", err, m)
 		}
+	}
+}
+
+func TestStatus_CardPreview(t *testing.T) {
+	fr := &fakeReports{preview: &cardverify.Preview{
+		VolumeName: "Untitled", CheckedAt: time.Date(2026, 11, 7, 18, 0, 0, 0, time.UTC),
+		Files: 5, Bytes: 500, InLibrary: 3, NewBytes: 200, Ignored: 1,
+		New: []cardverify.CardFile{{RelPath: "DCIM/100MSDCF/A.ARW", Size: 100},
+			{RelPath: "DCIM/100MSDCF/A.JPG", Size: 100}},
+	}}
+	s := startReportServer(t, fr, nil, nil)
+	m := dial(t, s.SocketPath, "status")
+	p, ok := m["card_preview"].(map[string]any)
+	if !ok {
+		t.Fatalf("card_preview missing: %v", m)
+	}
+	if p["files_new"] != float64(2) || p["files_in_library"] != float64(3) ||
+		p["files_ignored"] != float64(1) || p["new_file_types"] != "ARW 1 · JPG 1" ||
+		p["checked_at"] != "2026-11-07T18:00:00Z" {
+		t.Errorf("card_preview = %v", p)
+	}
+
+	fr.preview = nil
+	if _, ok := dial(t, s.SocketPath, "status")["card_preview"]; ok {
+		t.Error("card_preview present with no card")
+	}
+}
+
+func TestStatus_FileTypes(t *testing.T) {
+	s := startReportServer(t, nil, nil, nil)
+	m := dial(t, s.SocketPath, "status")
+	rows, ok := m["file_types"].([]any)
+	if !ok || len(rows) != len(config.KnownMediaTypes) {
+		t.Fatalf("file_types = %v", m["file_types"])
+	}
+	first := rows[0].(map[string]any)
+	if first["ext"] != ".arw" || first["enabled"] != true || first["label"] != "Sony RAW" {
+		t.Errorf("first row = %v", first)
+	}
+}
+
+func TestSetImportTypes(t *testing.T) {
+	t.Cleanup(func() { config.SetImportExtensions(nil) })
+	fc := &fakeConfig{}
+	srv := startServer(t, &fakeIngest{}, &fakeOutgest{}, &fakeStatus{}, fc)
+
+	m := dialJSON(t, srv.SocketPath, `{"command":"set_import_types","types":["ARW","mp4","insv"]}`)
+	if m["ok"] != true {
+		t.Fatalf("set = %v", m)
+	}
+	rows := m["file_types"].([]any)
+	enabled := map[string]bool{}
+	for _, r := range rows {
+		row := r.(map[string]any)
+		if row["enabled"] == true {
+			enabled[row["ext"].(string)] = true
+		}
+	}
+	if len(enabled) != 3 || !enabled[".arw"] || !enabled[".mp4"] || !enabled[".insv"] {
+		t.Errorf("enabled = %v", enabled)
+	}
+
+	for _, bad := range []string{`[]`, `[".xmp"]`, `["../x"]`} {
+		m := dialJSON(t, srv.SocketPath, `{"command":"set_import_types","types":`+bad+`}`)
+		if m["error"] != "invalid_file_type" {
+			t.Errorf("types %s → %v", bad, m)
+		}
+	}
+	if !config.IsImportable(".insv") {
+		t.Error("rejected request changed the import set")
+	}
+
+	// null / missing types resets to defaults.
+	m = dialJSON(t, srv.SocketPath, `{"command":"set_import_types","types":null}`)
+	if m["ok"] != true || !config.IsImportable(".jpg") || config.IsImportable(".insv") {
+		t.Errorf("reset = %v", m)
 	}
 }

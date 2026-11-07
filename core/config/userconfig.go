@@ -11,6 +11,10 @@ import (
 // set_backup_path IPC command; read at daemon startup to override env-var defaults.
 type UserConfig struct {
 	BackupPath string `json:"backup_path"`
+	// ImportTypes is the user's chosen import set (set_import_types). nil
+	// means "never chosen" — use DefaultImportExtensions, so new known
+	// types added in later versions are picked up automatically.
+	ImportTypes []string `json:"import_types,omitempty"`
 }
 
 // ReadUserConfig loads UserConfig from UserConfigPath. Returns a zero-value
@@ -28,6 +32,19 @@ func ReadUserConfig() (UserConfig, error) {
 		return UserConfig{}, err
 	}
 	return cfg, nil
+}
+
+// UpdateUserConfig reads the persisted config, applies change, and writes it
+// back. Every setter goes through this so changing one setting can never
+// reset another (writing a fresh UserConfig{BackupPath: p} would drop the
+// import types).
+func UpdateUserConfig(change func(*UserConfig)) error {
+	cfg, err := ReadUserConfig()
+	if err != nil {
+		return err
+	}
+	change(&cfg)
+	return WriteUserConfig(cfg)
 }
 
 // WriteUserConfig atomically writes cfg to UserConfigPath.

@@ -20,6 +20,7 @@ type Phase string
 
 const (
 	PhaseIdle      Phase = "idle"
+	PhaseScanning  Phase = "scanning"   // quick check of what's new on the card
 	PhaseCopying   Phase = "copying"    // card → inbox/
 	PhaseImporting Phase = "importing"  // inbox/ → originals/ + catalog
 	PhaseBackingUp Phase = "backing_up" // originals/ → backup drive

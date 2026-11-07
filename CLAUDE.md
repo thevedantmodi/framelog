@@ -15,8 +15,10 @@ core/         Go module (github.com/thevedantmodi/framelog/core)
   cmd/framelogd/    main package: run/install/uninstall/--version
   activity/         live progress tracker (phase/done/total) read by status
   backup/           rclone wrapper; IsDriveMounted; DestDir
-  cardverify/       end-to-end "safe to format" check + plain-text receipts
-  config/           all paths and constants (single source of truth)
+  cardverify/       end-to-end "safe to format" check, instant card preview,
+                    quick-hash backfill, plain-text receipts
+  config/           all paths and constants (single source of truth);
+                    filetypes.go = runtime-settable import types
   db/               SQLite schema + queries
   exif/             exiftool subprocess wrapper
   gitops/           git CLI wrapper; pmset AC-power check
@@ -125,16 +127,24 @@ than `t.TempDir()` (which produces long paths under the test cache). See
 - `outgestwatcher` watches only the top-level `processed/` directory, never
   subdirectories. Deliberate: `YYYY/MM/` folders created by a prior outgest run
   must not trigger a re-scan of already-organised files.
-- `outgest` and `outgestwatcher` filter on `config.OutgestExtensions`, while
-  `ingest` and `sdcard` filter on `config.SupportedExtensions`. Deliberate: the
-  export list is a superset (currently just PNG). PNG exports must be filed
-  into `processed/YYYY/MM/` but must never be imported into `originals/` and
-  git-tracked. Kept narrow on purpose: outgest sets `status="published"`, so
-  working files (`.psb`/`.psd`) and intermediates (`.jxl`) stay out — they
-  share the export's hash8 prefix and would republish the same row.
-  `OutgestExtensions` is derived from `SupportedExtensions` in an `init`, so
-  the two can't drift; export-only entries go in `outgestOnlyExtensions`.
-  Tests in `core/config/config_test.go` pin both directions.
+- File types live in `config/filetypes.go` behind accessors, not a map: the
+  import set is user-settable at runtime (`set_import_types`), so read it with
+  `config.IsImportable` / `config.ImportExtensions()`, never cache it.
+  `outgest`/`outgestwatcher` use `config.IsOutgestExtension`, which is every
+  known type + every imported type + export-only types (just PNG). PNG
+  exports are filed but never imported; working files (`.psb`/`.psd`/`.jxl`)
+  stay out because outgest sets `status="published"` and they share the
+  export's hash8 prefix. Tests in `core/config/config_test.go` pin this.
+- Every `KnownMediaTypes` entry defaults to imported. Deliberate: a known
+  type the user switched off is "ignored" (doesn't block safe-to-format), so a
+  type that started off would be dropped without the user ever choosing.
+- The card preview uses a quick hash (size + first/last 64 KiB) and decides
+  what gets copied, but never the verdict — full SHA-256 verification does.
+  A wrong quick match is caught by verification and the skipped files are
+  copied in the same run. See PROTOCOL.md §11.
+- Settings are persisted with `config.UpdateUserConfig` (read-modify-write),
+  never `WriteUserConfig` with a fresh struct, so one setting can't reset
+  another.
 - Sony XAVC clips are read from `PRIVATE/M4ROOT/CLIP/`, not `DCIM/`, and their
   `C####M01.XML` sidecar overrides exiftool for capture date and camera model.
   Deliberate: the MP4 container stores only a UTC `CreateDate` with no offset,
@@ -159,7 +169,7 @@ than `t.TempDir()` (which produces long paths under the test cache). See
   a configured backup means the user asked for two copies, and only one is
   provable. `unhandled` file types on the card also block — formatting
   would silently destroy them.
-- `.hif` is in `SupportedExtensions`: Sony bodies (incl. the α7C II) name
+- `.hif` is a known (default-on) type: Sony bodies (incl. the α7C II) name
   HEIF stills `.HIF`, not `.HEIC`. Without it a HEIF card would never be
   imported and the verifier would flag every still as unhandled.
 - Ingest retries a pending backup (failed / drive missing / destination

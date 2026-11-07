@@ -44,13 +44,17 @@ import (
 type Kind string
 
 const (
-	// KindMedia is a file Framelog imports (config.SupportedExtensions).
+	// KindMedia is a file Framelog imports (config.IsImportable).
 	// Every media file must be verified before the card is safe to format.
 	KindMedia Kind = "media"
 	// KindSidecar is metadata that travels with a media file and is not
 	// catalogued on its own: the Sony C####M01.XML next to a clip. It is
 	// copied by the clip import, so its loss is not a reason to block.
 	KindSidecar Kind = "sidecar"
+	// KindIgnored is a known camera type the user switched off in the
+	// file-type settings. Listed on the report, never blocks: the user
+	// chose not to keep these.
+	KindIgnored Kind = "ignored"
 	// KindUnhandled is anything else in a media directory — a format
 	// Framelog doesn't import. Formatting would destroy it, so it blocks.
 	KindUnhandled Kind = "unhandled"
@@ -75,6 +79,7 @@ const (
 	StateBackupMismatch  = "backup_mismatch"  // backup copy's bytes differ
 	StateCardUnreadable  = "card_unreadable"  // read error on the card itself
 	StateUnhandled       = "unhandled"        // file type Framelog never imports
+	StateIgnored         = "ignored"          // known type switched off in File Types
 )
 
 // Backup states — card_reports.backup_state.
@@ -189,8 +194,10 @@ func Inventory(volPath string) ([]CardFile, error) {
 			ext := strings.ToLower(filepath.Ext(path))
 			kind := KindUnhandled
 			switch {
-			case config.SupportedExtensions[ext]:
+			case config.IsImportable(ext):
 				kind = KindMedia
+			case config.IsKnownMediaType(ext):
+				kind = KindIgnored
 			case r.isClip && ext == config.NRTMetaExtension:
 				kind = KindSidecar
 			}
@@ -254,6 +261,9 @@ func Verify(opts Options) (*Report, error) {
 		case KindUnhandled:
 			rep.Files = append(rep.Files, FileResult{CardFile: f, State: StateUnhandled,
 				Detail: "Framelog does not import this file type"})
+		case KindIgnored:
+			rep.Files = append(rep.Files, FileResult{CardFile: f, State: StateIgnored,
+				Detail: "switched off in File Types"})
 		}
 	}
 
@@ -453,13 +463,9 @@ func (r *Report) finalise(extra []string) {
 				break
 			}
 		}
-		verb, pronoun := "are", "them"
-		if n == 1 {
-			verb, pronoun = "is", "it"
-		}
 		r.Problems = append(r.Problems, fmt.Sprintf(
-			"%s on the card %s a type Framelog doesn't import (e.g. %s) — copy %s manually",
-			plural(n, "file", "files"), verb, example, pronoun))
+			"%s on the card %s a type Framelog doesn't import (e.g. %s) — copy %s manually, or add the type in File Types",
+			plural(n, "file", "files"), pick(n, "is", "are"), example, pick(n, "it", "them")))
 	}
 	if r.BackupState == BackupDriveMissing && mediaTotal > 0 {
 		r.Problems = append(r.Problems,
@@ -470,6 +476,12 @@ func (r *Report) finalise(extra []string) {
 	if r.BackupState == BackupNotConfigured && mediaTotal > 0 {
 		r.Notes = append(r.Notes, "No backup drive is configured — the library is the only copy of these files")
 	}
+	if n := counts[StateIgnored]; n > 0 {
+		r.Notes = append(r.Notes, fmt.Sprintf(
+			"%s not imported because %s switched off in File Types (%s). Formatting will delete %s",
+			plural(n, "file was", "files were"), pick(n, "its type is", "their types are"),
+			r.ignoredTypes(), pick(n, "it", "them")))
+	}
 	if mediaTotal == 0 && counts[StateUnhandled] == 0 {
 		r.Notes = append(r.Notes, "No photos or videos found on the card")
 	}
@@ -479,6 +491,25 @@ func (r *Report) finalise(extra []string) {
 		counts[StateUnhandled] == 0 &&
 		r.BackupState != BackupDriveMissing &&
 		r.BackupState != BackupIncomplete
+}
+
+// pick chooses the singular or plural wording for n.
+func pick(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// ignoredTypes renders the switched-off types found on the card, e.g. "JPG 312".
+func (r *Report) ignoredTypes() string {
+	types := map[string]int{}
+	for _, f := range r.Files {
+		if f.State == StateIgnored {
+			types[strings.ToUpper(strings.TrimPrefix(filepath.Ext(f.RelPath), "."))]++
+		}
+	}
+	return formatTypes(types)
 }
 
 // StateCounts tallies Files by State.
@@ -544,7 +575,8 @@ func (r *Report) Summary() db.CardReport {
 		FilesTotal:    media,
 		BytesTotal:    bytes,
 		FilesVerified: counts[StateVerified],
-		FilesProblem:  len(r.Files) - counts[StateVerified],
+		FilesProblem:  len(r.Files) - counts[StateVerified] - counts[StateIgnored],
+		FilesIgnored:  counts[StateIgnored],
 		FilesNew:      newN,
 		FilesExisting: existing,
 		FileTypes:     formatTypes(types),

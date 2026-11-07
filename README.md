@@ -38,8 +38,10 @@ will start automatically every time you log in.
 
 Once installed, Framelog runs itself:
 
-1. **Insert an SD card.** Framelog notices it within a couple of seconds,
-   copies everything from `DCIM/` into a staging folder, then imports it:
+1. **Insert an SD card.** Within seconds Framelog tells you what's on it —
+   "Untitled inserted: 312 new files to import, 1,040 already in your
+   library" — and copies only the new files into a staging folder. Then it
+   imports them:
    files are hashed (to catch duplicates), renamed, and sorted into
    `~/Photos/originals/YYYY/MM/DD/`.
     - Each file is named as `YYYYMMDD_HHMMSS_[8letterhash]`.
@@ -96,6 +98,8 @@ in it:
 | Activity line | Live progress while a card is copying, importing, backing up, or being verified (e.g. "Verifying Untitled… 120 of 412"). |
 | Card line (✓/✗) | The last card's verdict. Its submenu shows what was copied (file count, size, types, camera, new vs. already imported), where it's verified, any problems, and **Open Card Report**. |
 | Verify Card Now | Re-check the inserted card end to end without re-importing it. |
+| New-files line | While a card is in: how many files are new, how many are already imported, and anything skipped. |
+| File Types | Choose which camera file types are imported (all known types are on by default). Switch off, say, JPEG if you only keep RAW; add your own extension with **Add File Type…**. A type you switch off is skipped and noted on the card report; it doesn't stop the card being "safe to format", because you chose it. |
 | Backup line | Whether a backup drive is configured and connected, and when the last successful backup ran. A ⚠ line explains a failed or pending backup. |
 | Retry Backup | Shown when a backup failed or is pending — copies the library to the drive now. |
 | ⚠ warnings | Shown if an optional feature (SD card detection, backups, etc.) is unavailable — see [Optional features](#optional-features-and-what-happens-without-them) below. |

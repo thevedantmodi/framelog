@@ -29,6 +29,16 @@ struct ContentView: View {
 
         Divider()
 
+        // While a card is in: what's new on it, seconds after insertion.
+        if let preview = status.cardPreview {
+            Text(previewLine(preview))
+            ForEach(previewDetailLines(preview), id: \.self) { line in
+                Text(line)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+
         // Last card verification: the "can I format it?" answer up front,
         // details (what was copied, where it's verified, what's wrong) in
         // a submenu so the main menu stays short.
@@ -86,6 +96,29 @@ struct ContentView: View {
         ForEach(status.capabilityNotes, id: \.self) { note in
             Text("⚠ \(note)")
                 .foregroundStyle(.secondary)
+        }
+
+        // Which camera file types are imported. A type switched off here is
+        // skipped and doesn't block "safe to format"; an unknown type does.
+        if !status.fileTypes.isEmpty {
+            Menu("File Types") {
+                ForEach(status.fileTypes, id: \.ext) { type in
+                    Toggle(
+                        isOn: Binding(
+                            get: { type.enabled },
+                            set: { _ in status.toggleFileType(type.ext) }
+                        )
+                    ) {
+                        Text(fileTypeMenuLabel(type))
+                    }
+                }
+                Divider()
+                Button("Add File Type…") { status.addFileType() }
+                Button("Reset to Defaults") { status.resetFileTypes() }
+                if let message = status.fileTypesMessage {
+                    Text(message)
+                }
+            }
         }
 
         Divider()

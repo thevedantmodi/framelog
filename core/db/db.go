@@ -52,6 +52,9 @@ type Photo struct {
 	GPSLat           *float64 // nil → NULL; not 0.0, which is a valid coordinate
 	GPSLon           *float64
 	Status           string // defaults to "raw" if empty (see InsertPhoto)
+	// QuickHash is hasher.QuickHash of the file — size plus first and last
+	// 64 KiB — for the instant "what's new on this card" preview. "" → NULL.
+	QuickHash string
 }
 
 // Open returns a *sql.DB pointed at path. WAL mode and a 2 s busy_timeout are
@@ -131,6 +134,7 @@ CREATE TABLE IF NOT EXISTS card_reports (
     bytes_total      INTEGER,
     files_verified   INTEGER,
     files_problem    INTEGER,
+    files_ignored    INTEGER,
     files_new        INTEGER,
     files_existing   INTEGER,
     file_types       TEXT,
@@ -164,7 +168,87 @@ CREATE TABLE IF NOT EXISTS backup_runs (
     files_failed  INTEGER,
     error         TEXT
 );`
-	_, err := db.Exec(schema)
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+	// Columns added after a table first shipped. CREATE TABLE IF NOT EXISTS
+	// leaves an existing table alone, so older catalogs get them here.
+	if err := ensureColumn(db, "photos", "quick_hash", "TEXT"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "card_reports", "files_ignored", "INTEGER"); err != nil {
+		return err
+	}
+	_, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_photos_quick_hash ON photos(quick_hash)")
+	return err
+}
+
+// ensureColumn adds column to table unless it already exists. Idempotent.
+func ensureColumn(db *sql.DB, table, column, typ string) error {
+	rows, err := db.Query("SELECT name FROM pragma_table_info(?)", table)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+	_, err = db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, typ))
+	return err
+}
+
+// QuickHashExists reports whether any photo has this quick fingerprint
+// (hasher.QuickHash). Used by the card preview to tell new files from ones
+// already imported without reading whole files.
+func QuickHashExists(db *sql.DB, quickHash string) (bool, error) {
+	var n int
+	err := db.QueryRow("SELECT COUNT(1) FROM photos WHERE quick_hash = ?", quickHash).Scan(&n)
+	return n > 0, err
+}
+
+// PhotoWithoutQuickHash is a row the quick-fingerprint backfill still has to fill in.
+type PhotoWithoutQuickHash struct {
+	Hash         string
+	ImportedPath string
+}
+
+// PhotosWithoutQuickHash returns up to limit rows whose quick_hash is NULL
+// (imported before quick fingerprints existed).
+func PhotosWithoutQuickHash(db *sql.DB, limit int) ([]PhotoWithoutQuickHash, error) {
+	rows, err := db.Query(
+		"SELECT hash, imported_path FROM photos WHERE quick_hash IS NULL LIMIT ?", limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PhotoWithoutQuickHash
+	for rows.Next() {
+		var r PhotoWithoutQuickHash
+		var p sql.NullString
+		if err := rows.Scan(&r.Hash, &p); err != nil {
+			return nil, err
+		}
+		r.ImportedPath = p.String
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// SetQuickHash records the quick fingerprint for the row with this hash.
+// An empty quickHash stores "" (not NULL) — "tried, unreadable" — so the
+// backfill does not pick the row up again.
+func SetQuickHash(db *sql.DB, hash, quickHash string) error {
+	_, err := db.Exec("UPDATE photos SET quick_hash = ? WHERE hash = ?", quickHash, hash)
 	return err
 }
 
@@ -207,6 +291,7 @@ type CardReport struct {
 	BytesTotal    int64
 	FilesVerified int
 	FilesProblem  int
+	FilesIgnored  int // known types switched off in File Types; never block
 	// FilesNew counts verified files imported during this card session;
 	// FilesExisting counts ones already in the library from an earlier
 	// import (same card re-inserted, or a file shot on two cards).
@@ -246,11 +331,12 @@ func InsertCardReport(db *sql.DB, r CardReport, files []CardReportFile) (int64, 
 	res, err := tx.Exec(`
 INSERT INTO card_reports
     (volume_name, volume_uuid, started_at, finished_at, files_total, bytes_total,
-     files_verified, files_problem, files_new, files_existing, file_types, camera_models,
-     capture_first, capture_last, backup_state, safe_to_format, problems, report_path)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     files_verified, files_problem, files_ignored, files_new, files_existing, file_types,
+     camera_models, capture_first, capture_last, backup_state, safe_to_format, problems,
+     report_path)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.VolumeName, r.VolumeUUID, r.StartedAt, r.FinishedAt, r.FilesTotal, r.BytesTotal,
-		r.FilesVerified, r.FilesProblem, r.FilesNew, r.FilesExisting, r.FileTypes,
+		r.FilesVerified, r.FilesProblem, r.FilesIgnored, r.FilesNew, r.FilesExisting, r.FileTypes,
 		r.CameraModels, r.CaptureFirst, r.CaptureLast, r.BackupState, r.SafeToFormat,
 		strings.Join(r.Problems, "\n"), r.ReportPath)
 	if err != nil {
@@ -285,11 +371,12 @@ func LastCardReport(db *sql.DB) (*CardReport, error) {
 	var problems, reportPath sql.NullString
 	err := db.QueryRow(`
 SELECT id, volume_name, volume_uuid, started_at, finished_at, files_total, bytes_total,
-       files_verified, files_problem, files_new, files_existing, file_types, camera_models,
-       capture_first, capture_last, backup_state, safe_to_format, problems, report_path
+       files_verified, files_problem, COALESCE(files_ignored, 0), files_new, files_existing,
+       file_types, camera_models, capture_first, capture_last, backup_state, safe_to_format,
+       problems, report_path
 FROM card_reports ORDER BY id DESC LIMIT 1`).Scan(
 		&r.ID, &r.VolumeName, &r.VolumeUUID, &r.StartedAt, &r.FinishedAt, &r.FilesTotal,
-		&r.BytesTotal, &r.FilesVerified, &r.FilesProblem, &r.FilesNew, &r.FilesExisting,
+		&r.BytesTotal, &r.FilesVerified, &r.FilesProblem, &r.FilesIgnored, &r.FilesNew, &r.FilesExisting,
 		&r.FileTypes, &r.CameraModels, &r.CaptureFirst, &r.CaptureLast,
 		&r.BackupState, &r.SafeToFormat, &problems, &reportPath)
 	if err == sql.ErrNoRows {
@@ -387,10 +474,11 @@ func InsertPhoto(db *sql.DB, p Photo) error {
 	_, err := db.Exec(`
 INSERT INTO photos
     (hash, original_filename, imported_path, camera_model, capture_date,
-     import_timestamp, gps_lat, gps_lon, status)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     import_timestamp, gps_lat, gps_lon, status, quick_hash)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.Hash, p.OriginalFilename, p.ImportedPath, p.CameraModel,
 		p.CaptureDate, p.ImportTimestamp, p.GPSLat, p.GPSLon, p.Status,
+		sql.NullString{String: p.QuickHash, Valid: p.QuickHash != ""},
 	)
 	return err
 }

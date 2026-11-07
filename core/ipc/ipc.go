@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/thevedantmodi/framelog/core/activity"
+	"github.com/thevedantmodi/framelog/core/cardverify"
+	"github.com/thevedantmodi/framelog/core/config"
 	"github.com/thevedantmodi/framelog/core/db"
 	"github.com/thevedantmodi/framelog/core/ingest"
 	"github.com/thevedantmodi/framelog/core/logging"
@@ -32,6 +34,10 @@ import (
 // StatusProvider, for the same cross-package-boundary reason.
 type ConfigSetter interface {
 	SetBackupPath(path string) error
+	// SetImportTypes persists and applies the import file types; nil
+	// restores the defaults. Returns an error wrapping
+	// config.ErrInvalidFileType when the list is rejected.
+	SetImportTypes(types []string) error
 }
 
 // StatusProvider is the read-only view of pipeline state the status handler
@@ -80,6 +86,33 @@ type ReportProvider interface {
 	Activity() activity.Snapshot
 	Backup() (BackupSummary, error)
 	LastCard() (*db.CardReport, error)
+	// CardPreview is the quick "what's new" result for the mounted card,
+	// or nil when no card is mounted (or none has been scanned).
+	CardPreview() *cardverify.Preview
+}
+
+// CardPreviewSummary is "card_preview" in the status response.
+type CardPreviewSummary struct {
+	VolumeName     string `json:"volume_name"`
+	CheckedAt      string `json:"checked_at"`
+	FilesTotal     int    `json:"files_total"`
+	BytesTotal     int64  `json:"bytes_total"`
+	FilesNew       int    `json:"files_new"`
+	BytesNew       int64  `json:"bytes_new"`
+	FilesInLibrary int    `json:"files_in_library"`
+	FilesIgnored   int    `json:"files_ignored"`
+	FilesUnhandled int    `json:"files_unhandled"`
+	NewFileTypes   string `json:"new_file_types"`
+}
+
+// NewCardPreviewSummary converts a preview to its wire shape.
+func NewCardPreviewSummary(p *cardverify.Preview) CardPreviewSummary {
+	return CardPreviewSummary{
+		VolumeName: p.VolumeName, CheckedAt: p.CheckedAt.UTC().Format(time.RFC3339),
+		FilesTotal: p.Files, BytesTotal: p.Bytes, FilesNew: len(p.New), BytesNew: p.NewBytes,
+		FilesInLibrary: p.InLibrary, FilesIgnored: p.Ignored, FilesUnhandled: p.Unhandled,
+		NewFileTypes: p.NewTypes(),
+	}
 }
 
 // CardVerifier re-verifies the mounted card on demand (sdcard.Watcher).
@@ -120,6 +153,7 @@ type CardSummary struct {
 	BytesTotal    int64    `json:"bytes_total"`
 	FilesVerified int      `json:"files_verified"`
 	FilesProblem  int      `json:"files_problem"`
+	FilesIgnored  int      `json:"files_ignored"`
 	FilesNew      int      `json:"files_new"`
 	FilesExisting int      `json:"files_existing"`
 	FileTypes     string   `json:"file_types"`
@@ -141,7 +175,7 @@ func NewCardSummary(r db.CardReport) CardSummary {
 		ID: r.ID, VolumeName: r.VolumeName, VolumeUUID: r.VolumeUUID,
 		StartedAt: r.StartedAt, FinishedAt: r.FinishedAt, SafeToFormat: r.SafeToFormat,
 		FilesTotal: r.FilesTotal, BytesTotal: r.BytesTotal, FilesVerified: r.FilesVerified,
-		FilesProblem: r.FilesProblem, FilesNew: r.FilesNew, FilesExisting: r.FilesExisting,
+		FilesProblem: r.FilesProblem, FilesIgnored: r.FilesIgnored, FilesNew: r.FilesNew, FilesExisting: r.FilesExisting,
 		FileTypes: r.FileTypes, CameraModels: r.CameraModels,
 		CaptureFirst: r.CaptureFirst, CaptureLast: r.CaptureLast,
 		BackupState: r.BackupState, Problems: problems, ReportPath: r.ReportPath,
@@ -234,6 +268,9 @@ func (s *Server) acceptLoop() {
 type request struct {
 	Command string `json:"command"`
 	Path    string `json:"path,omitempty"`
+	// Types is used by set_import_types. A pointer so a missing or null
+	// "types" (reset to defaults) is distinguishable from [] (rejected).
+	Types *[]string `json:"types,omitempty"`
 }
 
 // Per-command response structs — separate types so each command gets exactly
@@ -284,11 +321,22 @@ type statusResp struct {
 	DaemonVersion      string       `json:"daemon_version"`
 	Paused             bool         `json:"paused"`
 	Capabilities       Capabilities `json:"capabilities"`
+	// FileTypes lists every known camera type (on or off) and any custom
+	// types, for the File Types menu.
+	FileTypes []config.FileTypeSetting `json:"file_types"`
 	// Present when the server has a ReportProvider. last_card is absent
 	// until the first card has been verified.
 	Activity *activity.Snapshot `json:"activity,omitempty"`
 	Backup   *BackupSummary     `json:"backup,omitempty"`
 	LastCard *CardSummary       `json:"last_card,omitempty"`
+	// CardPreview is present while a scanned card is mounted.
+	CardPreview *CardPreviewSummary `json:"card_preview,omitempty"`
+}
+
+type importTypesOKResp struct {
+	ProtocolVersion int                      `json:"protocol_version"`
+	OK              bool                     `json:"ok"`
+	FileTypes       []config.FileTypeSetting `json:"file_types"`
 }
 
 type verifyCardOKResp struct {
@@ -409,6 +457,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			DaemonVersion:      s.Version,
 			Paused:             s.Status.Paused(),
 			Capabilities:       s.Caps,
+			FileTypes:          config.FileTypeSettings(),
 		}
 		if s.Reports != nil {
 			// A failure reading report history degrades to "field absent"
@@ -426,8 +475,35 @@ func (s *Server) handleConn(conn net.Conn) {
 				cs := NewCardSummary(*c)
 				resp.LastCard = &cs
 			}
+			if p := s.Reports.CardPreview(); p != nil {
+				ps := NewCardPreviewSummary(p)
+				resp.CardPreview = &ps
+			}
 		}
 		s.writeResp(conn, resp)
+
+	case "set_import_types":
+		if s.Config == nil {
+			s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			return
+		}
+		var types []string // nil = reset to defaults
+		if req.Types != nil {
+			types = *req.Types
+			if types == nil {
+				types = []string{} // explicit [] is a (rejected) empty set, not a reset
+			}
+		}
+		if err := s.Config.SetImportTypes(types); err != nil {
+			if errors.Is(err, config.ErrInvalidFileType) {
+				s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "invalid_file_type"})
+				return
+			}
+			s.Logger.Log(logging.PrefixCore, fmt.Sprintf("ipc set_import_types error: %v", err))
+			s.writeResp(conn, errResp{ProtocolVersion: 1, OK: false, Error: "internal_error"})
+			return
+		}
+		s.writeResp(conn, importTypesOKResp{ProtocolVersion: 1, OK: true, FileTypes: config.FileTypeSettings()})
 
 	case "verify_card":
 		if s.Card == nil {

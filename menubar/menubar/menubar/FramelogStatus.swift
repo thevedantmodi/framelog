@@ -272,6 +272,11 @@ final class FramelogStatus: ObservableObject {
     @Published private(set) var lastCard: CardInfo?
     @Published private(set) var backupProblem: String?
     @Published private(set) var backupPending = false
+    @Published private(set) var cardPreview: PreviewInfo?
+    // Every known file type (on or off) plus custom ones, from status.
+    @Published private(set) var fileTypes: [FileTypeInfo] = []
+    // Shown under the File Types menu when a change was rejected.
+    @Published private(set) var fileTypesMessage: String?
     @Published private(set) var verifyState: ActionState = .idle
     @Published private(set) var backupRetryState: ActionState = .idle
 
@@ -289,6 +294,7 @@ final class FramelogStatus: ObservableObject {
     private var hasSeededReports = false
     private var lastSeenCardID: Int?
     private var lastSeenBackupRunAt: String?
+    private var lastSeenPreviewKey: String?
 
     // Version stamped into the app bundle at build time — same source as framelogd's
     // -ldflags Version. Used to detect when an upgrade replaced the bundle but the
@@ -408,7 +414,11 @@ final class FramelogStatus: ObservableObject {
             activity: ActivityInfo(json: status["activity"] as? [String: Any]),
             backup: backupInfo,
             backupConfigured: backupConfigured,
-            card: CardInfo(json: status["last_card"] as? [String: Any]))
+            card: CardInfo(json: status["last_card"] as? [String: Any]),
+            preview: PreviewInfo(json: status["card_preview"] as? [String: Any]))
+        if status["file_types"] != nil {
+            fileTypes = FileTypeInfo.list(json: status["file_types"])
+        }
 
         if !hasAutoInstalled, let expected = bundledVersion,
             let running = status["daemon_version"] as? String,
@@ -422,7 +432,8 @@ final class FramelogStatus: ObservableObject {
     // MARK: Card + backup reporting
 
     private func applyReports(
-        activity: ActivityInfo?, backup: BackupInfo?, backupConfigured: Bool, card: CardInfo?
+        activity: ActivityInfo?, backup: BackupInfo?, backupConfigured: Bool, card: CardInfo?,
+        preview: PreviewInfo?
     ) {
         if let activity {
             activityLine = activityDisplayLine(activity)
@@ -436,9 +447,15 @@ final class FramelogStatus: ObservableObject {
         backupProblem = backup.flatMap { backupProblemLine($0, configured: backupConfigured) }
         backupPending = backupConfigured && (backup?.pending ?? false)
         lastCard = card
+        cardPreview = preview.flatMap { shouldShowPreview($0, lastCard: card) ? $0 : nil }
+        let previewKey = preview.map { "\($0.volumeName)|\($0.checkedAt)" }
 
         // Notify on transitions only, never for what was already on disk.
         if hasSeededReports {
+            if let preview, let previewKey, previewKey != lastSeenPreviewKey {
+                let n = previewNotification(preview)
+                postNotification(title: n.title, body: n.body)
+            }
             if let card, card.id != lastSeenCardID {
                 let n = cardNotification(card)
                 postNotification(title: n.title, body: n.body)
@@ -452,6 +469,50 @@ final class FramelogStatus: ObservableObject {
         hasSeededReports = true
         lastSeenCardID = card?.id ?? lastSeenCardID
         lastSeenBackupRunAt = backup?.lastRunAt ?? lastSeenBackupRunAt
+        lastSeenPreviewKey = previewKey ?? lastSeenPreviewKey
+    }
+
+    // MARK: File types (set_import_types)
+
+    func toggleFileType(_ ext: String) {
+        guard let types = importTypesAfterToggling(fileTypes, ext: ext) else {
+            fileTypesMessage = "At least one file type must stay on"
+            return
+        }
+        sendImportTypes(types)
+    }
+
+    func addFileType() {
+        let alert = NSAlert()
+        alert.messageText = "Add File Type"
+        alert.informativeText =
+            "Framelog will import files with this extension from your cards, e.g. INSV or BRAW."
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 200, height: 24))
+        field.placeholderString = "Extension"
+        alert.accessoryView = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let types = importTypesAdding(fileTypes, typed: field.stringValue) else {
+            fileTypesMessage = "Use letters and numbers only, like INSV"
+            return
+        }
+        sendImportTypes(types)
+    }
+
+    func resetFileTypes() { sendImportTypes(nil) }
+
+    private func sendImportTypes(_ types: [String]?) {
+        let payload = importTypesPayload(types)
+        Task.detached {
+            let json = sendSocketCommand(socketPath: FramelogPaths.socket.path, payload: payload)
+            await MainActor.run {
+                self.fileTypesMessage = setImportTypesMessage(json)
+                if json?["ok"] as? Bool == true {
+                    self.fileTypes = FileTypeInfo.list(json: json?["file_types"])
+                }
+            }
+        }
     }
 
     // Re-checks the mounted card end to end (verify_card). Runs for as long

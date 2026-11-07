@@ -200,6 +200,13 @@ Lightroom's relationship to `originals/`.
 - **FL-704 ✓ — Menu bar reporting** — card verdict + details submenu, Verify Card Now,
   Retry Backup, card and backup-failure notifications.
 - **FL-705 ✓ — Sony HEIF** — `.hif` imported (α7C II and other Sony bodies).
+- **FL-706 ✓ — Instant card preview** — quick hash (size + first/last 64 KiB) shows
+  "N new · M already imported" seconds after insertion; only new files are copied.
+  Full-hash verification still decides the verdict and catches a wrong quick match.
+  See `PROTOCOL.md §11`.
+- **FL-707 ✓ — Configurable file types** — known camera types (all on by default) can be
+  switched off; custom extensions can be added; switched-off types are "ignored" on the
+  card report. `set_import_types`, `PROTOCOL.md §12`.
 
 ### Pending (FL-404 follow-up)
 

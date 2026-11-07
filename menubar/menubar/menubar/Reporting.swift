@@ -94,6 +94,58 @@ extension CardInfo {
     }
 }
 
+// Quick "what's new on this card" preview, present while a card is mounted.
+struct PreviewInfo: Equatable {
+    var volumeName: String
+    var checkedAt: String
+    var filesTotal: Int
+    var filesNew: Int
+    var bytesNew: Int64
+    var filesInLibrary: Int
+    var filesIgnored: Int
+    var filesUnhandled: Int
+    var newFileTypes: String
+}
+
+extension PreviewInfo {
+    init?(json: [String: Any]?) {
+        guard let json, let name = json["volume_name"] as? String else { return nil }
+        self.init(
+            volumeName: name,
+            checkedAt: json["checked_at"] as? String ?? "",
+            filesTotal: json["files_total"] as? Int ?? 0,
+            filesNew: json["files_new"] as? Int ?? 0,
+            bytesNew: (json["bytes_new"] as? NSNumber)?.int64Value ?? 0,
+            filesInLibrary: json["files_in_library"] as? Int ?? 0,
+            filesIgnored: json["files_ignored"] as? Int ?? 0,
+            filesUnhandled: json["files_unhandled"] as? Int ?? 0,
+            newFileTypes: json["new_file_types"] as? String ?? "")
+    }
+}
+
+// One row of the File Types menu.
+struct FileTypeInfo: Equatable {
+    var ext: String  // ".arw"
+    var label: String
+    var enabled: Bool
+    var custom: Bool
+}
+
+extension FileTypeInfo {
+    init?(json: [String: Any]) {
+        guard let ext = json["ext"] as? String else { return nil }
+        self.init(
+            ext: ext,
+            label: json["label"] as? String ?? "",
+            enabled: json["enabled"] as? Bool ?? false,
+            custom: json["custom"] as? Bool ?? false)
+    }
+
+    static func list(json: Any?) -> [FileTypeInfo] {
+        (json as? [[String: Any]] ?? []).compactMap { FileTypeInfo(json: $0) }
+    }
+}
+
 // State of a long-running menu action (Verify Card / Retry Backup).
 enum ActionState: Equatable {
     case idle
@@ -146,6 +198,7 @@ func activityDisplayLine(_ a: ActivityInfo) -> String? {
     case "backing_up":
         return a.done > 0 ? "Backing up… \(plural(a.done, "file", "files")) copied" : "Backing up…"
     case "verifying": return "Verifying\(from)…\(progress)"
+    case "scanning": return "Checking\(from) for new files…"
     default: return "Working…\(progress)"
     }
 }
@@ -276,5 +329,118 @@ func backupNowMessage(_ json: [String: Any]?) -> String {
     case "ingest_paused": return "Framelog is paused"
     case let code?: return "Backup failed (\(code))"
     case nil: return "Backup failed"
+    }
+}
+
+// MARK: - Card preview
+
+// "Untitled: 312 new (8.1 GB) · 1,040 already imported"
+func previewLine(_ p: PreviewInfo) -> String {
+    if p.filesTotal == 0 {
+        return "\(p.volumeName): no photos or videos"
+    }
+    if p.filesNew == 0 {
+        return "\(p.volumeName): all \(plural(p.filesTotal, "file", "files")) already imported"
+    }
+    var line = "\(p.volumeName): \(p.filesNew) new"
+    if p.bytesNew > 0 { line += " (\(byteString(p.bytesNew)))" }
+    if p.filesInLibrary > 0 { line += " · \(p.filesInLibrary) already imported" }
+    return line
+}
+
+// Extra lines under the preview: what's new, and anything skipped.
+func previewDetailLines(_ p: PreviewInfo) -> [String] {
+    var lines: [String] = []
+    if p.filesNew > 0, !p.newFileTypes.isEmpty { lines.append("New: \(p.newFileTypes)") }
+    if p.filesIgnored > 0 {
+        lines.append("\(plural(p.filesIgnored, "file", "files")) skipped (switched off in File Types)")
+    }
+    if p.filesUnhandled > 0 {
+        lines.append("⚠ \(plural(p.filesUnhandled, "file", "files")) of a type Framelog doesn't know")
+    }
+    return lines
+}
+
+func previewNotification(_ p: PreviewInfo) -> (title: String, body: String) {
+    if p.filesTotal == 0 {
+        return ("\(p.volumeName) inserted", "No photos or videos on this card.")
+    }
+    if p.filesNew == 0 {
+        return (
+            "\(p.volumeName): nothing new",
+            "All \(plural(p.filesTotal, "file is", "files are")) already in your library. Checking them now."
+        )
+    }
+    var body = "\(plural(p.filesNew, "new file", "new files")) to import"
+    if p.bytesNew > 0 { body += " (\(byteString(p.bytesNew)))" }
+    if p.filesInLibrary > 0 { body += ", \(p.filesInLibrary) already in your library" }
+    return ("\(p.volumeName) inserted", body + ".")
+}
+
+// The preview belongs to the card run in progress; once that run's report
+// exists (finished after the preview was taken) the verdict replaces it.
+func shouldShowPreview(_ p: PreviewInfo, lastCard: CardInfo?) -> Bool {
+    guard let lastCard else { return true }
+    let fmt = ISO8601DateFormatter()
+    guard let checked = fmt.date(from: p.checkedAt),
+        let finished = fmt.date(from: lastCard.finishedAt)
+    else { return true }
+    return checked > finished
+}
+
+// MARK: - File types
+
+// ".ARW — Sony RAW"
+func fileTypeMenuLabel(_ t: FileTypeInfo) -> String {
+    let ext = t.ext.uppercased()
+    return t.custom ? "\(ext) — added by you" : "\(ext) — \(t.label)"
+}
+
+// The enabled list after toggling ext, or nil when that would switch off
+// the last type (the core rejects an empty list).
+func importTypesAfterToggling(_ types: [FileTypeInfo], ext: String) -> [String]? {
+    var enabled = types.filter(\.enabled).map(\.ext)
+    if let i = enabled.firstIndex(of: ext) {
+        enabled.remove(at: i)
+    } else {
+        enabled.append(ext)
+    }
+    return enabled.isEmpty ? nil : enabled.sorted()
+}
+
+// The enabled list with a user-typed extension added ("insv", ".INSV"),
+// or nil if the input isn't a plausible extension.
+func importTypesAdding(_ types: [FileTypeInfo], typed: String) -> [String]? {
+    var ext = typed.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if !ext.hasPrefix(".") { ext = "." + ext }
+    let body = ext.dropFirst()
+    guard (1...10).contains(body.count), body.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) })
+    else { return nil }
+    var enabled = Set(types.filter(\.enabled).map(\.ext))
+    enabled.insert(ext)
+    return enabled.sorted()
+}
+
+// JSON for set_import_types; nil types = reset to defaults.
+func importTypesPayload(_ types: [String]?) -> String {
+    var obj: [String: Any] = ["command": "set_import_types"]
+    if let types {
+        obj["types"] = types
+    } else {
+        obj["types"] = NSNull()
+    }
+    guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]),
+        let str = String(data: data, encoding: .utf8)
+    else { return "{\"command\":\"set_import_types\"}" }
+    return str
+}
+
+func setImportTypesMessage(_ json: [String: Any]?) -> String? {
+    guard let json else { return "Core didn't respond" }
+    if json["ok"] as? Bool == true { return nil }
+    switch json["error"] as? String {
+    case "invalid_file_type": return "That file type can't be imported"
+    case let code?: return "Couldn't change file types (\(code))"
+    case nil: return "Couldn't change file types"
     }
 }

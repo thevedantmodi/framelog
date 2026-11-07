@@ -101,6 +101,9 @@ func RenderReceipt(r *Report) string {
 	default:
 		fmt.Fprintf(tw, "Backup:\t%d/%d verified on %s\n", counts[StateVerified], sum.FilesTotal, r.BackupPath)
 	}
+	if n := counts[StateIgnored]; n > 0 {
+		fmt.Fprintf(tw, "Ignored:\t%d file(s) of a type switched off in File Types (%s)\n", n, r.ignoredTypes())
+	}
 	if r.Sidecars > 0 {
 		fmt.Fprintf(tw, "Sidecars:\t%d clip metadata file(s), copied with their clips\n", r.Sidecars)
 	}

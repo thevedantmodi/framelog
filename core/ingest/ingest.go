@@ -303,6 +303,10 @@ func (p *Pipeline) ImportFile(srcPath, batchID string) (Result, error) {
 		ImportTimestamp:  time.Now().UTC().Format(time.RFC3339),
 		GPSLat:           meta.GPSLat, // nil when absent, not 0.0
 		GPSLon:           meta.GPSLon,
+		// Best-effort: a failure only means this file is not recognised by
+		// the instant card preview, which then copies it again (harmless —
+		// ingest dedups by full hash).
+		QuickHash: quickHashOrEmpty(srcPath),
 	}
 	if err := db.InsertPhoto(p.DB, photo); err != nil {
 		// UNIQUE constraint means a previous ingest already recorded this hash
@@ -463,7 +467,7 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 			}
 			return nil
 		}
-		if config.SupportedExtensions[strings.ToLower(filepath.Ext(path))] {
+		if config.IsImportable(filepath.Ext(path)) {
 			files = append(files, path)
 		}
 		return nil
@@ -659,6 +663,14 @@ func (p *Pipeline) runBackup(backupPath string) db.BackupRun {
 	p.Logger.Log(logging.PrefixBackup,
 		fmt.Sprintf("synced %d new files to %s", run.FilesCopied, backupPath))
 	return run
+}
+
+func quickHashOrEmpty(path string) string {
+	h, err := hasher.QuickHash(path)
+	if err != nil {
+		return ""
+	}
+	return h
 }
 
 // copyFile copies src to dst, syncing the destination before returning so a
