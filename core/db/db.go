@@ -119,9 +119,251 @@ CREATE TABLE IF NOT EXISTS photos (
     gps_lat           REAL,
     gps_lon           REAL,
     status            TEXT DEFAULT 'raw'
+);
+
+CREATE TABLE IF NOT EXISTS card_reports (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    volume_name      TEXT,
+    volume_uuid      TEXT,
+    started_at       TEXT,
+    finished_at      TEXT,
+    files_total      INTEGER,
+    bytes_total      INTEGER,
+    files_verified   INTEGER,
+    files_problem    INTEGER,
+    files_new        INTEGER,
+    files_existing   INTEGER,
+    file_types       TEXT,
+    camera_models    TEXT,
+    capture_first    TEXT,
+    capture_last     TEXT,
+    backup_state     TEXT,
+    safe_to_format   INTEGER,
+    problems         TEXT,
+    report_path      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS card_report_files (
+    report_id     INTEGER REFERENCES card_reports(id),
+    card_path     TEXT,
+    size          INTEGER,
+    hash          TEXT,
+    library_path  TEXT,
+    backup_path   TEXT,
+    state         TEXT,
+    detail        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS backup_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at    TEXT,
+    finished_at   TEXT,
+    destination   TEXT,
+    outcome       TEXT,
+    files_copied  INTEGER,
+    files_failed  INTEGER,
+    error         TEXT
 );`
 	_, err := db.Exec(schema)
 	return err
+}
+
+// LibraryEntry is the subset of a photos row card verification needs.
+type LibraryEntry struct {
+	ImportedPath    string
+	ImportTimestamp string
+	CaptureDate     string
+	CameraModel     string
+}
+
+// LibraryEntryByHash returns where (and when) the bytes with this hash were
+// imported, and whether a row exists at all. Used by card verification to
+// find a card file's copy in originals/.
+func LibraryEntryByHash(db *sql.DB, hash string) (LibraryEntry, bool, error) {
+	var p, ts, cd, cm sql.NullString
+	err := db.QueryRow(`
+SELECT imported_path, import_timestamp, capture_date, camera_model
+FROM photos WHERE hash = ?`, hash).Scan(&p, &ts, &cd, &cm)
+	if err == sql.ErrNoRows {
+		return LibraryEntry{}, false, nil
+	}
+	if err != nil {
+		return LibraryEntry{}, false, err
+	}
+	return LibraryEntry{ImportedPath: p.String, ImportTimestamp: ts.String,
+		CaptureDate: cd.String, CameraModel: cm.String}, true, nil
+}
+
+// CardReport mirrors one card_reports row: the outcome of one end-to-end
+// verification of an SD card (PROTOCOL.md §1). Problems is a list of
+// human-readable sentences; it is stored newline-joined.
+type CardReport struct {
+	ID            int64
+	VolumeName    string
+	VolumeUUID    string
+	StartedAt     string // RFC 3339, UTC
+	FinishedAt    string
+	FilesTotal    int
+	BytesTotal    int64
+	FilesVerified int
+	FilesProblem  int
+	// FilesNew counts verified files imported during this card session;
+	// FilesExisting counts ones already in the library from an earlier
+	// import (same card re-inserted, or a file shot on two cards).
+	FilesNew      int
+	FilesExisting int
+	FileTypes     string // e.g. "ARW 312 · JPG 312 · MP4 4"
+	CameraModels  string // comma-separated, e.g. "ILCE-7CM2"
+	CaptureFirst  string // exiftool layout "2006:01:02 15:04:05", "" if unknown
+	CaptureLast   string
+	BackupState   string
+	SafeToFormat  bool
+	Problems      []string
+	ReportPath    string
+}
+
+// CardReportFile mirrors one card_report_files row: the verdict for one file
+// on the card.
+type CardReportFile struct {
+	CardPath    string
+	Size        int64
+	Hash        string
+	LibraryPath string
+	BackupPath  string
+	State       string
+	Detail      string
+}
+
+// InsertCardReport writes a report and its per-file rows in one transaction
+// and returns the new report id.
+func InsertCardReport(db *sql.DB, r CardReport, files []CardReportFile) (int64, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck — no-op after Commit
+
+	res, err := tx.Exec(`
+INSERT INTO card_reports
+    (volume_name, volume_uuid, started_at, finished_at, files_total, bytes_total,
+     files_verified, files_problem, files_new, files_existing, file_types, camera_models,
+     capture_first, capture_last, backup_state, safe_to_format, problems, report_path)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.VolumeName, r.VolumeUUID, r.StartedAt, r.FinishedAt, r.FilesTotal, r.BytesTotal,
+		r.FilesVerified, r.FilesProblem, r.FilesNew, r.FilesExisting, r.FileTypes,
+		r.CameraModels, r.CaptureFirst, r.CaptureLast, r.BackupState, r.SafeToFormat,
+		strings.Join(r.Problems, "\n"), r.ReportPath)
+	if err != nil {
+		return 0, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+
+	stmt, err := tx.Prepare(`
+INSERT INTO card_report_files
+    (report_id, card_path, size, hash, library_path, backup_path, state, detail)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	for _, f := range files {
+		if _, err := stmt.Exec(id, f.CardPath, f.Size, f.Hash, f.LibraryPath,
+			f.BackupPath, f.State, f.Detail); err != nil {
+			return 0, err
+		}
+	}
+	return id, tx.Commit()
+}
+
+// LastCardReport returns the most recent card report, or nil when no card
+// has ever been verified.
+func LastCardReport(db *sql.DB) (*CardReport, error) {
+	var r CardReport
+	var problems, reportPath sql.NullString
+	err := db.QueryRow(`
+SELECT id, volume_name, volume_uuid, started_at, finished_at, files_total, bytes_total,
+       files_verified, files_problem, files_new, files_existing, file_types, camera_models,
+       capture_first, capture_last, backup_state, safe_to_format, problems, report_path
+FROM card_reports ORDER BY id DESC LIMIT 1`).Scan(
+		&r.ID, &r.VolumeName, &r.VolumeUUID, &r.StartedAt, &r.FinishedAt, &r.FilesTotal,
+		&r.BytesTotal, &r.FilesVerified, &r.FilesProblem, &r.FilesNew, &r.FilesExisting,
+		&r.FileTypes, &r.CameraModels, &r.CaptureFirst, &r.CaptureLast,
+		&r.BackupState, &r.SafeToFormat, &problems, &reportPath)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if problems.String != "" {
+		r.Problems = strings.Split(problems.String, "\n")
+	}
+	r.ReportPath = reportPath.String
+	return &r, nil
+}
+
+// Backup run outcomes (backup_runs.outcome) — closed set, PROTOCOL.md §1.
+const (
+	BackupOK            = "ok"
+	BackupFailed        = "failed"
+	BackupDriveMissing  = "drive_missing"
+	BackupRcloneMissing = "rclone_missing"
+)
+
+// BackupRun mirrors one backup_runs row.
+type BackupRun struct {
+	ID          int64
+	StartedAt   string // RFC 3339, UTC
+	FinishedAt  string
+	Destination string
+	Outcome     string
+	FilesCopied int
+	FilesFailed int
+	Error       string // human-readable (rclonerun.Explain), "" on success
+}
+
+// InsertBackupRun records one backup attempt.
+func InsertBackupRun(db *sql.DB, r BackupRun) error {
+	_, err := db.Exec(`
+INSERT INTO backup_runs
+    (started_at, finished_at, destination, outcome, files_copied, files_failed, error)
+VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		r.StartedAt, r.FinishedAt, r.Destination, r.Outcome, r.FilesCopied, r.FilesFailed, r.Error)
+	return err
+}
+
+// LastBackupRun returns the most recent backup attempt, or nil if none.
+func LastBackupRun(db *sql.DB) (*BackupRun, error) {
+	return scanBackupRun(db.QueryRow(`
+SELECT id, started_at, finished_at, destination, outcome, files_copied, files_failed, error
+FROM backup_runs ORDER BY id DESC LIMIT 1`))
+}
+
+// LastSuccessfulBackupAt returns finished_at of the most recent successful
+// backup, or "" if there has never been one.
+func LastSuccessfulBackupAt(db *sql.DB) (string, error) {
+	var ts sql.NullString
+	err := db.QueryRow(
+		"SELECT MAX(finished_at) FROM backup_runs WHERE outcome = ?", BackupOK).Scan(&ts)
+	return ts.String, err
+}
+
+func scanBackupRun(row *sql.Row) (*BackupRun, error) {
+	var r BackupRun
+	var errText sql.NullString
+	err := row.Scan(&r.ID, &r.StartedAt, &r.FinishedAt, &r.Destination, &r.Outcome,
+		&r.FilesCopied, &r.FilesFailed, &errText)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.Error = errText.String
+	return &r, nil
 }
 
 // HashExists reports whether a row with the given hash already exists. Used by

@@ -19,6 +19,7 @@
 package sdcard
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -29,11 +30,26 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thevedantmodi/framelog/core/activity"
+	"github.com/thevedantmodi/framelog/core/cardverify"
 	"github.com/thevedantmodi/framelog/core/config"
+	"github.com/thevedantmodi/framelog/core/db"
 	"github.com/thevedantmodi/framelog/core/ingest"
 	"github.com/thevedantmodi/framelog/core/logging"
 	"github.com/thevedantmodi/framelog/core/rclonerun"
 )
+
+// ErrNoCard is returned by VerifyMounted when no camera card is mounted.
+// Wire-string convention (PROTOCOL.md §3 verify_card).
+var ErrNoCard = errors.New("no_card")
+
+// ErrCardBusy is returned by VerifyMounted while a card is already being
+// copied or verified.
+var ErrCardBusy = errors.New("card_busy")
+
+// ErrVerifyUnavailable is returned by VerifyMounted when the watcher was
+// built without a catalog DB (verification disabled).
+var ErrVerifyUnavailable = errors.New("verify_unavailable")
 
 // diskutilCandidates is the ordered list of known diskutil locations on macOS.
 // Package-level var (not const) so FindDiskutil tests can force the LookPath branch.
@@ -81,6 +97,24 @@ func IsRemovableMedia(diskutilPath, volPath string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// VolumeUUID returns the "Volume UUID" diskutil reports for volPath, or ""
+// when diskutil fails or reports none. Card volume names are useless as an
+// identity — every Sony card formats as "Untitled", most others "NO NAME" —
+// so reports carry the UUID (which changes on every in-camera format) to
+// tell one card, and one format of it, from another.
+func VolumeUUID(diskutilPath, volPath string) string {
+	out, err := exec.Command(diskutilPath, "info", volPath).Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if _, v, ok := strings.Cut(line, "Volume UUID:"); ok {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 // HasDCIM reports whether volPath contains a DCIM subdirectory. Not injected
@@ -173,12 +207,16 @@ func copyMedia(rclonePath, srcPath, inboxPath string, exts []string, onCopy ...f
 		cb = onCopy[0]
 	}
 
+	res, err := copyMediaDetailed(rclonePath, srcPath, inboxPath, exts, cb)
+	return res.Copied, err
+}
+
+func copyMediaDetailed(rclonePath, srcPath, inboxPath string, exts []string, cb func(string, int)) (rclonerun.Result, error) {
 	args := []string{"copy", srcPath, inboxPath, "--ignore-existing", "--ignore-case"}
 	for _, ext := range exts {
 		args = append(args, "--include", "*"+ext)
 	}
-
-	return rclonerun.Copy(rclonePath, args, cb)
+	return rclonerun.Run(rclonePath, args, cb)
 }
 
 // sortedSupportedExtensions returns config.SupportedExtensions keys sorted,
@@ -207,6 +245,31 @@ type Watcher struct {
 	PollInterval time.Duration
 	Runner       ingest.Runner
 	Logger       *logging.Logger
+
+	// --- End-to-end verification (cardverify). Leave DB nil to disable. ---
+
+	// DB is the catalog verification checks card hashes against.
+	DB *sql.DB
+	// OriginalsPath is the library root (backup copies mirror its layout).
+	OriginalsPath string
+	// ReportsDir receives one plain-text receipt per verified card.
+	ReportsDir string
+	// BackupPath returns the currently configured backup root ("" = none).
+	// A func, not a string, because set_backup_path changes it at runtime.
+	BackupPath func() string
+	// Activity receives live copy/verify progress. Nil-safe.
+	Activity *activity.Tracker
+	// OnReport, when set, is called with every saved card report.
+	OnReport func(db.CardReport)
+	// IngestRetryInterval is how often a card waiting on an
+	// already-running ingest re-tries (default 2s); IngestRetryTimeout
+	// bounds the wait (default 30m).
+	IngestRetryInterval time.Duration
+	IngestRetryTimeout  time.Duration
+
+	// cardMu serialises card work: the automatic copy→ingest→verify run
+	// and on-demand VerifyMounted never overlap.
+	cardMu sync.Mutex
 
 	// seen is the set of volume names present on the last tick.
 	// processed is the set already handled this mount session.
@@ -299,56 +362,7 @@ func (w *Watcher) tick() {
 		}
 
 		processed[name] = true
-		w.Logger.Log(logging.PrefixCore, "SD card detected: "+volPath)
-		w.Logger.Log(logging.PrefixCore, "scanning card (may take a moment on slow card readers)...")
-
-		logProgress := func(filename string, n int) {
-			w.Logger.Log(logging.PrefixCore,
-				fmt.Sprintf("copying [%05d] %s → inbox/", n, filename))
-		}
-
-		// DCIM and PRIVATE/M4ROOT/CLIP are copied independently: a card can
-		// hold either or both, and a failure reading one must not skip the
-		// other. Both land flat in inbox/ so a clip's XML sidecar stays next
-		// to it, which is what ingest's sidecar lookup relies on.
-		var n int
-		if HasDCIM(volPath) {
-			copied, copyErr := CopyDCIM(w.RclonePath, filepath.Join(volPath, config.DCIMDirName), w.InboxPath, logProgress)
-			if copyErr != nil {
-				w.Logger.Log(logging.PrefixCore,
-					fmt.Sprintf("DCIM copy error: %v", copyErr))
-			}
-			w.Logger.Log(logging.PrefixCore,
-				fmt.Sprintf("copied %d files from DCIM", copied))
-			n += copied
-		}
-		if HasClips(volPath) {
-			copied, copyErr := CopyClips(w.RclonePath, filepath.Join(volPath, config.ClipDirRelPath), w.InboxPath, logProgress)
-			if copyErr != nil {
-				w.Logger.Log(logging.PrefixCore,
-					fmt.Sprintf("CLIP copy error: %v", copyErr))
-			}
-			w.Logger.Log(logging.PrefixCore,
-				fmt.Sprintf("copied %d files from %s", copied, config.ClipDirRelPath))
-			n += copied
-		}
-		w.Logger.Log(logging.PrefixCore,
-			fmt.Sprintf("copied %d files from card", n))
-
-		counts, err := w.Runner.RunIngest()
-		if err != nil {
-			if errors.Is(err, ingest.ErrIngestAlreadyRunning) {
-				w.Logger.Log(logging.PrefixCore,
-					"ingest already running, skipping SD card trigger")
-			} else {
-				w.Logger.Log(logging.PrefixCore,
-					fmt.Sprintf("ingest error: %v", err))
-			}
-		} else {
-			w.Logger.Log(logging.PrefixCore,
-				fmt.Sprintf("ingest done: %d imported, %d skipped, %d failed",
-					counts.Imported, counts.Skipped, counts.Failed))
-		}
+		w.processCard(name, volPath)
 	}
 
 	for _, name := range pausedNames {
@@ -358,4 +372,189 @@ func (w *Watcher) tick() {
 	w.mu.Lock()
 	w.seen = current
 	w.mu.Unlock()
+}
+
+// processCard is the full automatic run for one newly inserted card:
+// copy → ingest (which backs up) → end-to-end verification → report.
+func (w *Watcher) processCard(name, volPath string) {
+	w.cardMu.Lock()
+	defer w.cardMu.Unlock()
+	defer w.Activity.Idle()
+
+	sessionStart := time.Now()
+	uuid := VolumeUUID(w.DiskutilPath, volPath)
+	w.Logger.Log(logging.PrefixCore, "SD card detected: "+volPath)
+	w.Logger.Log(logging.PrefixCore, "scanning card (may take a moment on slow card readers)...")
+
+	// The inventory gives the copy phase a real total. It is best-effort:
+	// verification takes its own inventory afterwards.
+	total := 0
+	if inv, err := cardverify.Inventory(volPath); err == nil {
+		for _, f := range inv {
+			if f.Kind != cardverify.KindUnhandled {
+				total++
+			}
+		}
+	}
+	w.Activity.Start(activity.PhaseCopying, name, total)
+
+	var copyProblems []string
+	var n int
+	copyPart := func(label, src string, exts []string) {
+		base := n
+		res, copyErr := copyMediaDetailed(w.RclonePath, src, w.InboxPath, exts, func(filename string, i int) {
+			w.Activity.Step(base+i, filename)
+			w.Logger.Log(logging.PrefixCore,
+				fmt.Sprintf("copying [%05d] %s → inbox/", base+i, filename))
+		})
+		if copyErr != nil || len(res.Errors) > 0 {
+			msg := fmt.Sprintf("Copying %s from the card failed: %s", label, rclonerun.Explain(res, copyErr))
+			copyProblems = append(copyProblems, msg)
+			w.Logger.Log(logging.PrefixCore, fmt.Sprintf("%s copy error: %v", label, copyErr))
+		}
+		w.Logger.Log(logging.PrefixCore, fmt.Sprintf("copied %d files from %s", res.Copied, label))
+		n += res.Copied
+	}
+
+	// DCIM and PRIVATE/M4ROOT/CLIP are copied independently: a card can
+	// hold either or both, and a failure reading one must not skip the
+	// other. Both land flat in inbox/ so a clip's XML sidecar stays next
+	// to it, which is what ingest's sidecar lookup relies on.
+	if HasDCIM(volPath) {
+		copyPart(config.DCIMDirName, filepath.Join(volPath, config.DCIMDirName), sortedSupportedExtensions())
+	}
+	if HasClips(volPath) {
+		copyPart(config.ClipDirRelPath, filepath.Join(volPath, config.ClipDirRelPath),
+			append(sortedSupportedExtensions(), config.NRTMetaExtension))
+	}
+	w.Logger.Log(logging.PrefixCore, fmt.Sprintf("copied %d files from card", n))
+
+	w.runIngestWaiting()
+
+	if w.DB == nil {
+		return
+	}
+	if _, err := w.verify(name, volPath, uuid, sessionStart, copyProblems); err != nil {
+		w.Logger.Log(logging.PrefixCore, fmt.Sprintf("card verification error: %v", err))
+	}
+}
+
+// runIngestWaiting runs ingest for the freshly copied card. If a manual
+// ingest is already running it waits for it rather than skipping: skipping
+// would leave this card's files in inbox/ and the verification that follows
+// would (correctly, but needlessly) say "do not format".
+func (w *Watcher) runIngestWaiting() {
+	interval := w.IngestRetryInterval
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	timeout := w.IngestRetryTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Minute
+	}
+	deadline := time.Now().Add(timeout)
+	logged := false
+	for {
+		counts, err := w.Runner.RunIngest()
+		switch {
+		case err == nil:
+			w.Logger.Log(logging.PrefixCore,
+				fmt.Sprintf("ingest done: %d imported, %d skipped, %d failed",
+					counts.Imported, counts.Skipped, counts.Failed))
+			return
+		case errors.Is(err, ingest.ErrIngestAlreadyRunning) && time.Now().Before(deadline):
+			if !logged {
+				w.Logger.Log(logging.PrefixCore, "ingest already running, waiting to import SD card")
+				logged = true
+			}
+			time.Sleep(interval)
+		case errors.Is(err, ingest.ErrIngestAlreadyRunning):
+			w.Logger.Log(logging.PrefixCore,
+				"ingest already running, skipping SD card trigger")
+			return
+		default:
+			w.Logger.Log(logging.PrefixCore, fmt.Sprintf("ingest error: %v", err))
+			return
+		}
+	}
+}
+
+// verify runs cardverify against the card, saves the report, logs the
+// verdict, and notifies OnReport. Caller holds cardMu.
+func (w *Watcher) verify(name, volPath, uuid string, sessionStart time.Time, extra []string) (db.CardReport, error) {
+	backupPath := ""
+	if w.BackupPath != nil {
+		backupPath = w.BackupPath()
+	}
+	target := "library"
+	if backupPath != "" {
+		target = "library and backup"
+	}
+	w.Logger.Log(logging.PrefixCore, fmt.Sprintf("verifying card %s against %s", name, target))
+	w.Activity.Start(activity.PhaseVerifying, name, 0)
+	rep, err := cardverify.Verify(cardverify.Options{
+		VolumePath:    volPath,
+		VolumeName:    name,
+		VolumeUUID:    uuid,
+		DB:            w.DB,
+		OriginalsPath: w.OriginalsPath,
+		BackupPath:    backupPath,
+		SessionStart:  sessionStart,
+		ExtraProblems: extra,
+		Progress: func(done, total int, file string) {
+			w.Activity.SetTotal(total)
+			w.Activity.Step(done, file)
+		},
+	})
+	if err != nil {
+		return db.CardReport{}, err
+	}
+	sum, err := cardverify.Save(w.DB, rep, w.ReportsDir)
+	if err != nil {
+		return sum, err
+	}
+
+	verdict := "DO NOT FORMAT"
+	if sum.SafeToFormat {
+		verdict = "SAFE TO FORMAT"
+	}
+	w.Logger.Log(logging.PrefixCore, fmt.Sprintf(
+		"card %s: %s — %d/%d files verified (%s), backup %s",
+		name, verdict, sum.FilesVerified, sum.FilesTotal,
+		cardverify.HumanBytes(sum.BytesTotal), sum.BackupState))
+	for _, p := range sum.Problems {
+		w.Logger.Log(logging.PrefixCore, "  problem: "+p)
+	}
+	if sum.ReportPath != "" {
+		w.Logger.Log(logging.PrefixCore, "card report: "+sum.ReportPath)
+	}
+	if w.OnReport != nil {
+		w.OnReport(sum)
+	}
+	return sum, nil
+}
+
+// VerifyMounted re-checks the currently mounted camera card without copying
+// or importing anything — the "Verify Card" menu action. Use it after
+// plugging the backup drive back in, or right before formatting, to get a
+// fresh verdict. Read-only on the card, so it runs even while paused.
+func (w *Watcher) VerifyMounted() (db.CardReport, error) {
+	if w.DB == nil {
+		return db.CardReport{}, ErrVerifyUnavailable
+	}
+	if !w.cardMu.TryLock() {
+		return db.CardReport{}, ErrCardBusy
+	}
+	defer w.cardMu.Unlock()
+	defer w.Activity.Idle()
+
+	volPath, err := FindSDCard(w.DiskutilPath, w.VolumesRoot)
+	if err != nil {
+		return db.CardReport{}, err
+	}
+	if volPath == "" {
+		return db.CardReport{}, ErrNoCard
+	}
+	name := filepath.Base(volPath)
+	return w.verify(name, volPath, VolumeUUID(w.DiskutilPath, volPath), time.Time{}, nil)
 }

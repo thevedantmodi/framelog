@@ -43,6 +43,11 @@ var (
 	// successful ingest (FL-207). Empty/unset means backup is disabled.
 	BackupPath = os.Getenv("FRAMELOG_BACKUP_PATH")
 
+	// ReportsDir holds one plain-text receipt per verified SD card
+	// (cardverify). Durable, human-readable proof of what was on the card
+	// and where every file ended up — the thing you check before formatting.
+	ReportsDir = filepath.Join(home, "Photos", "reports")
+
 	// UserConfigPath is the persisted JSON file written by set_backup_path IPC.
 	// Takes precedence over FRAMELOG_BACKUP_PATH at daemon startup.
 	UserConfigPath = filepath.Join(home, "Library", "Application Support", "Framelog", "framelog_config.json")
@@ -85,6 +90,12 @@ var SupportedExtensions = map[string]bool{
 	".arw":  true,
 	".dng":  true,
 	".heic": true,
+	// .hif is Sony's extension for HEIF stills (α7C II, α7 IV, α1 and other
+	// bodies with "HEIF 4:2:0/4:2:2" file format). Same container as .heic —
+	// exiftool reads it and Lightroom imports it — but without this entry a
+	// HEIF-mode card would be left un-imported and, worse, the card
+	// verification would flag every still as unhandled.
+	".hif":  true,
 	".jpg":  true,
 	".jpeg": true,
 	".mp4":  true,

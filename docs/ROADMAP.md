@@ -184,6 +184,23 @@ Lightroom's relationship to `originals/`.
   distinguish four states: never installed / restarting (launchd recovering) / no photos /
   normal. See `PROTOCOL.md §4`.
 
+## Phase 7 — Card safety & reporting ✓
+
+- **FL-701 ✓ — End-to-end card verification** — `core/cardverify` re-reads every media
+  file on the card, SHA-256s it, and proves it exists intact in `originals/` and on the
+  backup drive. One `safe_to_format` verdict per card, stored in `card_reports` /
+  `card_report_files`, with a plain-text receipt in `~/Photos/reports/`. Runs after
+  every card import and on demand (`verify_card`). See `PROTOCOL.md §10`.
+- **FL-702 ✓ — Backup failure reporting** — every attempt recorded in `backup_runs`;
+  rclone per-file errors captured and explained in plain English
+  (`rclonerun.Explain`); failed/pending backups retried by the next ingest and by
+  `backup_now` ("Retry Backup").
+- **FL-703 ✓ — Live status** — `core/activity` tracker reports copy / import / backup /
+  verify progress in `status`; the menu bar polls every 2 s while busy.
+- **FL-704 ✓ — Menu bar reporting** — card verdict + details submenu, Verify Card Now,
+  Retry Backup, card and backup-failure notifications.
+- **FL-705 ✓ — Sony HEIF** — `.hif` imported (α7C II and other Sony bodies).
+
 ### Pending (FL-404 follow-up)
 
 - **Socket migration for Swift buttons** — "Run Ingest Now" / "Run Outgest Now" currently

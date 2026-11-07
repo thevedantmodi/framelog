@@ -13,7 +13,9 @@ historical — do not restore them.
 ```
 core/         Go module (github.com/thevedantmodi/framelog/core)
   cmd/framelogd/    main package: run/install/uninstall/--version
-  backup/           rclone wrapper; IsDriveMounted
+  activity/         live progress tracker (phase/done/total) read by status
+  backup/           rclone wrapper; IsDriveMounted; DestDir
+  cardverify/       end-to-end "safe to format" check + plain-text receipts
   config/           all paths and constants (single source of truth)
   db/               SQLite schema + queries
   exif/             exiftool subprocess wrapper
@@ -26,7 +28,9 @@ core/         Go module (github.com/thevedantmodi/framelog/core)
   nrtmeta/          Sony NonRealTimeMeta XML sidecar parser (XAVC clips)
   outgest/          RunOutgest; concurrency guard
   outgestwatcher/   fsnotify watcher for processed/; debounce
-  sdcard/           /Volumes watcher; diskutil check; DCIM + XAVC CLIP copy
+  rclonerun/        shared rclone JSON-log runner; per-file errors; Explain
+  sdcard/           /Volumes watcher; diskutil check; DCIM + XAVC CLIP copy;
+                    copy → ingest → verify card run; VerifyMounted
   triggerwatcher/   2s poll for .ingest_trigger / .outgest_trigger
   xmp/              sidecar writer
   xmpwatcher/       fsnotify watcher for originals/; debounce+commit
@@ -145,6 +149,23 @@ than `t.TempDir()` (which produces long paths under the test cache). See
   the wire JSON `"error"` field exactly (`"ingest_already_running"` /
   `"outgest_already_running"`). The IPC handler uses `err.Error()` directly as
   the JSON value — no mapping table.
+- Card verification re-reads every file on the card and re-hashes the
+  library and backup copies instead of trusting rclone's exit code, the
+  inbox copy, or the catalog. Deliberate: the whole point is a verdict the
+  user can format on. It looks files up by content hash, so it is
+  indifferent to how a file reached the library. See PROTOCOL.md §10.
+- A configured-but-unplugged backup drive makes the card verdict "don't
+  format", while no backup configured at all is only a note. Deliberate:
+  a configured backup means the user asked for two copies, and only one is
+  provable. `unhandled` file types on the card also block — formatting
+  would silently destroy them.
+- `.hif` is in `SupportedExtensions`: Sony bodies (incl. the α7C II) name
+  HEIF stills `.HIF`, not `.HEIC`. Without it a HEIF card would never be
+  imported and the verifier would flag every still as unhandled.
+- Ingest retries a pending backup (failed / drive missing / destination
+  changed) even when nothing new was imported, and records every attempt
+  in `backup_runs`. `RunBackup` shares ingest's running flag so a backup
+  never overlaps an import.
 - The launchd plist is re-generated on every `framelogd install`, not cached.
   This ensures the plist always references the current executable path even if
   you moved or rebuilt the binary.

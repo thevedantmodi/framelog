@@ -49,6 +49,7 @@ var watchedExts = map[string]bool{
 	".jpg":  true,
 	".jpeg": true,
 	".heic": true,
+	".hif":  true, // Sony HEIF — same container as .heic
 	".dng":  true, // see config.EmbeddedXMPExtensions
 }
 

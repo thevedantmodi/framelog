@@ -24,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/thevedantmodi/framelog/core/activity"
 	"github.com/thevedantmodi/framelog/core/backup"
 	"github.com/thevedantmodi/framelog/core/config"
 	"github.com/thevedantmodi/framelog/core/db"
@@ -202,6 +203,35 @@ func (s *statusProvider) BackupConfigured() bool { return s.configSetter.backupP
 // both pipelines together, so the two are never out of sync in practice.
 func (s *statusProvider) Paused() bool { return s.ingestPipeline.Paused() }
 
+// reportProvider implements ipc.ReportProvider: live activity plus the
+// backup and card-verification history stored in catalog.db.
+type reportProvider struct {
+	tracker         *activity.Tracker
+	ingestPipeline  *ingest.Pipeline
+	dbConn          *sql.DB
+}
+
+func (r *reportProvider) Activity() activity.Snapshot { return r.tracker.Snapshot() }
+
+func (r *reportProvider) LastCard() (*db.CardReport, error) { return db.LastCardReport(r.dbConn) }
+
+func (r *reportProvider) Backup() (ipc.BackupSummary, error) {
+	sum := ipc.BackupSummary{Pending: r.ingestPipeline.BackupPending()}
+	last, err := db.LastBackupRun(r.dbConn)
+	if err != nil {
+		return sum, err
+	}
+	if last != nil {
+		sum.LastOutcome = last.Outcome
+		sum.LastError = last.Error
+		sum.LastRunAt = last.FinishedAt
+		sum.FilesCopied = last.FilesCopied
+		sum.FilesFailed = last.FilesFailed
+	}
+	sum.LastSuccessAt, err = db.LastSuccessfulBackupAt(r.dbConn)
+	return sum, err
+}
+
 // pauseController implements ipc.PauseController: "pause framelog" is a
 // single global toggle that pauses/resumes ingest and outgest together.
 type pauseController struct {
@@ -326,7 +356,11 @@ func mainRun() error {
 	}
 
 	// --- Pipelines ---
+	// One tracker shared by every stage of the card → library → backup
+	// pipeline, read by the status command for live progress.
+	tracker := &activity.Tracker{}
 	ingestPipeline := &ingest.Pipeline{
+		Activity:      tracker,
 		DB:            dbConn,
 		Logger:        logger,
 		InboxPath:     config.Inbox,
@@ -358,6 +392,8 @@ func mainRun() error {
 		Outgest:      outgestPipeline,
 		Status:       sp,
 		Config:       cs,
+		Reports:      &reportProvider{tracker: tracker, ingestPipeline: ingestPipeline, dbConn: dbConn},
+		Backup:       ingestPipeline,
 		Pause:        &pauseController{ingestPipeline: ingestPipeline, outgestPipeline: outgestPipeline},
 		Logger:       logger,
 		Version:      Version,
@@ -413,13 +449,21 @@ func mainRun() error {
 	var sdcardW *sdcard.Watcher
 	if diskutilErr == nil && rclonePath != "" {
 		sdcardW = &sdcard.Watcher{
-			DiskutilPath: diskutilPath,
-			RclonePath:   rclonePath,
-			VolumesRoot:  "/Volumes",
-			InboxPath:    config.Inbox,
-			Runner:       ingestPipeline,
-			Logger:       logger,
+			DiskutilPath:  diskutilPath,
+			RclonePath:    rclonePath,
+			VolumesRoot:   "/Volumes",
+			InboxPath:     config.Inbox,
+			Runner:        ingestPipeline,
+			Logger:        logger,
+			DB:            dbConn,
+			OriginalsPath: config.Originals,
+			ReportsDir:    config.ReportsDir,
+			BackupPath:    cs.backupPath,
+			Activity:      tracker,
 		}
+		// Assigned only when non-nil: a typed-nil *Watcher in the interface
+		// would pass the handler's nil check and panic on use.
+		ipcServer.Card = sdcardW
 	}
 
 	rc := &runConfig{

@@ -265,6 +265,15 @@ final class FramelogStatus: ObservableObject {
     // response (PROTOCOL.md §3). nil/empty until the first successful poll.
     @Published private(set) var backupLine: String?
     @Published private(set) var capabilityNotes: [String] = []
+    // Richer reporting (PROTOCOL.md §3 activity / backup / last_card).
+    // All nil until a daemon that reports them answers a status poll.
+    @Published private(set) var activityLine: String?
+    @Published private(set) var activityFile: String?
+    @Published private(set) var lastCard: CardInfo?
+    @Published private(set) var backupProblem: String?
+    @Published private(set) var backupPending = false
+    @Published private(set) var verifyState: ActionState = .idle
+    @Published private(set) var backupRetryState: ActionState = .idle
 
     private var previousCount = 0
     private var previousLastImport: String?
@@ -274,6 +283,12 @@ final class FramelogStatus: ObservableObject {
     // app launch.
     private var hasSeededCounters = false
     private var timer: Timer?
+    private var timerInterval: TimeInterval = 0
+    // Same seeding rule as the photo counters: the card report and backup
+    // run already on disk at launch are not news.
+    private var hasSeededReports = false
+    private var lastSeenCardID: Int?
+    private var lastSeenBackupRunAt: String?
 
     // Version stamped into the app bundle at build time — same source as framelogd's
     // -ldflags Version. Used to detect when an upgrade replaced the bundle but the
@@ -286,10 +301,21 @@ final class FramelogStatus: ObservableObject {
     init() {
         requestNotificationPermissionIfNeeded()
         refreshLoginItemStatus()
-        refresh()
-        // 15-second poll matches PROTOCOL.md §4 — don't change this number.
-        timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
-            self?.refresh()
+        scheduleTimer(busy: false)
+        refresh()  // may switch to the fast cadence if the core is busy
+    }
+
+    // Poll cadence (PROTOCOL.md §5): 15 s when idle — don't change that
+    // number — and 2 s while the core reports activity, so copy / verify
+    // progress in the open menu actually moves. Notifications only fire on
+    // transitions, so the faster cadence can't spam them.
+    private func scheduleTimer(busy: Bool) {
+        let interval: TimeInterval = busy ? 2 : 15
+        guard interval != timerInterval else { return }
+        timerInterval = interval
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
         }
     }
 
@@ -356,6 +382,7 @@ final class FramelogStatus: ObservableObject {
         // capability flags, and the daemon version. Unreachable core → keep
         // the previous displayed values.
         guard coreReachable, let status = fetchStatus(socketPath: FramelogPaths.socket.path) else {
+            scheduleTimer(busy: false)
             return
         }
 
@@ -365,14 +392,23 @@ final class FramelogStatus: ObservableObject {
 
         // A daemon predating these fields (no "capabilities" key) shows no
         // backup line at all rather than a wrong "Backup not set up".
+        let backupConfigured = status["backup_configured"] as? Bool ?? false
+        let backupInfo = BackupInfo(json: status["backup"] as? [String: Any])
         if let caps = status["capabilities"] as? [String: Any] {
-            backupLine = backupStatusLine(
+            var line = backupStatusLine(
                 rcloneAvailable: caps["backup"] as? Bool ?? true,
-                configured: status["backup_configured"] as? Bool ?? false,
+                configured: backupConfigured,
                 mounted: status["backup_drive_mounted"] as? Bool ?? false
             )
+            if backupConfigured, let backupInfo { line += lastBackupSuffix(backupInfo) }
+            backupLine = line
             capabilityNotes = capabilityWarnings(caps)
         }
+        applyReports(
+            activity: ActivityInfo(json: status["activity"] as? [String: Any]),
+            backup: backupInfo,
+            backupConfigured: backupConfigured,
+            card: CardInfo(json: status["last_card"] as? [String: Any]))
 
         if !hasAutoInstalled, let expected = bundledVersion,
             let running = status["daemon_version"] as? String,
@@ -381,6 +417,98 @@ final class FramelogStatus: ObservableObject {
             hasAutoInstalled = true
             installCore()
         }
+    }
+
+    // MARK: Card + backup reporting
+
+    private func applyReports(
+        activity: ActivityInfo?, backup: BackupInfo?, backupConfigured: Bool, card: CardInfo?
+    ) {
+        if let activity {
+            activityLine = activityDisplayLine(activity)
+            activityFile = activity.isBusy ? activity.currentFile : nil
+        } else {
+            activityLine = nil
+            activityFile = nil
+        }
+        scheduleTimer(busy: activity?.isBusy ?? false)
+
+        backupProblem = backup.flatMap { backupProblemLine($0, configured: backupConfigured) }
+        backupPending = backupConfigured && (backup?.pending ?? false)
+        lastCard = card
+
+        // Notify on transitions only, never for what was already on disk.
+        if hasSeededReports {
+            if let card, card.id != lastSeenCardID {
+                let n = cardNotification(card)
+                postNotification(title: n.title, body: n.body)
+            }
+            if let backup, !backup.lastRunAt.isEmpty, backup.lastRunAt != lastSeenBackupRunAt,
+                let n = backupFailureNotification(backup)
+            {
+                postNotification(title: n.title, body: n.body)
+            }
+        }
+        hasSeededReports = true
+        lastSeenCardID = card?.id ?? lastSeenCardID
+        lastSeenBackupRunAt = backup?.lastRunAt ?? lastSeenBackupRunAt
+    }
+
+    // Re-checks the mounted card end to end (verify_card). Runs for as long
+    // as re-reading the card takes, so no 5 s socket timeout here.
+    func verifyCard() {
+        guard !verifyState.isRunning else { return }
+        verifyState = .running
+        Task.detached {
+            let json = sendSocketCommand(
+                socketPath: FramelogPaths.socket.path,
+                payload: "{\"command\":\"verify_card\"}", timeout: 4 * 3600)
+            await MainActor.run {
+                self.verifyState = .finished(verifyResultMessage(json))
+                self.refresh()
+                self.clearActionStateLater {
+                    // Only clear a stale result, never a re-run in progress.
+                    if case .finished = $0.verifyState { $0.verifyState = .idle }
+                }
+            }
+        }
+    }
+
+    // Runs the library backup now (backup_now) — the "Retry Backup" action.
+    func retryBackup() {
+        guard !backupRetryState.isRunning else { return }
+        backupRetryState = .running
+        Task.detached {
+            let json = sendSocketCommand(
+                socketPath: FramelogPaths.socket.path,
+                payload: "{\"command\":\"backup_now\"}", timeout: 4 * 3600)
+            await MainActor.run {
+                self.backupRetryState = .finished(backupNowMessage(json))
+                self.refresh()
+                self.clearActionStateLater {
+                    if case .finished = $0.backupRetryState { $0.backupRetryState = .idle }
+                }
+            }
+        }
+    }
+
+    // Results stay visible long enough to read when the menu is reopened.
+    private func clearActionStateLater(_ reset: @escaping (FramelogStatus) -> Void) {
+        Task {
+            try? await Task.sleep(for: .seconds(60))
+            reset(self)
+        }
+    }
+
+    func openLastCardReport() {
+        guard let path = lastCard?.reportPath else { return }
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    }
+
+    func openReportsFolder() {
+        try? FileManager.default.createDirectory(
+            at: FramelogPaths.reportsDir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(FramelogPaths.reportsDir)
     }
 
     // MARK: Notifications (FL-405)
@@ -396,9 +524,14 @@ final class FramelogStatus: ObservableObject {
     }
 
     private func fireImportNotification(oldCount: Int, newCount: Int) {
+        postNotification(
+            title: "Framelog", body: importDeltaMessage(oldCount: oldCount, newCount: newCount))
+    }
+
+    private func postNotification(title: String, body: String) {
         let content = UNMutableNotificationContent()
-        content.title = "Framelog"
-        content.body = importDeltaMessage(oldCount: oldCount, newCount: newCount)
+        content.title = title
+        content.body = body
         let req = UNNotificationRequest(
             identifier: UUID().uuidString, content: content, trigger: nil)
         Task { try? await UNUserNotificationCenter.current().add(req) }

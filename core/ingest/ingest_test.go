@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/thevedantmodi/framelog/core/activity"
 	"github.com/thevedantmodi/framelog/core/config"
 	"github.com/thevedantmodi/framelog/core/db"
 	"github.com/thevedantmodi/framelog/core/hasher"
@@ -944,5 +945,162 @@ func TestRunIngest_ImportsClipsAndIgnoresSidecarAsPhoto(t *testing.T) {
 	}
 	if n != 2 {
 		t.Errorf("photo_count = %d, want 2 — the sidecar must not become a row", n)
+	}
+}
+
+// ---- backup reporting --------------------------------------------------------
+
+// fakeFailingRclone simulates a full backup drive: one per-file error in
+// rclone's JSON log and a non-zero exit. counterFile counts invocations.
+func fakeFailingRclone(t *testing.T, binDir, counterFile string) string {
+	t.Helper()
+	return writeFakeBin(t, binDir, "rclone", `echo x >> `+counterFile+`
+cat >&2 <<'EOF2'
+{"level":"error","msg":"Failed to copy: write: no space left on device","object":"2026/06/22/a.raf"}
+EOF2
+exit 1`)
+}
+
+func countLines(t *testing.T, path string) int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	return strings.Count(string(b), "\n")
+}
+
+func TestRunIngest_BackupFailureIsRecordedAndExplained(t *testing.T) {
+	p, inbox, logPath := newPipeline(t, fakeExiftoolScript(testModel, testDate, testLat, testLon))
+	counter := filepath.Join(t.TempDir(), "calls")
+	p.RclonePath = fakeFailingRclone(t, t.TempDir(), counter)
+	p.BackupPath = t.TempDir()
+
+	writePhoto(t, inbox, "photo.raf")
+	if _, err := p.RunIngest(); err != nil {
+		t.Fatalf("RunIngest: %v", err)
+	}
+
+	last, err := db.LastBackupRun(p.DB)
+	if err != nil || last == nil {
+		t.Fatalf("LastBackupRun = %v, %v", last, err)
+	}
+	if last.Outcome != db.BackupFailed || last.Error != "Backup drive is full" || last.FilesFailed != 1 {
+		t.Errorf("backup run = %+v", *last)
+	}
+	if last.Destination != p.BackupPath {
+		t.Errorf("Destination = %q", last.Destination)
+	}
+	joined := strings.Join(readLines(t, logPath), "\n")
+	for _, want := range []string{"FAILED: Backup drive is full", "not backed up: 2026/06/22/a.raf"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("log missing %q:\n%s", want, joined)
+		}
+	}
+
+	// A later ingest with nothing new to import still retries the backup.
+	if _, err := p.RunIngest(); err != nil {
+		t.Fatal(err)
+	}
+	if n := countLines(t, counter); n != 2 {
+		t.Errorf("rclone calls = %d, want 2 (failed backup must be retried)", n)
+	}
+}
+
+func TestRunIngest_SuccessfulBackupIsNotRepeatedWithoutImports(t *testing.T) {
+	p, inbox, _ := newPipeline(t, fakeExiftoolScript(testModel, testDate, testLat, testLon))
+	counter := filepath.Join(t.TempDir(), "calls")
+	p.RclonePath = writeFakeBin(t, t.TempDir(), "rclone", `echo x >> `+counter)
+	p.BackupPath = t.TempDir()
+
+	writePhoto(t, inbox, "photo.raf")
+	if _, err := p.RunIngest(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.RunIngest(); err != nil {
+		t.Fatal(err)
+	}
+	if n := countLines(t, counter); n != 1 {
+		t.Errorf("rclone calls = %d, want 1", n)
+	}
+	last, _ := db.LastBackupRun(p.DB)
+	if last == nil || last.Outcome != db.BackupOK {
+		t.Errorf("last run = %+v", last)
+	}
+
+	// Pointing at a new drive makes the backup pending again.
+	p.SetBackupPath(t.TempDir())
+	if _, err := p.RunIngest(); err != nil {
+		t.Fatal(err)
+	}
+	if n := countLines(t, counter); n != 2 {
+		t.Errorf("rclone calls after destination change = %d, want 2", n)
+	}
+}
+
+func TestRunIngest_UnpluggedDriveRecordedAsDriveMissing(t *testing.T) {
+	p, inbox, _ := newPipeline(t, fakeExiftoolScript(testModel, testDate, testLat, testLon))
+	p.RclonePath = writeFakeBin(t, t.TempDir(), "rclone", "exit 0")
+	p.BackupPath = "/nonexistent/backup"
+
+	writePhoto(t, inbox, "photo.raf")
+	if _, err := p.RunIngest(); err != nil {
+		t.Fatal(err)
+	}
+	last, _ := db.LastBackupRun(p.DB)
+	if last == nil || last.Outcome != db.BackupDriveMissing {
+		t.Errorf("last run = %+v, want drive_missing", last)
+	}
+}
+
+func TestRunBackup(t *testing.T) {
+	p, _, _ := newPipeline(t, fakeExiftoolScript(testModel, testDate, testLat, testLon))
+	if err := db.InitDB(p.DB); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := p.RunBackup(); err != ErrBackupNotConfigured {
+		t.Errorf("unconfigured err = %v", err)
+	}
+
+	p.BackupPath = t.TempDir()
+	p.RclonePath = ""
+	run, err := p.RunBackup()
+	if err != nil || run.Outcome != db.BackupRcloneMissing {
+		t.Errorf("no rclone: run=%+v err=%v", run, err)
+	}
+
+	p.RclonePath = writeFakeBin(t, t.TempDir(), "rclone",
+		`echo '{"level":"info","msg":"Copied (new)","object":"2026/a.raf"}' >&2`)
+	run, err = p.RunBackup()
+	if err != nil || run.Outcome != db.BackupOK || run.FilesCopied != 1 {
+		t.Errorf("ok: run=%+v err=%v", run, err)
+	}
+
+	if !p.TryAcquire() {
+		t.Fatal("TryAcquire")
+	}
+	if _, err := p.RunBackup(); err != ErrIngestAlreadyRunning {
+		t.Errorf("concurrent err = %v", err)
+	}
+	p.Release()
+
+	p.Pause()
+	if _, err := p.RunBackup(); err != ErrIngestPaused {
+		t.Errorf("paused err = %v", err)
+	}
+}
+
+func TestRunIngest_ReportsActivity(t *testing.T) {
+	p, inbox, _ := newPipeline(t, fakeExiftoolScript(testModel, testDate, testLat, testLon))
+	p.Activity = &activity.Tracker{}
+	// The fake exiftool runs mid-import; snapshotting from it is racy, so
+	// instead assert the tracker ends idle (deferred reset ran).
+	writePhoto(t, inbox, "a.raf")
+	if _, err := p.RunIngest(); err != nil {
+		t.Fatal(err)
+	}
+	if ph := p.Activity.Snapshot().Phase; ph != activity.PhaseIdle {
+		t.Errorf("phase after run = %q, want idle", ph)
 	}
 }
