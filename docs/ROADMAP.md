@@ -204,6 +204,9 @@ Lightroom's relationship to `originals/`.
   "N new · M already imported" seconds after insertion; only new files are copied.
   Full-hash verification still decides the verdict and catches a wrong quick match.
   See `PROTOCOL.md §11`.
+- **FL-708 ✓ — End-to-end simulator** — `core/sim` + `make sim`: the real pipeline
+  against a generated α7C II card with fake macOS tools, nine narrated scenarios,
+  also run in CI as `go test ./sim`.
 - **FL-707 ✓ — Configurable file types** — known camera types (all on by default) can be
   switched off; custom extensions can be added; switched-off types are "ignored" on the
   card report. `set_import_types`, `PROTOCOL.md §12`.

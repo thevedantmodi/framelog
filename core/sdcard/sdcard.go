@@ -428,7 +428,14 @@ func (w *Watcher) processCard(name, volPath string) {
 	// file that is not really in the library, that file was skipped by the
 	// copy and verification reports it as not imported. Copy those once
 	// and check again, so a wrong hint costs time, never a lost photo.
-	rep, err := w.check(name, volPath, uuid, sessionStart, copyProblems)
+	var copiedSet map[string]bool
+	if preview != nil {
+		copiedSet = make(map[string]bool, len(preview.New))
+		for _, f := range preview.New {
+			copiedSet[f.RelPath] = true
+		}
+	}
+	rep, err := w.check(name, volPath, uuid, sessionStart, copyProblems, copiedSet)
 	if err != nil {
 		w.Logger.Log(logging.PrefixCore, fmt.Sprintf("card verification error: %v", err))
 		return
@@ -438,8 +445,11 @@ func (w *Watcher) processCard(name, volPath string) {
 			w.Logger.Log(logging.PrefixCore, fmt.Sprintf(
 				"quick check missed %d file(s) not in the library — copying them now", len(missed)))
 			copyProblems = append(copyProblems, w.copyListed(name, volPath, missed)...)
+			for _, f := range missed {
+				copiedSet[f.RelPath] = true
+			}
 			w.runIngestWaiting()
-			if rep, err = w.check(name, volPath, uuid, sessionStart, copyProblems); err != nil {
+			if rep, err = w.check(name, volPath, uuid, sessionStart, copyProblems, copiedSet); err != nil {
 				w.Logger.Log(logging.PrefixCore, fmt.Sprintf("card verification error: %v", err))
 				return
 			}
@@ -653,7 +663,7 @@ func (w *Watcher) runIngestWaiting() {
 
 // check runs cardverify against the card and returns the unsaved report.
 // Caller holds cardMu.
-func (w *Watcher) check(name, volPath, uuid string, sessionStart time.Time, extra []string) (*cardverify.Report, error) {
+func (w *Watcher) check(name, volPath, uuid string, sessionStart time.Time, extra []string, copied map[string]bool) (*cardverify.Report, error) {
 	backupPath := ""
 	if w.BackupPath != nil {
 		backupPath = w.BackupPath()
@@ -665,14 +675,15 @@ func (w *Watcher) check(name, volPath, uuid string, sessionStart time.Time, extr
 	w.Logger.Log(logging.PrefixCore, fmt.Sprintf("verifying card %s against %s", name, target))
 	w.Activity.Start(activity.PhaseVerifying, name, 0)
 	return cardverify.Verify(cardverify.Options{
-		VolumePath:    volPath,
-		VolumeName:    name,
-		VolumeUUID:    uuid,
-		DB:            w.DB,
-		OriginalsPath: w.OriginalsPath,
-		BackupPath:    backupPath,
-		SessionStart:  sessionStart,
-		ExtraProblems: extra,
+		VolumePath:        volPath,
+		VolumeName:        name,
+		VolumeUUID:        uuid,
+		DB:                w.DB,
+		OriginalsPath:     w.OriginalsPath,
+		BackupPath:        backupPath,
+		SessionStart:      sessionStart,
+		ExtraProblems:     extra,
+		CopiedThisSession: copied,
 		Progress: func(done, total int, file string) {
 			w.Activity.SetTotal(total)
 			w.Activity.Step(done, file)
@@ -729,7 +740,7 @@ func (w *Watcher) VerifyMounted() (db.CardReport, error) {
 		return db.CardReport{}, ErrNoCard
 	}
 	name := filepath.Base(volPath)
-	rep, err := w.check(name, volPath, VolumeUUID(w.DiskutilPath, volPath), time.Time{}, nil)
+	rep, err := w.check(name, volPath, VolumeUUID(w.DiskutilPath, volPath), time.Time{}, nil, nil)
 	if err != nil {
 		return db.CardReport{}, err
 	}

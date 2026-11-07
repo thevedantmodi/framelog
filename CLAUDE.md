@@ -31,6 +31,8 @@ core/         Go module (github.com/thevedantmodi/framelog/core)
   outgest/          RunOutgest; concurrency guard
   outgestwatcher/   fsnotify watcher for processed/; debounce
   rclonerun/        shared rclone JSON-log runner; per-file errors; Explain
+  sim/              end-to-end simulator: fake card + fake tools, real pipeline
+  cmd/framelog-sim/ CLI for sim (make sim)
   sdcard/           /Volumes watcher; diskutil check; DCIM + XAVC CLIP copy;
                     copy → ingest → verify card run; VerifyMounted
   triggerwatcher/   2s poll for .ingest_trigger / .outgest_trigger
@@ -78,7 +80,17 @@ go test ./... -race
 
 # Test a single package verbosely:
 go test ./ipc/... -race -v
+
+# See the whole pipeline work end to end, no SD card needed (narrated):
+make sim                      # or: go run ./cmd/framelog-sim -v
 ```
+
+`core/sim` drives the real watcher → preview → copy → ingest → backup →
+verify path and the IPC socket against a generated Sony card in a sandbox,
+with fake diskutil/exiftool/rclone/pmset (`-real-rclone` for the installed
+one). Its scenarios also run as `go test ./sim` in CI. When you change card,
+backup or verification behaviour, add or update a scenario in
+`core/sim/scenarios.go` — it is the closest thing to inserting a real card.
 
 ## Key design decisions (don't re-litigate without reading the rationale)
 

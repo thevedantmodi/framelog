@@ -140,6 +140,11 @@ type Options struct {
 	// at or after it count as "new" in the report. Zero means there was no
 	// import session (an on-demand re-verify): nothing counts as new.
 	SessionStart time.Time
+	// CopiedThisSession, when non-nil, holds the RelPaths this card run
+	// copied off the card. A file then counts as new only if it is in the
+	// set and was imported since SessionStart — so a re-insert straight
+	// after an import (same second) is not miscounted as all-new.
+	CopiedThisSession map[string]bool
 	// ExtraProblems are failures the caller already knows about (e.g. an
 	// rclone error while copying the card) — included verbatim. They are
 	// context, not a verdict: the per-file check decides SafeToFormat.
@@ -332,7 +337,8 @@ func Verify(opts Options) (*Report, error) {
 		r.LibraryPath = entry.ImportedPath
 		r.CaptureDate = entry.CaptureDate
 		r.CameraModel = entry.CameraModel
-		if ts, err := time.Parse(time.RFC3339, entry.ImportTimestamp); err == nil && !sessionStart.IsZero() {
+		copied := opts.CopiedThisSession == nil || opts.CopiedThisSession[f.RelPath]
+		if ts, err := time.Parse(time.RFC3339, entry.ImportTimestamp); err == nil && !sessionStart.IsZero() && copied {
 			// import_timestamp has second resolution; truncate the session
 			// start the same way so a file imported in the session's first
 			// second still counts as new.

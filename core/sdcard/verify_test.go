@@ -361,10 +361,8 @@ func TestProcessCard_PreviewThenCopiesOnlyNewFiles(t *testing.T) {
 		t.Error("preview should stay available while the card is mounted")
 	}
 
-	// Shoot two more frames and re-insert: only those are copied. "New" in
-	// the report is decided by import time at one-second resolution, so
-	// keep the two sessions in different seconds as real ones always are.
-	time.Sleep(1100 * time.Millisecond)
+	// Shoot two more frames and re-insert straight away: only those are
+	// copied, and only those count as new even within the same second.
 	env.put(t, "DCIM/100MSDCF/DSC00003.ARW", "arw-3")
 	env.put(t, "PRIVATE/M4ROOT/CLIP/C0002.MP4", "mp4-2")
 	env.put(t, "PRIVATE/M4ROOT/CLIP/C0002M01.XML", "<xml2/>")

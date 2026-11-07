@@ -163,6 +163,23 @@ huge photo library.
 
 ---
 
+## Trying it without a card (for development)
+
+```bash
+cd core && make sim
+```
+
+This runs the real pipeline against a generated Sony α7C II card in a
+throwaway folder — no SD card, reader, or photos needed — and walks through
+nine situations: a fresh card, re-inserting it, shooting more, the backup
+drive unplugged, the backup drive full, a corrupted library file, an
+unknown file type, switching JPEG off, and the quick check guessing wrong.
+Each one prints what Framelog decided and whether that was right. Add `-v`
+(`make sim ARGS=-v`) to watch the log as it's written, `-real-rclone` to use
+your installed rclone, and `-keep` to keep the sandbox afterwards.
+
+---
+
 ## Troubleshooting
 
 **"Core restarting…" won't go away.**

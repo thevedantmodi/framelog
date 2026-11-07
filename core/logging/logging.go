@@ -42,6 +42,9 @@ const timestampFormat = "2006-01-02 15:04:05"
 type Logger struct {
 	mu   sync.Mutex
 	file *os.File
+	// echo receives a copy of every line; os.Stdout unless SetEcho changed
+	// it. nil means file only.
+	echo io.Writer
 }
 
 // New opens path in append+create mode and returns a Logger backed by that
@@ -53,7 +56,7 @@ func New(path string) (*Logger, error) {
 	if err != nil {
 		return nil, fmt.Errorf("logging.New: %w", err)
 	}
-	return &Logger{file: f}, nil
+	return &Logger{file: f, echo: os.Stdout}, nil
 }
 
 // Log writes one line — "TIMESTAMP [PREFIX] message\n" — to both stdout and
@@ -73,7 +76,9 @@ func (l *Logger) Log(prefix Prefix, message string) {
 
 	// Write to stdout first so the line is visible even if the file write
 	// fails; ignore the error — stdout failure is not actionable here.
-	io.WriteString(os.Stdout, line) //nolint:errcheck
+	if l.echo != nil {
+		io.WriteString(l.echo, line) //nolint:errcheck
+	}
 
 	if _, err := fmt.Fprint(l.file, line); err != nil {
 		// Log to stderr so we don't silently swallow the failure, but don't
@@ -84,6 +89,15 @@ func (l *Logger) Log(prefix Prefix, message string) {
 	if err := l.file.Sync(); err != nil {
 		fmt.Fprintf(os.Stderr, "logging: sync failed: %v\n", err)
 	}
+}
+
+// SetEcho changes where lines are echoed besides the log file (default
+// os.Stdout); nil echoes nowhere. The simulator uses it to keep its own
+// narration readable.
+func (l *Logger) SetEcho(w io.Writer) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.echo = w
 }
 
 // Close flushes and closes the backing file. Safe to call exactly once.
