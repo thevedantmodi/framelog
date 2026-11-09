@@ -13,8 +13,12 @@ historical — do not restore them.
 ```
 core/         Go module (github.com/thevedantmodi/framelog/core)
   cmd/framelogd/    main package: run/install/uninstall/--version
-  backup/           rclone wrapper; IsDriveMounted
-  config/           all paths and constants (single source of truth)
+  activity/         live progress tracker (phase/done/total) read by status
+  backup/           rclone wrapper; IsDriveMounted; DestDir
+  cardverify/       end-to-end "safe to format" check, instant card preview,
+                    quick-hash backfill, plain-text receipts
+  config/           all paths and constants (single source of truth);
+                    filetypes.go = runtime-settable import types
   db/               SQLite schema + queries
   exif/             exiftool subprocess wrapper
   gitops/           git CLI wrapper; pmset AC-power check
@@ -26,7 +30,11 @@ core/         Go module (github.com/thevedantmodi/framelog/core)
   nrtmeta/          Sony NonRealTimeMeta XML sidecar parser (XAVC clips)
   outgest/          RunOutgest; concurrency guard
   outgestwatcher/   fsnotify watcher for processed/; debounce
-  sdcard/           /Volumes watcher; diskutil check; DCIM + XAVC CLIP copy
+  rclonerun/        shared rclone JSON-log runner; per-file errors; Explain
+  sim/              end-to-end simulator: fake card + fake tools, real pipeline
+  cmd/framelog-sim/ CLI for sim (make sim)
+  sdcard/           /Volumes watcher; diskutil check; DCIM + XAVC CLIP copy;
+                    copy → ingest → verify card run; VerifyMounted
   triggerwatcher/   2s poll for .ingest_trigger / .outgest_trigger
   xmp/              sidecar writer
   xmpwatcher/       fsnotify watcher for originals/; debounce+commit
@@ -72,7 +80,17 @@ go test ./... -race
 
 # Test a single package verbosely:
 go test ./ipc/... -race -v
+
+# See the whole pipeline work end to end, no SD card needed (narrated):
+make sim                      # or: go run ./cmd/framelog-sim -v
 ```
+
+`core/sim` drives the real watcher → preview → copy → ingest → backup →
+verify path and the IPC socket against a generated Sony card in a sandbox,
+with fake diskutil/exiftool/rclone/pmset (`-real-rclone` for the installed
+one). Its scenarios also run as `go test ./sim` in CI. When you change card,
+backup or verification behaviour, add or update a scenario in
+`core/sim/scenarios.go` — it is the closest thing to inserting a real card.
 
 ## Key design decisions (don't re-litigate without reading the rationale)
 
@@ -121,16 +139,24 @@ than `t.TempDir()` (which produces long paths under the test cache). See
 - `outgestwatcher` watches only the top-level `processed/` directory, never
   subdirectories. Deliberate: `YYYY/MM/` folders created by a prior outgest run
   must not trigger a re-scan of already-organised files.
-- `outgest` and `outgestwatcher` filter on `config.OutgestExtensions`, while
-  `ingest` and `sdcard` filter on `config.SupportedExtensions`. Deliberate: the
-  export list is a superset (currently just PNG). PNG exports must be filed
-  into `processed/YYYY/MM/` but must never be imported into `originals/` and
-  git-tracked. Kept narrow on purpose: outgest sets `status="published"`, so
-  working files (`.psb`/`.psd`) and intermediates (`.jxl`) stay out — they
-  share the export's hash8 prefix and would republish the same row.
-  `OutgestExtensions` is derived from `SupportedExtensions` in an `init`, so
-  the two can't drift; export-only entries go in `outgestOnlyExtensions`.
-  Tests in `core/config/config_test.go` pin both directions.
+- File types live in `config/filetypes.go` behind accessors, not a map: the
+  import set is user-settable at runtime (`set_import_types`), so read it with
+  `config.IsImportable` / `config.ImportExtensions()`, never cache it.
+  `outgest`/`outgestwatcher` use `config.IsOutgestExtension`, which is every
+  known type + every imported type + export-only types (just PNG). PNG
+  exports are filed but never imported; working files (`.psb`/`.psd`/`.jxl`)
+  stay out because outgest sets `status="published"` and they share the
+  export's hash8 prefix. Tests in `core/config/config_test.go` pin this.
+- Every `KnownMediaTypes` entry defaults to imported. Deliberate: a known
+  type the user switched off is "ignored" (doesn't block safe-to-format), so a
+  type that started off would be dropped without the user ever choosing.
+- The card preview uses a quick hash (size + first/last 64 KiB) and decides
+  what gets copied, but never the verdict — full SHA-256 verification does.
+  A wrong quick match is caught by verification and the skipped files are
+  copied in the same run. See PROTOCOL.md §11.
+- Settings are persisted with `config.UpdateUserConfig` (read-modify-write),
+  never `WriteUserConfig` with a fresh struct, so one setting can't reset
+  another.
 - Sony XAVC clips are read from `PRIVATE/M4ROOT/CLIP/`, not `DCIM/`, and their
   `C####M01.XML` sidecar overrides exiftool for capture date and camera model.
   Deliberate: the MP4 container stores only a UTC `CreateDate` with no offset,
@@ -145,6 +171,23 @@ than `t.TempDir()` (which produces long paths under the test cache). See
   the wire JSON `"error"` field exactly (`"ingest_already_running"` /
   `"outgest_already_running"`). The IPC handler uses `err.Error()` directly as
   the JSON value — no mapping table.
+- Card verification re-reads every file on the card and re-hashes the
+  library and backup copies instead of trusting rclone's exit code, the
+  inbox copy, or the catalog. Deliberate: the whole point is a verdict the
+  user can format on. It looks files up by content hash, so it is
+  indifferent to how a file reached the library. See PROTOCOL.md §10.
+- A configured-but-unplugged backup drive makes the card verdict "don't
+  format", while no backup configured at all is only a note. Deliberate:
+  a configured backup means the user asked for two copies, and only one is
+  provable. `unhandled` file types on the card also block — formatting
+  would silently destroy them.
+- `.hif` is a known (default-on) type: Sony bodies (incl. the α7C II) name
+  HEIF stills `.HIF`, not `.HEIC`. Without it a HEIF card would never be
+  imported and the verifier would flag every still as unhandled.
+- Ingest retries a pending backup (failed / drive missing / destination
+  changed) even when nothing new was imported, and records every attempt
+  in `backup_runs`. `RunBackup` shares ingest's running flag so a backup
+  never overlaps an import.
 - The launchd plist is re-generated on every `framelogd install`, not cached.
   This ensures the plist always references the current executable path even if
   you moved or rebuilt the binary.

@@ -218,3 +218,114 @@ func TestReadOnlyRejectsWrites(t *testing.T) {
 		t.Fatal("expected write through read-only connection to fail, got nil")
 	}
 }
+
+func TestCardReport_RoundTrip(t *testing.T) {
+	conn := openReportTestDB(t)
+
+	if r, err := LastCardReport(conn); err != nil || r != nil {
+		t.Fatalf("empty LastCardReport = %v, %v; want nil, nil", r, err)
+	}
+
+	in := CardReport{
+		VolumeName: "Untitled", VolumeUUID: "UUID-1",
+		StartedAt: "2026-11-07T10:00:00Z", FinishedAt: "2026-11-07T10:05:00Z",
+		FilesTotal: 2, BytesTotal: 99, FilesVerified: 1, FilesProblem: 1,
+		FilesNew: 1, FileTypes: "ARW 2", CameraModels: "ILCE-7CM2",
+		CaptureFirst: "2026:11:06 18:00:00", CaptureLast: "2026:11:06 19:00:00",
+		BackupState: "verified", SafeToFormat: false,
+		Problems:   []string{"1 file is not in the library", "second line"},
+		ReportPath: "/r.txt",
+	}
+	files := []CardReportFile{
+		{CardPath: "DCIM/100MSDCF/DSC00001.ARW", Size: 50, Hash: "aa", State: "verified"},
+		{CardPath: "DCIM/100MSDCF/DSC00002.ARW", Size: 49, Hash: "bb", State: "not_in_library"},
+	}
+	id, err := InsertCardReport(conn, in, files)
+	if err != nil {
+		t.Fatalf("InsertCardReport: %v", err)
+	}
+
+	got, err := LastCardReport(conn)
+	if err != nil || got == nil {
+		t.Fatalf("LastCardReport: %v, %v", got, err)
+	}
+	in.ID = id
+	if got.ID != in.ID || got.VolumeName != in.VolumeName || got.SafeToFormat != in.SafeToFormat ||
+		got.FilesProblem != 1 || len(got.Problems) != 2 || got.Problems[1] != "second line" ||
+		got.ReportPath != "/r.txt" || got.BytesTotal != 99 || got.FilesNew != 1 ||
+		got.FileTypes != "ARW 2" || got.CameraModels != "ILCE-7CM2" ||
+		got.CaptureLast != "2026:11:06 19:00:00" {
+		t.Errorf("round trip mismatch:\n got %+v\nwant %+v", *got, in)
+	}
+
+	var n int
+	conn.QueryRow("SELECT COUNT(*) FROM card_report_files WHERE report_id = ?", id).Scan(&n)
+	if n != 2 {
+		t.Errorf("card_report_files rows = %d, want 2", n)
+	}
+}
+
+func TestBackupRuns(t *testing.T) {
+	conn := openReportTestDB(t)
+
+	if r, err := LastBackupRun(conn); err != nil || r != nil {
+		t.Fatalf("empty LastBackupRun = %v, %v", r, err)
+	}
+	if ts, err := LastSuccessfulBackupAt(conn); err != nil || ts != "" {
+		t.Fatalf("empty LastSuccessfulBackupAt = %q, %v", ts, err)
+	}
+
+	must := func(r BackupRun) {
+		t.Helper()
+		if err := InsertBackupRun(conn, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(BackupRun{StartedAt: "a", FinishedAt: "2026-11-01T00:00:00Z", Outcome: BackupOK, FilesCopied: 4})
+	must(BackupRun{StartedAt: "b", FinishedAt: "2026-11-02T00:00:00Z", Outcome: BackupFailed,
+		FilesFailed: 2, Error: "Backup drive is full"})
+
+	last, err := LastBackupRun(conn)
+	if err != nil || last == nil {
+		t.Fatal(err)
+	}
+	if last.Outcome != BackupFailed || last.Error != "Backup drive is full" || last.FilesFailed != 2 {
+		t.Errorf("LastBackupRun = %+v", *last)
+	}
+	ts, _ := LastSuccessfulBackupAt(conn)
+	if ts != "2026-11-01T00:00:00Z" {
+		t.Errorf("LastSuccessfulBackupAt = %q", ts)
+	}
+}
+
+func TestLibraryEntryByHash(t *testing.T) {
+	conn := openReportTestDB(t)
+	model := "ILCE-7CM2"
+	if err := InsertPhoto(conn, Photo{Hash: "h1", ImportedPath: "/o/a.arw",
+		ImportTimestamp: "2026-11-07T10:00:00Z", CaptureDate: "2026:11:06 18:00:00",
+		CameraModel: &model}); err != nil {
+		t.Fatal(err)
+	}
+	e, ok, err := LibraryEntryByHash(conn, "h1")
+	want := LibraryEntry{ImportedPath: "/o/a.arw", ImportTimestamp: "2026-11-07T10:00:00Z",
+		CaptureDate: "2026:11:06 18:00:00", CameraModel: "ILCE-7CM2"}
+	if err != nil || !ok || e != want {
+		t.Errorf("LibraryEntryByHash(h1) = %+v, %v, %v", e, ok, err)
+	}
+	if _, ok, err := LibraryEntryByHash(conn, "nope"); err != nil || ok {
+		t.Errorf("LibraryEntryByHash(nope) ok=%v err=%v", ok, err)
+	}
+}
+
+func openReportTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	conn, err := Open(filepath.Join(t.TempDir(), "c.db"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	if err := InitDB(conn); err != nil {
+		t.Fatal(err)
+	}
+	return conn
+}

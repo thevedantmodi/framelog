@@ -38,8 +38,10 @@ will start automatically every time you log in.
 
 Once installed, Framelog runs itself:
 
-1. **Insert an SD card.** Framelog notices it within a couple of seconds,
-   copies everything from `DCIM/` into a staging folder, then imports it:
+1. **Insert an SD card.** Within seconds Framelog tells you what's on it —
+   "Untitled inserted: 312 new files to import, 1,040 already in your
+   library" — and copies only the new files into a staging folder. Then it
+   imports them:
    files are hashed (to catch duplicates), renamed, and sorted into
    `~/Photos/originals/YYYY/MM/DD/`.
     - Each file is named as `YYYYMMDD_HHMMSS_[8letterhash]`.
@@ -57,7 +59,35 @@ Once installed, Framelog runs itself:
 4. **Export from Lightroom into `~/Photos/processed/`.** Framelog notices
    the export and files it into `processed/YYYY/MM/`.
 5. **(Optional) Back up automatically.** If you've set a backup drive (see
-   below), every import is copied there too.
+   below), every import is copied there too. If a backup fails (drive full,
+   unplugged, read-only), the menu says why, you get a notification, and
+   the next import retries it — or click **Retry Backup**.
+6. **Know when the card is safe to format.** After every card import,
+   Framelog re-reads every photo and video on the card and checks it
+   byte-for-byte (SHA-256) against your library *and* your backup drive.
+   You get a notification — **"Untitled is safe to format"** or
+   **"Don't format Untitled yet"** with the reason — and a plain-text
+   receipt in `~/Photos/reports/` listing every file and where it went.
+   No counting photos, no keeping logs.
+
+### Is it safe to format my card?
+
+Look at the card line in the menu: **✓ Untitled: safe to format** means
+every photo and video on the card was found, intact, in your library and
+(if you set one up) on your backup drive. **✗ … don't format yet** means
+something isn't proven safe; hover it for the reasons, e.g.:
+
+- *files are not in the library yet* — an import failed; check
+  `~/Photos/inbox/failed/` or click **Run Ingest Now**.
+- *not on the backup drive yet* — click **Retry Backup**, then
+  **Verify Card Now**.
+- *Backup drive is not connected* — plug it in, then **Verify Card Now**.
+- *a type Framelog doesn't import* — something unexpected is on the card;
+  copy it off by hand before formatting.
+
+**Verify Card Now** re-checks whatever card is inserted without
+re-importing it — handy right before you format, or after plugging the
+backup drive back in. Always format in the camera, not on the Mac.
 
 You generally don't need to open the menu bar app at all — but here's what's
 in it:
@@ -65,7 +95,13 @@ in it:
 | Menu item | What it does |
 |---|---|
 | Status line | Photo count and how long ago the last import happened. See below for what the different messages mean. |
-| Backup line | Whether a backup drive is configured and currently connected. |
+| Activity line | Live progress while a card is copying, importing, backing up, or being verified (e.g. "Verifying Untitled… 120 of 412"). |
+| Card line (✓/✗) | The last card's verdict. Its submenu shows what was copied (file count, size, types, camera, new vs. already imported), where it's verified, any problems, and **Open Card Report**. |
+| Verify Card Now | Re-check the inserted card end to end without re-importing it. |
+| New-files line | While a card is in: how many files are new, how many are already imported, and anything skipped. |
+| File Types | Choose which camera file types are imported (all known types are on by default). Switch off, say, JPEG if you only keep RAW; add your own extension with **Add File Type…**. A type you switch off is skipped and noted on the card report; it doesn't stop the card being "safe to format", because you chose it. |
+| Backup line | Whether a backup drive is configured and connected, and when the last successful backup ran. A ⚠ line explains a failed or pending backup. |
+| Retry Backup | Shown when a backup failed or is pending — copies the library to the drive now. |
 | ⚠ warnings | Shown if an optional feature (SD card detection, backups, etc.) is unavailable — see [Optional features](#optional-features-and-what-happens-without-them) below. |
 | Launch at Login | Whether the menu bar app itself opens automatically at login. |
 | Pause/Resume Framelog | Temporarily stop all automatic imports/exports (e.g. before you unplug a drive). Nothing is lost — pending work runs once you resume. |
@@ -116,6 +152,7 @@ If you installed the DMG directly, get them via Homebrew:
 │   └── failed/             ← files that couldn't be imported after 3 tries (corrupt/unreadable)
 ├── originals/YYYY/MM/DD/   ← your imported photos + edit-history sidecar files
 ├── processed/YYYY/MM/      ← your Lightroom exports, auto-filed by date
+├── reports/                ← one receipt per checked card: verdict + every file and where it went
 ├── catalog.db              ← Framelog's internal database — don't edit by hand
 └── framelog.log            ← plain-text log, useful for troubleshooting
 ```
@@ -123,6 +160,23 @@ If you installed the DMG directly, get them via Homebrew:
 `originals/` is a git repository, but it only tracks the small edit-history
 files (XMP sidecars), not your actual photos — so it stays small even with a
 huge photo library.
+
+---
+
+## Trying it without a card (for development)
+
+```bash
+cd core && make sim
+```
+
+This runs the real pipeline against a generated Sony α7C II card in a
+throwaway folder — no SD card, reader, or photos needed — and walks through
+nine situations: a fresh card, re-inserting it, shooting more, the backup
+drive unplugged, the backup drive full, a corrupted library file, an
+unknown file type, switching JPEG off, and the quick check guessing wrong.
+Each one prints what Framelog decided and whether that was right. Add `-v`
+(`make sim ARGS=-v`) to watch the log as it's written, `-real-rclone` to use
+your installed rclone, and `-keep` to keep the sandbox afterwards.
 
 ---
 

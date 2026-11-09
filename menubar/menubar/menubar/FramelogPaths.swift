@@ -9,6 +9,8 @@ enum FramelogPaths {
     static var framelogLog: URL  { photosDir.appendingPathComponent("framelog.log") }
     static var ingestTrigger: URL  { photosDir.appendingPathComponent(".ingest_trigger") }
     static var outgestTrigger: URL { photosDir.appendingPathComponent(".outgest_trigger") }
+    // Must match config.ReportsDir in the Go core — one receipt per verified card.
+    static var reportsDir: URL     { photosDir.appendingPathComponent("reports") }
 
     // Must match launchd.GeneratePlist's CrashLogPath in the Go core — the
     // plist's StandardOutPath/StandardErrorPath, which only receives uncaught

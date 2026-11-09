@@ -184,6 +184,33 @@ Lightroom's relationship to `originals/`.
   distinguish four states: never installed / restarting (launchd recovering) / no photos /
   normal. See `PROTOCOL.md §4`.
 
+## Phase 7 — Card safety & reporting ✓
+
+- **FL-701 ✓ — End-to-end card verification** — `core/cardverify` re-reads every media
+  file on the card, SHA-256s it, and proves it exists intact in `originals/` and on the
+  backup drive. One `safe_to_format` verdict per card, stored in `card_reports` /
+  `card_report_files`, with a plain-text receipt in `~/Photos/reports/`. Runs after
+  every card import and on demand (`verify_card`). See `PROTOCOL.md §10`.
+- **FL-702 ✓ — Backup failure reporting** — every attempt recorded in `backup_runs`;
+  rclone per-file errors captured and explained in plain English
+  (`rclonerun.Explain`); failed/pending backups retried by the next ingest and by
+  `backup_now` ("Retry Backup").
+- **FL-703 ✓ — Live status** — `core/activity` tracker reports copy / import / backup /
+  verify progress in `status`; the menu bar polls every 2 s while busy.
+- **FL-704 ✓ — Menu bar reporting** — card verdict + details submenu, Verify Card Now,
+  Retry Backup, card and backup-failure notifications.
+- **FL-705 ✓ — Sony HEIF** — `.hif` imported (α7C II and other Sony bodies).
+- **FL-706 ✓ — Instant card preview** — quick hash (size + first/last 64 KiB) shows
+  "N new · M already imported" seconds after insertion; only new files are copied.
+  Full-hash verification still decides the verdict and catches a wrong quick match.
+  See `PROTOCOL.md §11`.
+- **FL-708 ✓ — End-to-end simulator** — `core/sim` + `make sim`: the real pipeline
+  against a generated α7C II card with fake macOS tools, nine narrated scenarios,
+  also run in CI as `go test ./sim`.
+- **FL-707 ✓ — Configurable file types** — known camera types (all on by default) can be
+  switched off; custom extensions can be added; switched-off types are "ignored" on the
+  card report. `set_import_types`, `PROTOCOL.md §12`.
+
 ### Pending (FL-404 follow-up)
 
 - **Socket migration for Swift buttons** — "Run Ingest Now" / "Run Outgest Now" currently

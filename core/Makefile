@@ -1,10 +1,16 @@
-.PHONY: build test clean reset
+.PHONY: build test sim clean reset
 
 build:
 	go build -o framelogd ./cmd/framelogd
 
 test:
 	go test ./... -race
+
+# Run the real pipeline end to end against a fake α7C II card in a temp
+# sandbox — no SD card, reader, or photos needed. Pass flags with ARGS,
+# e.g. make sim ARGS="-v -only backup-full".
+sim:
+	go run ./cmd/framelog-sim $(ARGS)
 
 clean: reset
 	rm -f framelogd

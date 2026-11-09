@@ -53,6 +53,13 @@ func IsDriveMounted(backupPath string) bool {
 	return err == nil && fi.IsDir()
 }
 
+// DestDir is where Sync puts the library on the backup drive:
+// <backupPath>/originals. Exported so card verification looks for backup
+// copies in exactly the place Sync writes them.
+func DestDir(backupPath string) string {
+	return filepath.Join(backupPath, "originals")
+}
+
 // Sync copies originalsPath into backupPath/originals/ using rclone copy.
 // Returns (false, nil) without invoking rclone when backupPath does not exist
 // or is not a directory — an unmounted backup drive is expected, not an error.
@@ -72,10 +79,21 @@ func Sync(rclonePath, originalsPath, backupPath string, onCopy ...func(filename 
 		cb = onCopy[0]
 	}
 
-	dest := filepath.Join(backupPath, "originals")
-
-	if _, err := rclonerun.Copy(rclonePath, []string{"copy", originalsPath, dest}, cb); err != nil {
+	res, err := SyncDetailed(rclonePath, originalsPath, backupPath, cb)
+	if err != nil {
 		return false, err
 	}
-	return true, nil
+	return res != nil, nil
+}
+
+// SyncDetailed is Sync returning rclone's full Result (copied count and
+// per-file errors) so callers can report exactly what failed. A nil Result
+// with a nil error means the drive is not mounted and nothing ran. On an
+// rclone failure the Result is still returned alongside the error.
+func SyncDetailed(rclonePath, originalsPath, backupPath string, onCopy func(filename string, n int)) (*rclonerun.Result, error) {
+	if !IsDriveMounted(backupPath) {
+		return nil, nil
+	}
+	res, err := rclonerun.Run(rclonePath, []string{"copy", originalsPath, DestDir(backupPath)}, onCopy)
+	return &res, err
 }

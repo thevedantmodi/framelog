@@ -17,6 +17,60 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
         }
 
+        // Live progress while copying / importing / backing up / verifying.
+        if let line = status.activityLine {
+            Text(line)
+            if let file = status.activityFile {
+                Text(file)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+
+        Divider()
+
+        // While a card is in: what's new on it, seconds after insertion.
+        if let preview = status.cardPreview {
+            Text(previewLine(preview))
+            ForEach(previewDetailLines(preview), id: \.self) { line in
+                Text(line)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+
+        // Last card verification: the "can I format it?" answer up front,
+        // details (what was copied, where it's verified, what's wrong) in
+        // a submenu so the main menu stays short.
+        if let card = status.lastCard {
+            Menu(cardVerdictLine(card)) {
+                ForEach(cardDetailLines(card), id: \.self) { line in
+                    Text(line)
+                }
+                Divider()
+                if card.reportPath != nil {
+                    Button("Open Card Report") { status.openLastCardReport() }
+                }
+                Button("Open Reports Folder") { status.openReportsFolder() }
+            }
+        } else {
+            Text("No card checked yet")
+                .foregroundStyle(.secondary)
+        }
+        switch status.verifyState {
+        case .idle:
+            Button("Verify Card Now") { status.verifyCard() }
+        case .running:
+            Button("Verifying card…") {}
+                .disabled(true)
+        case .finished(let message):
+            Text(message)
+                .foregroundStyle(.secondary)
+            Button("Verify Card Again") { status.verifyCard() }
+        }
+
+        Divider()
+
         // Backup state + degraded-capability warnings from the daemon's
         // status response — surfaced here so a missing rclone or unplugged
         // backup drive is visible without tailing framelog.log.
@@ -24,9 +78,47 @@ struct ContentView: View {
             Text(backupLine)
                 .foregroundStyle(.secondary)
         }
+        if let problem = status.backupProblem {
+            Text(problem)
+        }
+        switch status.backupRetryState {
+        case .idle:
+            if status.backupPending {
+                Button("Retry Backup") { status.retryBackup() }
+            }
+        case .running:
+            Button("Backing up…") {}
+                .disabled(true)
+        case .finished(let message):
+            Text(message)
+                .foregroundStyle(.secondary)
+        }
         ForEach(status.capabilityNotes, id: \.self) { note in
             Text("⚠ \(note)")
                 .foregroundStyle(.secondary)
+        }
+
+        // Which camera file types are imported. A type switched off here is
+        // skipped and doesn't block "safe to format"; an unknown type does.
+        if !status.fileTypes.isEmpty {
+            Menu("File Types") {
+                ForEach(status.fileTypes, id: \.ext) { type in
+                    Toggle(
+                        isOn: Binding(
+                            get: { type.enabled },
+                            set: { _ in status.toggleFileType(type.ext) }
+                        )
+                    ) {
+                        Text(fileTypeMenuLabel(type))
+                    }
+                }
+                Divider()
+                Button("Add File Type…") { status.addFileType() }
+                Button("Reset to Defaults") { status.resetFileTypes() }
+                if let message = status.fileTypesMessage {
+                    Text(message)
+                }
+            }
         }
 
         Divider()

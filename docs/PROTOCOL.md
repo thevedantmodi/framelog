@@ -22,7 +22,57 @@ CREATE TABLE IF NOT EXISTS photos (
     import_timestamp  TEXT,     -- ISO 8601, UTC
     gps_lat           REAL,
     gps_lon           REAL,
-    status            TEXT DEFAULT 'raw'  -- raw | edited | published
+    status            TEXT DEFAULT 'raw',  -- raw | edited | published
+    quick_hash        TEXT     -- SHA-256 of size + first/last 64 KiB; see §11.
+                               -- NULL = not computed yet, '' = file unreadable
+);
+CREATE INDEX IF NOT EXISTS idx_photos_quick_hash ON photos(quick_hash);
+
+-- One row per end-to-end SD card verification (see §10).
+CREATE TABLE IF NOT EXISTS card_reports (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    volume_name      TEXT,     -- e.g. "Untitled" (Sony's default)
+    volume_uuid      TEXT,     -- diskutil "Volume UUID"; changes on every format
+    started_at       TEXT,     -- ISO 8601, UTC
+    finished_at      TEXT,
+    files_total      INTEGER,  -- importable media files on the card
+    bytes_total      INTEGER,
+    files_verified   INTEGER,
+    files_problem    INTEGER,  -- listed files that are neither "verified" nor "ignored"
+    files_ignored    INTEGER,  -- known types switched off in File Types (§12)
+    files_new        INTEGER,  -- verified, imported during this card session
+    files_existing   INTEGER,  -- verified, already in the library beforehand
+    file_types       TEXT,     -- "ARW 312 · JPG 312 · MP4 4"
+    camera_models    TEXT,     -- comma-separated
+    capture_first    TEXT,     -- exiftool layout "YYYY:MM:DD HH:MM:SS"
+    capture_last     TEXT,
+    backup_state     TEXT,     -- verified | not_configured | drive_missing | incomplete
+    safe_to_format   INTEGER,  -- 0/1, the verdict
+    problems         TEXT,     -- newline-separated human-readable sentences
+    report_path      TEXT      -- plain-text receipt in ~/Photos/reports/
+);
+
+CREATE TABLE IF NOT EXISTS card_report_files (
+    report_id     INTEGER REFERENCES card_reports(id),
+    card_path     TEXT,   -- relative to the volume root
+    size          INTEGER,
+    hash          TEXT,   -- SHA-256 of the bytes on the card
+    library_path  TEXT,
+    backup_path   TEXT,
+    state         TEXT,   -- see §10 file states
+    detail        TEXT
+);
+
+-- One row per backup attempt (after ingest, or backup_now).
+CREATE TABLE IF NOT EXISTS backup_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at    TEXT,
+    finished_at   TEXT,
+    destination   TEXT,     -- backup root; copies live in <destination>/originals/
+    outcome       TEXT,     -- ok | failed | drive_missing | rclone_missing
+    files_copied  INTEGER,
+    files_failed  INTEGER,  -- distinct files rclone reported errors for
+    error         TEXT      -- human-readable explanation, "" on success
 );
 ```
 
@@ -81,7 +131,34 @@ never leaves the frontend holding a dead connection.
 {"command": "set_backup_path", "path": "/Volumes/MyBackupDrive"}
 {"command": "pause"}
 {"command": "resume"}
+{"command": "verify_card"}
+{"command": "backup_now"}
+{"command": "set_import_types", "types": [".arw", ".hif", ".mp4"]}
+{"command": "set_import_types", "types": null}
 ```
+
+`set_import_types` replaces the set of file types imported from cards (§12) and
+persists it in `framelog_config.json` (`"import_types"`). `null` or a missing `types`
+restores the defaults (stored as "never chosen"); `[]` is rejected. Extensions are
+case-insensitive, with or without the dot. Reply: `{"ok": true, "file_types": […]}` (same
+shape as in `status`), or `invalid_file_type` for an empty list, a malformed extension, or
+a never-importable type (`.xml`, `.xmp`, `.png`). Applies immediately, no restart.
+
+`verify_card` re-runs the §10 end-to-end check on the currently mounted
+camera card — no copy, no import — and replies when it finishes (as long as
+re-reading the card takes). Read-only, so it is allowed while paused. Use it
+after reconnecting the backup drive, or right before formatting.
+
+`backup_now` copies `originals/` to the configured backup drive now (the
+"Retry Backup" action). It shares ingest's running flag, so it returns
+`ingest_already_running` during an import and `ingest_paused` while paused.
+A completed attempt is `ok: true` whatever its outcome — the outcome is in
+`outcome` / `backup_error`, and is also recorded in `backup_runs`.
+
+**Automatic backup retry:** after every ingest, the backup runs if anything
+was imported **or** a backup is pending (the last attempt failed, the drive
+was missing, or the destination changed since the last success) — a failed
+backup is retried by the next ingest instead of waiting for new photos.
 
 `set_backup_path` with an empty `"path"` disables backup. The core persists the
 value to `~/Library/Application Support/Framelog/framelog_config.json` and
@@ -114,13 +191,34 @@ Pause state is in-memory only — it resets to unpaused on every daemon restart
  "photo_count": 4213, "last_import": "2026-06-20T14:02:00Z", "backup_drive_mounted": true,
  "backup_configured": true, "daemon_version": "0.4.0", "paused": false,
  "capabilities": {"sd_card_watch": true, "backup": true, "ac_power_gate": true,
-                  "lightroom_check": true}}
+                  "lightroom_check": true},
+ "activity": {"phase": "verifying", "volume": "Untitled", "done": 120, "total": 412,
+              "current_file": "DSC00120.ARW", "started_at": "2026-11-07T18:03:11Z"},
+ "backup": {"pending": false, "last_outcome": "ok", "last_error": "",
+            "last_run_at": "2026-11-07T18:01:40Z", "last_success_at": "2026-11-07T18:01:40Z",
+            "files_copied": 412, "files_failed": 0},
+ "last_card": {"id": 12, "volume_name": "Untitled", "volume_uuid": "0E1D2C3B-…",
+               "started_at": "2026-11-07T17:58:02Z", "finished_at": "2026-11-07T18:09:30Z",
+               "safe_to_format": true, "files_total": 412, "bytes_total": 23400000000,
+               "files_verified": 412, "files_problem": 0, "files_new": 400, "files_existing": 12,
+               "file_types": "ARW 206 · JPG 206", "camera_models": "ILCE-7CM2",
+               "capture_first": "2026:11:07 09:12:44", "capture_last": "2026:11:07 16:40:02",
+               "backup_state": "verified", "problems": [],
+               "report_path": "/Users/me/Photos/reports/20261107_175802_Untitled.txt"}}
+{"protocol_version": 1, "ok": true, "card": { …same shape as last_card… }}
+{"protocol_version": 1, "ok": true, "outcome": "failed", "files_copied": 10,
+ "files_failed": 2, "backup_error": "Backup drive is full"}
 {"protocol_version": 1, "ok": true}
 {"protocol_version": 1, "ok": true, "paused": true}
 {"protocol_version": 1, "ok": false, "error": "ingest_already_running"}
 {"protocol_version": 1, "ok": false, "error": "outgest_already_running"}
 {"protocol_version": 1, "ok": false, "error": "ingest_paused"}
 {"protocol_version": 1, "ok": false, "error": "outgest_paused"}
+{"protocol_version": 1, "ok": false, "error": "no_card"}
+{"protocol_version": 1, "ok": false, "error": "card_busy"}
+{"protocol_version": 1, "ok": false, "error": "verify_unavailable"}
+{"protocol_version": 1, "ok": false, "error": "backup_not_configured"}
+{"protocol_version": 1, "ok": false, "error": "invalid_file_type"}
 {"protocol_version": 1, "ok": false, "error": "unknown_command"}
 {"protocol_version": 1, "ok": false, "error": "bad_request"}
 {"protocol_version": 1, "ok": false, "error": "internal_error"}
@@ -138,6 +236,27 @@ daemon found at startup (`sd_card_watch`=diskutil, `backup`=rclone, `ac_power_ga
 run; the frontend shows it in the menu instead of requiring a log tail. Static per daemon
 process. `backup_configured` distinguishes "no backup path set" from "backup drive
 unplugged" — both report `backup_drive_mounted: false` but call for different guidance.
+
+**Report fields in `status`** (all additive; a client must tolerate their absence,
+which is what an older daemon sends):
+- `file_types` — always present: every known camera type in display order, then custom
+  types. Each `{"ext": ".arw", "label": "Sony RAW", "enabled": true, "custom": false}`.
+- `card_preview` — present while a card that has been scanned is still mounted (§11):
+  `{"volume_name", "checked_at", "files_total", "bytes_total", "files_new", "bytes_new",
+  "files_in_library", "files_ignored", "files_unhandled", "new_file_types"}`. The frontend
+  shows it until a `last_card` with a later `finished_at` arrives.
+- `activity` — live progress. `phase` is one of `idle` · `scanning` (quick preview) · `copying` (card → inbox) ·
+  `importing` (inbox → originals) · `backing_up` · `verifying`. `total: 0` means
+  unknown (backup doesn't know its total up front). `volume` is set for card phases.
+- `backup` — the most recent `backup_runs` row plus `pending` (see "Automatic backup
+  retry" above; always `false` when no backup is configured, and `false` on an empty
+  library). `last_error` is a plain sentence ("Backup drive is full"), not rclone output.
+- `last_card` — the newest `card_reports` row. Absent until the first card has been
+  verified. `problems` is always an array.
+
+`verify_card` errors: `no_card` (no removable volume with `DCIM/` or
+`PRIVATE/M4ROOT/CLIP/`), `card_busy` (a card is being copied/verified right now),
+`verify_unavailable` (SD card watcher disabled — diskutil or rclone missing).
 
 **`status` is served by a separate handler** that never shares a lock with
 `ingest_now`/`outgest_now`. A slow ingest must not make the core look unreachable to a
@@ -170,13 +289,23 @@ No push channel. The frontend polls `status` on a 15-second timer and diffs
 local `UserNotification` fires. This handles SD-card-triggered ingests (which happen
 entirely inside the core with no frontend request).
 
-**Do not change the 15-second poll interval** without also updating this document and
+The same poll drives two more notifications, each fired only on a transition (the
+values present on the app's first poll seed the comparison and never notify):
+- `last_card.id` changed → "Untitled is safe to format" / "Don't format Untitled yet"
+  with the first problem.
+- `backup.last_run_at` changed and `backup.last_outcome == "failed"` → "Backup failed"
+  with `last_error`.
+
+**Do not change the 15-second idle poll interval** without also updating this document and
 verifying the UNUserNotificationCenter throttling does not suppress rapid successive
-notifications.
+notifications. While `activity.phase != "idle"` the frontend polls every **2 seconds**
+so progress in the open menu moves; it drops back to 15 s as soon as the core reports
+idle (or stops answering). Notifications are transition-only, so the fast cadence
+cannot multiply them.
 
 ## 6. XMP / git behaviour
 
-**Non-DNG files** (RAF, CR3, ARW, HEIC, JPG): Lightroom writes a `.xmp` sidecar next to
+**Non-DNG files** (RAF, CR3, ARW, HEIC, HIF, JPG): Lightroom writes a `.xmp` sidecar next to
 the file. The XMP watcher detects the write via fsnotify, waits 10 seconds (debounce to
 collapse burst edits), then runs `git add -A && git commit` in `originals/`.
 
@@ -222,6 +351,12 @@ Closed set of prefixes — add to this list in the same commit that introduces a
 
 `CORE` · `INGEST` · `OUTGEST` · `XMP` · `GIT` · `BACKUP`
 
+Card verification logs under `CORE` (the SD card watcher's prefix):
+`card Untitled: SAFE TO FORMAT — 412/412 files verified (23.4 GB), backup verified`,
+followed by one `  problem: …` line per problem and `card report: <path>`.
+Backup failures log `[BACKUP] FAILED: <explanation> (N copied, M failed)` followed by up
+to 10 `  not backed up: <path>` lines.
+
 Frontend tails this file for the log viewer. No bare `print()` anywhere in the core.
 
 ## 8. File layout on disk
@@ -236,6 +371,8 @@ Frontend tails this file for the log viewer. No bare `print()` anywhere in the c
 ├── originals/YYYY/MM/DD/     ← imported files + .xmp sidecars; git-tracked
 │   └── .git/                 ← tracks .xmp sidecars only (see gitignore above)
 ├── processed/YYYY/MM/        ← Lightroom exports, organised by outgest
+├── reports/                  ← one plain-text receipt per verified card (§10)
+│   └── YYYYMMDD_HHMMSS_<volume>.txt
 ├── catalog.db                ← SQLite WAL; core writes, frontend reads immutable
 └── framelog.log              ← structured log
 
@@ -260,18 +397,105 @@ Frontend tails this file for the log viewer. No bare `print()` anywhere in the c
 - **`outgestwatcher` watches only the top-level `processed/` directory**, never
   subdirectories. `YYYY/MM/` folders created by a prior outgest run must not trigger a
   re-scan of already-organised files.
-- **Outgest filters on `config.OutgestExtensions`, not `config.SupportedExtensions`.**
+- **Outgest filters on `config.IsOutgestExtension`, not `config.IsImportable`.**
   The import list and the export list are deliberately different: ingest decides what
   enters `originals/` and gets git-tracked, outgest decides what counts as a finished
   export. A PNG export must be filed into `processed/YYYY/MM/` but must never be
   ingested. The export-only list stays narrow because outgest sets
   `status="published"`: Photoshop working files and archival intermediates share the
   export's hash8 prefix and would republish the same catalog row.
-  `OutgestExtensions` is built from `SupportedExtensions` at init, so the import formats
-  can never drift out of the export set; export-only additions go in
-  `outgestOnlyExtensions`.
+  The export set is every known camera type, every type currently imported, and the
+  export-only types (`outgestOnlyExtensions`), so it can never miss an import format and
+  switching JPEG import off never stops JPEG exports being filed.
 - **XMP watcher skips `.git/`** during initial walk. Watching git internals would leak
   fsnotify watches on every commit the watcher itself makes.
 - **Socket path is capped at 104 bytes** (macOS `sockaddr_un` limit). Tests use
   `os.MkdirTemp("", "prefix*")` under `/tmp` (short paths), not `t.TempDir()` (long
   paths under the test cache). Violations surface as `bind: invalid argument`.
+
+## 10. End-to-end card verification ("safe to format")
+
+After every automatic card run (copy → ingest → backup) the SD card watcher re-reads
+the card and proves every file made it, then records a verdict. `verify_card` runs the
+same check on demand. Implemented in `core/cardverify`.
+
+**What is checked.** Every non-hidden file under `DCIM/` and `PRIVATE/M4ROOT/CLIP/` is
+inventoried (hidden `._*` / `.DS_Store` / `.Trashes` are Mac-created and skipped; other
+card directories — Sony thumbnails, proxies, databases — are regenerated by the camera
+and not inventoried). Each file is classified:
+- **media** — extension currently imported (`config.IsImportable`); must be verified.
+- **sidecar** — `.xml` inside the clip directory (Sony NonRealTimeMeta); copied with its
+  clip, counted, not separately verified.
+- **ignored** — a known camera type (§12) the user switched off. Listed with state
+  `ignored` and noted on the report; does not block (the user chose to drop it).
+- **unhandled** — anything else in a media directory. Formatting would destroy it, so
+  it blocks the verdict.
+
+For each media file: SHA-256 the bytes **on the card**; look the hash up in `photos`;
+re-hash the library file it points at; when a backup is configured and mounted, re-hash
+`<backup>/originals/<same relative path>`. Size is compared first, so truncation is
+caught without a full read. Because `photos` is keyed by content hash, a file counts no
+matter which import put it there (this session, an earlier insert, another card).
+
+**File states** (`card_report_files.state`): `verified` · `not_in_library` ·
+`library_missing` · `library_mismatch` · `backup_missing` · `backup_mismatch` ·
+`card_unreadable` · `unhandled` · `ignored`.
+
+**Backup states** (`card_reports.backup_state`): `verified` · `not_configured` (library
+is the only copy — reported as a note, does not block) · `drive_missing` (blocks: the
+user configured two copies, only one is provable) · `incomplete` (blocks).
+
+**Verdict.** `safe_to_format` is true iff every media file is `verified`, there are no
+`unhandled` files, and `backup_state` is `verified` or `not_configured`. A card with no
+media is safe. Copy errors from the card run are listed in `problems` as context but do
+not decide the verdict — the per-file check does.
+
+**Receipt.** `~/Photos/reports/YYYYMMDD_HHMMSS_<volume>.txt` (local time; never
+overwritten — a same-second re-check gets `-2`): verdict, card identity, counts, types,
+camera, capture range, new vs. already-imported, library/backup tallies, problems, then
+every file with its state, problem files first.
+
+**Identity.** Card volume names are not unique (every Sony card is "Untitled"), so
+reports carry diskutil's Volume UUID, which also changes when the card is reformatted.
+
+## 11. Instant card preview
+
+Before copying anything, the SD card watcher fingerprints each media file on the card
+with a **quick hash** — SHA-256 over the file size, its first 64 KiB, and its last 64 KiB
+(`hasher.QuickHash`; the whole file if under 128 KiB) — and looks it up in
+`photos.quick_hash`. At most 128 KiB is read per file, so a full card is previewed in
+seconds. The result ("312 new · 1,040 already imported") is logged, exposed as
+`card_preview` in `status`, and decides what is copied:
+
+- Only the files the preview calls new are copied, via
+  `rclone copy <DCIM|CLIP> inbox/ --files-from-raw <list> --ignore-existing`, plus the
+  `C####M01.XML` sidecar of every new clip. Re-inserting an imported card copies nothing.
+- A quick hash is a hint, never proof. §10 verification still uses full SHA-256 and alone
+  decides `safe_to_format`. If verification finds a file `not_in_library` that the preview
+  had skipped (a wrong quick match), the run copies those files, imports, and verifies
+  again — once — before saving the report.
+- Ingest stores the quick hash of every file it imports. Rows imported earlier are filled in
+  by a background backfill at daemon start (`cardverify.BackfillQuickHashes`); until then
+  those photos look new to the preview and are copied again, then parked by ingest as
+  duplicates — slower, never unsafe.
+- Without a catalog (verification disabled) or if the preview fails, the watcher falls back
+  to copying every importable file.
+
+## 12. File types
+
+`config.KnownMediaTypes` lists every camera format Framelog recognises (Sony ARW and HIF,
+Canon CR3/CR2, Nikon NEF, Fujifilm RAF, OM System ORF, Panasonic RW2, DNG, HEIC, JPEG,
+MP4, MOV, WAV). **All are imported by default.** The user can switch any off and add
+custom extensions (`set_import_types`, persisted as `import_types` in
+`framelog_config.json`). On a card:
+
+| Type | Copied & imported | On the report | Blocks "safe to format"? |
+|---|---|---|---|
+| switched on (known or custom) | yes | verified / problem | if not verified |
+| known, switched off | no | `ignored`, plus a note | no |
+| anything else in `DCIM/` or the clip folder | no | `unhandled` | yes |
+
+Every known type defaults to on so nothing becomes `ignored` without the user choosing it.
+`.xml`, `.xmp` and `.png` can never be imported. Turning a type off does not affect
+outgest: exports of every known type are still filed.
+

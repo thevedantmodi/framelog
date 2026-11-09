@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/thevedantmodi/framelog/core/activity"
 	"github.com/thevedantmodi/framelog/core/backup"
 	"github.com/thevedantmodi/framelog/core/config"
 	"github.com/thevedantmodi/framelog/core/db"
@@ -33,6 +34,7 @@ import (
 	"github.com/thevedantmodi/framelog/core/hasher"
 	"github.com/thevedantmodi/framelog/core/logging"
 	"github.com/thevedantmodi/framelog/core/nrtmeta"
+	"github.com/thevedantmodi/framelog/core/rclonerun"
 	"github.com/thevedantmodi/framelog/core/xmp"
 )
 
@@ -47,6 +49,10 @@ var ErrIngestAlreadyRunning = errors.New("ingest_already_running")
 // pattern as ErrIngestAlreadyRunning) so the socket handler can use
 // err.Error() directly as the JSON "error" field.
 var ErrIngestPaused = errors.New("ingest_paused")
+
+// ErrBackupNotConfigured is returned by RunBackup when no backup path is set.
+// Wire-string convention as above (PROTOCOL.md §3 backup_now).
+var ErrBackupNotConfigured = errors.New("backup_not_configured")
 
 // Runner is the minimal interface consumers of ingest need. *Pipeline satisfies
 // it. Defined here so packages that depend on ingest behaviour (sdcard, ipc,
@@ -81,6 +87,10 @@ type Pipeline struct {
 	// writes don't trigger the watcher and flip fresh imports to status
 	// "edited" (PROTOCOL.md §1: edited means Lightroom wrote to the file).
 	OnFileWritten func(path string)
+
+	// Activity, when non-nil, receives live progress for the status IPC
+	// command (importing N/M, backing up N). Nil-safe.
+	Activity *activity.Tracker
 
 	mu                 sync.Mutex
 	running            bool
@@ -293,6 +303,10 @@ func (p *Pipeline) ImportFile(srcPath, batchID string) (Result, error) {
 		ImportTimestamp:  time.Now().UTC().Format(time.RFC3339),
 		GPSLat:           meta.GPSLat, // nil when absent, not 0.0
 		GPSLon:           meta.GPSLon,
+		// Best-effort: a failure only means this file is not recognised by
+		// the instant card preview, which then copies it again (harmless —
+		// ingest dedups by full hash).
+		QuickHash: quickHashOrEmpty(srcPath),
 	}
 	if err := db.InsertPhoto(p.DB, photo); err != nil {
 		// UNIQUE constraint means a previous ingest already recorded this hash
@@ -453,7 +467,7 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 			}
 			return nil
 		}
-		if config.SupportedExtensions[strings.ToLower(filepath.Ext(path))] {
+		if config.IsImportable(filepath.Ext(path)) {
 			files = append(files, path)
 		}
 		return nil
@@ -465,9 +479,14 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 
 	total := len(files)
 	var counts Counts
+	if total > 0 {
+		p.Activity.Start(activity.PhaseImporting, "", total)
+	}
+	defer p.Activity.Idle()
 	for i, f := range files {
 		p.Logger.Log(logging.PrefixIngest,
 			fmt.Sprintf("copying [%05d/%05d] %s", i+1, total, filepath.Base(f)))
+		p.Activity.Step(i, filepath.Base(f))
 		switch result, _ := p.ImportFile(f, batchID); result {
 		case ResultImported:
 			counts.Imported++
@@ -503,33 +522,155 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 		}
 	}
 
-	// Backup: gated only on having imported files and a configured BackupPath.
-	// Deliberately independent of the git commit/push block above — git only
-	// tracks XMP sidecars; the photo bytes are safe in originals/ as soon as
-	// the import loop finishes, regardless of AC power or push outcome.
-	backupPath := p.getBackupPath()
-	if counts.Imported > 0 && backupPath != "" && p.RclonePath == "" {
-		// rclone was not found at startup — a configured backup path cannot be
-		// synced. Say so explicitly instead of invoking exec.Command("").
-		p.Logger.Log(logging.PrefixBackup, "backup skipped: rclone not installed")
-	} else if counts.Imported > 0 && backupPath != "" {
-		p.Logger.Log(logging.PrefixBackup, fmt.Sprintf("syncing %d photos to %s", counts.Imported, backupPath))
-		logSyncProgress := func(filename string, n int) {
-			p.Logger.Log(logging.PrefixBackup,
-				fmt.Sprintf("syncing [%05d] %s → %s", n, filename, backupPath))
-		}
-		synced, err := backup.Sync(p.RclonePath, p.OriginalsPath, backupPath, logSyncProgress)
-		if err != nil {
-			p.Logger.Log(logging.PrefixBackup, fmt.Sprintf("sync error: %v", err))
-		} else if synced {
-			p.Logger.Log(logging.PrefixBackup,
-				fmt.Sprintf("synced %d photos to %s", counts.Imported, backupPath))
-		} else {
-			p.Logger.Log(logging.PrefixBackup, "backup drive not found, skipped")
+	// Backup: runs when something was imported, or when an earlier backup
+	// is still outstanding (failed, drive was unplugged, or the destination
+	// changed) — so a failed backup is retried by the next ingest instead of
+	// waiting for new photos. Deliberately independent of the git
+	// commit/push block above — git only tracks XMP sidecars; the photo
+	// bytes are safe in originals/ as soon as the import loop finishes,
+	// regardless of AC power or push outcome.
+	if backupPath := p.getBackupPath(); backupPath != "" {
+		if counts.Imported > 0 || p.backupPending(backupPath) {
+			p.runBackup(backupPath)
 		}
 	}
 
 	return counts, nil
+}
+
+// RunBackup copies originals/ to the configured backup drive now, without
+// importing anything — the "Retry Backup" action. It shares RunIngest's
+// running flag so a backup never overlaps an import (both write the same
+// tree and the backup would otherwise copy half-imported days).
+func (p *Pipeline) RunBackup() (db.BackupRun, error) {
+	if p.Paused() {
+		return db.BackupRun{}, ErrIngestPaused
+	}
+	backupPath := p.getBackupPath()
+	if backupPath == "" {
+		return db.BackupRun{}, ErrBackupNotConfigured
+	}
+	if !p.TryAcquire() {
+		return db.BackupRun{}, ErrIngestAlreadyRunning
+	}
+	defer p.Release()
+	if err := db.InitDB(p.DB); err != nil {
+		return db.BackupRun{}, fmt.Errorf("backup: InitDB: %w", err)
+	}
+	return p.runBackup(backupPath), nil
+}
+
+// BackupPending reports, for the status command, whether the library may
+// not be fully on the configured backup drive. False when backup is not
+// configured, and false on a fresh install with an empty library (nothing
+// to back up yet is not a warning).
+func (p *Pipeline) BackupPending() bool {
+	backupPath := p.getBackupPath()
+	if backupPath == "" {
+		return false
+	}
+	last, err := db.LastBackupRun(p.DB)
+	if err != nil || last == nil {
+		n, cerr := db.PhotoCount(p.DB)
+		return err == nil && cerr == nil && n > 0
+	}
+	return last.Outcome != db.BackupOK || last.Destination != backupPath
+}
+
+// backupPending reports whether the library may not be fully on the backup
+// drive at backupPath: no backup has ever been recorded, the last attempt
+// did not succeed, or it went to a different destination.
+func (p *Pipeline) backupPending(backupPath string) bool {
+	last, err := db.LastBackupRun(p.DB)
+	if err != nil {
+		p.Logger.Log(logging.PrefixBackup, fmt.Sprintf("WARN could not read backup history: %v", err))
+		return false
+	}
+	return last == nil || last.Outcome != db.BackupOK || last.Destination != backupPath
+}
+
+// maxLoggedBackupFailures caps how many individual failed files a backup
+// failure lists in the log; the count is always logged in full.
+const maxLoggedBackupFailures = 10
+
+// runBackup performs one backup attempt, logs it, and records it in
+// backup_runs so the status command and menu bar can report the outcome.
+// Caller holds the running flag.
+func (p *Pipeline) runBackup(backupPath string) db.BackupRun {
+	run := db.BackupRun{
+		StartedAt:   time.Now().UTC().Format(time.RFC3339),
+		Destination: backupPath,
+	}
+	defer func() {
+		run.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+		if err := db.InsertBackupRun(p.DB, run); err != nil {
+			p.Logger.Log(logging.PrefixBackup, fmt.Sprintf("WARN could not record backup run: %v", err))
+		}
+	}()
+
+	if p.RclonePath == "" {
+		// rclone was not found at startup — a configured backup path cannot be
+		// synced. Say so explicitly instead of invoking exec.Command("").
+		run.Outcome = db.BackupRcloneMissing
+		run.Error = "rclone is not installed — run: brew install rclone"
+		p.Logger.Log(logging.PrefixBackup, "backup skipped: rclone not installed")
+		return run
+	}
+
+	p.Logger.Log(logging.PrefixBackup, fmt.Sprintf("syncing originals to %s", backupPath))
+	p.Activity.Start(activity.PhaseBackingUp, "", 0)
+	defer p.Activity.Idle()
+	logSyncProgress := func(filename string, n int) {
+		p.Activity.Step(n, filename)
+		p.Logger.Log(logging.PrefixBackup,
+			fmt.Sprintf("syncing [%05d] %s → %s", n, filename, backupPath))
+	}
+	res, err := backup.SyncDetailed(p.RclonePath, p.OriginalsPath, backupPath, logSyncProgress)
+	if res == nil && err == nil {
+		run.Outcome = db.BackupDriveMissing
+		run.Error = "Backup drive is not connected"
+		p.Logger.Log(logging.PrefixBackup, "backup drive not found, skipped — will retry on next ingest")
+		return run
+	}
+	if res != nil {
+		run.FilesCopied = res.Copied
+		run.FilesFailed = len(res.FailedObjects())
+	}
+	if err != nil || run.FilesFailed > 0 {
+		var r rclonerun.Result
+		if res != nil {
+			r = *res
+		}
+		run.Outcome = db.BackupFailed
+		run.Error = rclonerun.Explain(r, err)
+		p.Logger.Log(logging.PrefixBackup, fmt.Sprintf("FAILED: %s (%d copied, %d failed)",
+			run.Error, run.FilesCopied, run.FilesFailed))
+		for i, obj := range r.FailedObjects() {
+			if i == maxLoggedBackupFailures {
+				p.Logger.Log(logging.PrefixBackup,
+					fmt.Sprintf("  … and %d more", run.FilesFailed-maxLoggedBackupFailures))
+				break
+			}
+			p.Logger.Log(logging.PrefixBackup, "  not backed up: "+obj)
+		}
+		if err != nil {
+			// The raw error keeps rclone's stderr for debugging.
+			p.Logger.Log(logging.PrefixBackup, fmt.Sprintf("sync error: %v", err))
+		}
+		return run
+	}
+	run.Outcome = db.BackupOK
+	p.Logger.Log(logging.PrefixBackup,
+		fmt.Sprintf("synced %d new files to %s", run.FilesCopied, backupPath))
+	return run
+}
+
+func quickHashOrEmpty(path string) string {
+	h, err := hasher.QuickHash(path)
+	if err != nil {
+		return ""
+	}
+	return h
 }
 
 // copyFile copies src to dst, syncing the destination before returning so a

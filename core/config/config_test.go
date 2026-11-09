@@ -1,41 +1,139 @@
 package config
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
-// TestOutgestExtensions_SupersetOfSupported enforces the invariant that every
-// format ingest imports can also be filed by outgest. If someone adds a RAW
-// format to SupportedExtensions and forgets outgest, exports of that format
-// would silently pile up in processed/ root — exactly the failure this set
-// was introduced to fix.
-func TestOutgestExtensions_SupersetOfSupported(t *testing.T) {
-	for ext := range SupportedExtensions {
-		if !OutgestExtensions[ext] {
-			t.Errorf("OutgestExtensions missing %q, which is in SupportedExtensions", ext)
+// restoreImports resets the global import set after a test that changes it.
+func restoreImports(t *testing.T) {
+	t.Helper()
+	t.Cleanup(resetImportExtensions)
+}
+
+// Every importable type must be filed by outgest too — otherwise a format
+// added to the import list would have its exports ignored.
+func TestOutgest_SupersetOfImport(t *testing.T) {
+	restoreImports(t)
+	if err := SetImportExtensions([]string{".arw", ".insv"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, ext := range ImportExtensions() {
+		if !IsOutgestExtension(ext) {
+			t.Errorf("IsOutgestExtension(%q) = false for an importable type", ext)
 		}
 	}
 }
 
-// TestOutgestOnlyExtensions_NotIngested is the other half of the split: an
-// export-only format must never leak into the ingest set, or PNGs and PSDs
-// dropped in inbox/ would be imported into originals/ and git-tracked.
-func TestOutgestOnlyExtensions_NotIngested(t *testing.T) {
-	for ext := range outgestOnlyExtensions {
-		if SupportedExtensions[ext] {
-			t.Errorf("%q is in both outgestOnlyExtensions and SupportedExtensions", ext)
+// PNG is the case that motivated the split: exported, never imported.
+func TestPNG_ExportOnly(t *testing.T) {
+	if !IsOutgestExtension(".png") {
+		t.Error("PNG exports must be filed by outgest")
+	}
+	if IsImportable(".png") {
+		t.Error("PNG must not be imported")
+	}
+	restoreImports(t)
+	if err := SetImportExtensions([]string{".png"}); err == nil {
+		t.Error("SetImportExtensions allowed .png")
+	}
+}
+
+// Switching JPEG import off must not stop Lightroom JPEG exports being filed.
+func TestOutgest_IndependentOfDisabledImports(t *testing.T) {
+	restoreImports(t)
+	if err := SetImportExtensions([]string{".arw"}); err != nil {
+		t.Fatal(err)
+	}
+	if IsImportable(".jpg") {
+		t.Fatal("jpg still importable")
+	}
+	if !IsOutgestExtension(".JPG") {
+		t.Error("JPEG exports stopped being filed after JPEG import was switched off")
+	}
+}
+
+func TestDefaults_AllKnownTypesOn(t *testing.T) {
+	for _, mt := range KnownMediaTypes {
+		if !IsImportable(mt.Ext) {
+			t.Errorf("known type %s is off by default — it would be dropped without the user choosing", mt.Ext)
 		}
-		if !OutgestExtensions[ext] {
-			t.Errorf("OutgestExtensions missing outgest-only extension %q", ext)
+	}
+	for _, ext := range []string{".hif", ".HIF", ".arw", ".mp4"} {
+		if !IsImportable(ext) {
+			t.Errorf("IsImportable(%q) = false", ext)
+		}
+	}
+	if IsImportable(".xml") || IsImportable(".xmp") {
+		t.Error("sidecars must never be importable")
+	}
+}
+
+func TestSetImportExtensions_Validation(t *testing.T) {
+	restoreImports(t)
+	bad := [][]string{{}, {"../x"}, {".toolongextension"}, {".xml"}, {"xmp"}, {". arw"}}
+	for _, b := range bad {
+		if err := SetImportExtensions(b); err == nil {
+			t.Errorf("SetImportExtensions(%q) accepted", b)
+		}
+	}
+	// A rejected set must leave the current one untouched.
+	if !IsImportable(".arw") {
+		t.Error("failed Set changed the import set")
+	}
+
+	if err := SetImportExtensions([]string{"ARW", " .Mp4 "}); err != nil {
+		t.Fatal(err)
+	}
+	if got := ImportExtensions(); len(got) != 2 || got[0] != ".arw" || got[1] != ".mp4" {
+		t.Errorf("ImportExtensions = %v", got)
+	}
+
+	if err := SetImportExtensions(nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(ImportExtensions()) != len(KnownMediaTypes) {
+		t.Error("nil did not restore defaults")
+	}
+}
+
+func TestFileTypeSettings(t *testing.T) {
+	restoreImports(t)
+	if err := SetImportExtensions([]string{".arw", ".insv"}); err != nil {
+		t.Fatal(err)
+	}
+	s := FileTypeSettings()
+	if len(s) != len(KnownMediaTypes)+1 {
+		t.Fatalf("len = %d", len(s))
+	}
+	if s[0].Ext != ".arw" || !s[0].Enabled || s[0].Label != "Sony RAW" {
+		t.Errorf("first = %+v", s[0])
+	}
+	for _, row := range s {
+		if row.Ext == ".jpg" && row.Enabled {
+			t.Error(".jpg should be off")
+		}
+	}
+	last := s[len(s)-1]
+	if last.Ext != ".insv" || !last.Custom || !last.Enabled {
+		t.Errorf("custom row = %+v", last)
+	}
+}
+
+func TestNormalizeExtension(t *testing.T) {
+	for in, want := range map[string]string{"ARW": ".arw", ".Hif": ".hif", " mp4 ": ".mp4", "": ""} {
+		if got := NormalizeExtension(in); got != want {
+			t.Errorf("NormalizeExtension(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
 
-// TestOutgestExtensions_PNG pins the concrete case that motivated the split:
-// a Lightroom PNG export must be outgest-eligible and ingest-ineligible.
-func TestOutgestExtensions_PNG(t *testing.T) {
-	if !OutgestExtensions[".png"] {
-		t.Error("OutgestExtensions[.png] = false, want true")
+func TestValidateImportExtensions(t *testing.T) {
+	got, err := ValidateImportExtensions([]string{"MP4", ".arw", "arw"})
+	if err != nil || len(got) != 2 || got[0] != ".arw" || got[1] != ".mp4" {
+		t.Errorf("Validate = %v, %v", got, err)
 	}
-	if SupportedExtensions[".png"] {
-		t.Error("SupportedExtensions[.png] = true, want false — PNGs must not be ingested")
+	if _, err := ValidateImportExtensions([]string{".xmp"}); !errors.Is(err, ErrInvalidFileType) {
+		t.Errorf("err = %v, want ErrInvalidFileType", err)
 	}
 }

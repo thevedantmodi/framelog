@@ -43,6 +43,11 @@ var (
 	// successful ingest (FL-207). Empty/unset means backup is disabled.
 	BackupPath = os.Getenv("FRAMELOG_BACKUP_PATH")
 
+	// ReportsDir holds one plain-text receipt per verified SD card
+	// (cardverify). Durable, human-readable proof of what was on the card
+	// and where every file ended up — the thing you check before formatting.
+	ReportsDir = filepath.Join(home, "Photos", "reports")
+
 	// UserConfigPath is the persisted JSON file written by set_backup_path IPC.
 	// Takes precedence over FRAMELOG_BACKUP_PATH at daemon startup.
 	UserConfigPath = filepath.Join(home, "Library", "Application Support", "Framelog", "framelog_config.json")
@@ -71,57 +76,15 @@ const DCIMDirName = "DCIM"
 var ClipDirRelPath = filepath.Join("PRIVATE", "M4ROOT", "CLIP")
 
 // NRTMetaExtension is the extension of the Sony NonRealTimeMeta sidecar.
-// Deliberately NOT in SupportedExtensions: the sidecar is metadata for a
+// Deliberately never importable (see filetypes.go): the sidecar is metadata for a
 // clip, never an importable file in its own right. Ingest reads it, copies
 // it next to the imported clip (where .gitignore keeps it untracked), and
 // deletes the inbox copy along with the clip.
 const NRTMetaExtension = ".xml"
 
-// SupportedExtensions mirrors config.py's SUPPORTED_EXTENSIONS. Decide here,
-// in one place, which RAW/video formats this install cares about.
-var SupportedExtensions = map[string]bool{
-	".raf":  true,
-	".cr3":  true,
-	".arw":  true,
-	".dng":  true,
-	".heic": true,
-	".jpg":  true,
-	".jpeg": true,
-	".mp4":  true,
-	".mov":  true,
-}
-
-// OutgestExtensions is the set of extensions RunOutgest and outgestwatcher
-// accept in processed/. Deliberately a superset of SupportedExtensions: ingest
-// decides what enters the library, outgest decides what counts as a finished
-// export, and the two lists diverge. A PNG export must be filed into YYYY/MM
-// but must never be ingested into originals/ and git-tracked.
-//
-// Built from SupportedExtensions at init so the ingest formats can never drift
-// out of the outgest set. Add export-only formats to outgestOnlyExtensions.
-//
-// Kept deliberately narrow: outgest sets status="published", so only finished
-// deliverables belong here. Photoshop working files (.psb/.psd) and archival
-// intermediates (.jxl) share the same hash8 prefix as the export they came
-// from — filing them would publish one photo several times and park multi-GB
-// scratch files next to the deliverable in YYYY/MM. Add .tif and friends if
-// and when exports of that format actually appear.
-var OutgestExtensions = map[string]bool{}
-
-// outgestOnlyExtensions are formats outgest files but ingest never imports.
-// Kept separate so it is obvious which entries widen only the outgest side.
-var outgestOnlyExtensions = map[string]bool{
-	".png": true,
-}
-
-func init() {
-	for ext := range SupportedExtensions {
-		OutgestExtensions[ext] = true
-	}
-	for ext := range outgestOnlyExtensions {
-		OutgestExtensions[ext] = true
-	}
-}
+// The import / export file-type sets live in filetypes.go: the import set
+// is user-configurable at runtime (set_import_types), so it is behind
+// accessors rather than a plain map.
 
 // EmbeddedXMPExtensions is the set of formats that store XMP metadata embedded
 // inside the file rather than in a separate sidecar. Writing a .xmp sidecar

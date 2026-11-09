@@ -24,7 +24,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/thevedantmodi/framelog/core/activity"
 	"github.com/thevedantmodi/framelog/core/backup"
+	"github.com/thevedantmodi/framelog/core/cardverify"
 	"github.com/thevedantmodi/framelog/core/config"
 	"github.com/thevedantmodi/framelog/core/db"
 	"github.com/thevedantmodi/framelog/core/exif"
@@ -202,6 +204,45 @@ func (s *statusProvider) BackupConfigured() bool { return s.configSetter.backupP
 // both pipelines together, so the two are never out of sync in practice.
 func (s *statusProvider) Paused() bool { return s.ingestPipeline.Paused() }
 
+// reportProvider implements ipc.ReportProvider: live activity plus the
+// backup and card-verification history stored in catalog.db.
+type reportProvider struct {
+	tracker        *activity.Tracker
+	ingestPipeline *ingest.Pipeline
+	dbConn         *sql.DB
+	// preview returns the mounted card's quick preview; nil when the SD card
+	// watcher is disabled.
+	preview func() *cardverify.Preview
+}
+
+func (r *reportProvider) CardPreview() *cardverify.Preview {
+	if r.preview == nil {
+		return nil
+	}
+	return r.preview()
+}
+
+func (r *reportProvider) Activity() activity.Snapshot { return r.tracker.Snapshot() }
+
+func (r *reportProvider) LastCard() (*db.CardReport, error) { return db.LastCardReport(r.dbConn) }
+
+func (r *reportProvider) Backup() (ipc.BackupSummary, error) {
+	sum := ipc.BackupSummary{Pending: r.ingestPipeline.BackupPending()}
+	last, err := db.LastBackupRun(r.dbConn)
+	if err != nil {
+		return sum, err
+	}
+	if last != nil {
+		sum.LastOutcome = last.Outcome
+		sum.LastError = last.Error
+		sum.LastRunAt = last.FinishedAt
+		sum.FilesCopied = last.FilesCopied
+		sum.FilesFailed = last.FilesFailed
+	}
+	sum.LastSuccessAt, err = db.LastSuccessfulBackupAt(r.dbConn)
+	return sum, err
+}
+
 // pauseController implements ipc.PauseController: "pause framelog" is a
 // single global toggle that pauses/resumes ingest and outgest together.
 type pauseController struct {
@@ -234,7 +275,7 @@ func (c *configSetter) backupPath() string {
 }
 
 func (c *configSetter) SetBackupPath(path string) error {
-	if err := config.WriteUserConfig(config.UserConfig{BackupPath: path}); err != nil {
+	if err := config.UpdateUserConfig(func(u *config.UserConfig) { u.BackupPath = path }); err != nil {
 		return fmt.Errorf("persist backup path: %w", err)
 	}
 	c.mu.Lock()
@@ -242,6 +283,23 @@ func (c *configSetter) SetBackupPath(path string) error {
 	c.mu.Unlock()
 	c.pipeline.SetBackupPath(path)
 	return nil
+}
+
+// SetImportTypes validates, persists, then applies the import file types.
+// nil restores the defaults (and is persisted as "never chosen", so types
+// added in later versions are picked up automatically).
+func (c *configSetter) SetImportTypes(types []string) error {
+	var valid []string
+	if types != nil {
+		var err error
+		if valid, err = config.ValidateImportExtensions(types); err != nil {
+			return err
+		}
+	}
+	if err := config.UpdateUserConfig(func(u *config.UserConfig) { u.ImportTypes = valid }); err != nil {
+		return fmt.Errorf("persist import types: %w", err)
+	}
+	return config.SetImportExtensions(valid)
 }
 
 // mainRun resolves all binaries, opens the DB, wires the pipeline, and runs
@@ -277,6 +335,11 @@ func mainRun() error {
 	userCfg, err := config.ReadUserConfig()
 	if err != nil {
 		logger.Log(logging.PrefixCore, fmt.Sprintf("WARN could not read user config: %v", err))
+	}
+	if userCfg.ImportTypes != nil {
+		if err := config.SetImportExtensions(userCfg.ImportTypes); err != nil {
+			logger.Log(logging.PrefixCore, fmt.Sprintf("WARN ignoring saved file types, using defaults: %v", err))
+		}
 	}
 	initialBackupPath := userCfg.BackupPath
 	if initialBackupPath == "" {
@@ -326,7 +389,11 @@ func mainRun() error {
 	}
 
 	// --- Pipelines ---
+	// One tracker shared by every stage of the card → library → backup
+	// pipeline, read by the status command for live progress.
+	tracker := &activity.Tracker{}
 	ingestPipeline := &ingest.Pipeline{
+		Activity:      tracker,
 		DB:            dbConn,
 		Logger:        logger,
 		InboxPath:     config.Inbox,
@@ -352,12 +419,15 @@ func mainRun() error {
 		dbConn:          dbConn,
 		configSetter:    cs,
 	}
+	reports := &reportProvider{tracker: tracker, ingestPipeline: ingestPipeline, dbConn: dbConn}
 	ipcServer := &ipc.Server{
 		SocketPath:   config.SocketPath,
 		Ingest:       ingestPipeline,
 		Outgest:      outgestPipeline,
 		Status:       sp,
 		Config:       cs,
+		Reports:      reports,
+		Backup:       ingestPipeline,
 		Pause:        &pauseController{ingestPipeline: ingestPipeline, outgestPipeline: outgestPipeline},
 		Logger:       logger,
 		Version:      Version,
@@ -413,13 +483,22 @@ func mainRun() error {
 	var sdcardW *sdcard.Watcher
 	if diskutilErr == nil && rclonePath != "" {
 		sdcardW = &sdcard.Watcher{
-			DiskutilPath: diskutilPath,
-			RclonePath:   rclonePath,
-			VolumesRoot:  "/Volumes",
-			InboxPath:    config.Inbox,
-			Runner:       ingestPipeline,
-			Logger:       logger,
+			DiskutilPath:  diskutilPath,
+			RclonePath:    rclonePath,
+			VolumesRoot:   "/Volumes",
+			InboxPath:     config.Inbox,
+			Runner:        ingestPipeline,
+			Logger:        logger,
+			DB:            dbConn,
+			OriginalsPath: config.Originals,
+			ReportsDir:    config.ReportsDir,
+			BackupPath:    cs.backupPath,
+			Activity:      tracker,
 		}
+		// Assigned only when non-nil: a typed-nil *Watcher in the interface
+		// would pass the handler's nil check and panic on use.
+		ipcServer.Card = sdcardW
+		reports.preview = sdcardW.CurrentPreview
 	}
 
 	rc := &runConfig{
@@ -441,6 +520,19 @@ func mainRun() error {
 		<-sig
 		logger.Log(logging.PrefixCore, "received signal, shutting down")
 		close(stop)
+	}()
+
+	// Quick fingerprints for photos imported before they existed, so the
+	// instant card preview recognises the whole library. Background and
+	// best-effort: until it finishes, unrecognised photos are just copied
+	// again and parked as duplicates.
+	go func() {
+		n, err := cardverify.BackfillQuickHashes(dbConn, stop)
+		if err != nil {
+			logger.Log(logging.PrefixCore, fmt.Sprintf("quick fingerprint backfill error: %v", err))
+		} else if n > 0 {
+			logger.Log(logging.PrefixCore, fmt.Sprintf("quick fingerprints added for %d library files", n))
+		}
 	}()
 
 	return run(rc, stop)

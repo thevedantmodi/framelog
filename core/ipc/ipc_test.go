@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thevedantmodi/framelog/core/config"
 	"github.com/thevedantmodi/framelog/core/ingest"
 	"github.com/thevedantmodi/framelog/core/logging"
 	"github.com/thevedantmodi/framelog/core/outgest"
@@ -116,6 +117,24 @@ type fakeConfig struct {
 	mu          sync.Mutex
 	backupPath  string
 	err         error
+	importTypes []string
+	typesCalls  int
+}
+
+// SetImportTypes mirrors the real setter's contract: validate via config,
+// then apply. Tests restore the global set with config.SetImportExtensions(nil).
+func (f *fakeConfig) SetImportTypes(types []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.typesCalls++
+	if f.err != nil {
+		return f.err
+	}
+	if err := config.SetImportExtensions(types); err != nil {
+		return err
+	}
+	f.importTypes = types
+	return nil
 }
 
 func (f *fakeConfig) SetBackupPath(path string) error {
