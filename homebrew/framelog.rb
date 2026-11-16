@@ -1,6 +1,9 @@
+# Template for Casks/framelog.rb in the thevedantmodi/homebrew-framelog tap.
+# The release workflow rewrites only the version and sha256 lines in the tap,
+# so any other change here must also be made in the tap by hand.
 cask "framelog" do
-  version "0.1.0"
-  sha256 "PLACEHOLDER"
+  version "0.16.0"
+  sha256 "ecb7407b2014df84b9c61d5b98d3f4bb4e7777041640717da3e83b7e7b95f6f9"
 
   url "https://github.com/thevedantmodi/framelog/releases/download/v#{version}/Framelog-#{version}.dmg"
   name "Framelog"
@@ -13,10 +16,10 @@ cask "framelog" do
 
   app "Framelog.app"
 
-  postflight do
-    # Prompt the user to click Install Core in the menu bar after dragging to /Applications.
-    puts "Framelog installed. Open the app and click 'Install Core…' to set up the background daemon."
-  end
+  caveats <<~EOS
+    Open Framelog from Applications, then click "Install Core…" in its menu
+    bar menu to start the background daemon.
+  EOS
 
   zap trash: [
     "~/Library/Application Support/Framelog",

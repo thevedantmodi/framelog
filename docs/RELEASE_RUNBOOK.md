@@ -70,33 +70,24 @@ The tag push triggers the release CI workflow
 3. Builds `Framelog.app` with `MARKETING_VERSION=<VERSION>` (unsigned)
 4. Bundles `framelogd` into `Framelog.app/Contents/MacOS/`
 5. Creates `Framelog-<VERSION>.dmg`
-6. Opens a GitHub Release, uploads the DMG, and prints the sha256 in the
-   release notes
+6. Opens a GitHub Release and uploads the DMG
+7. Updates the Homebrew tap: rewrites `version` and `sha256` in
+   `Casks/framelog.rb` in `homebrew-framelog` and pushes (needs the
+   `TAP_TOKEN` secret)
 
 Monitor progress at `github.com/thevedantmodi/framelog/actions`.
 
-### 4 — Update the Homebrew cask
+### 4 — Homebrew cask (automatic)
 
-After the GitHub Release is published, copy the sha256 from the release notes
-and edit `Casks/framelog.rb` in your `homebrew-framelog` repo:
+Step 7 above updates the tap for you — check that `homebrew-framelog` got a
+`framelog <VERSION>` commit. If the step failed (for example an expired
+`TAP_TOKEN`), set `version` and `sha256` in the tap's `Casks/framelog.rb` by
+hand; the DMG's sha256 is shown next to the asset on the release page, or run
+`shasum -a 256 Framelog-<VERSION>.dmg`.
 
-```ruby
-cask "framelog" do
-  version "0.2.0"                    # ← new version
-  sha256 "<sha256 from release notes>" # ← paste here
-
-  url "https://github.com/thevedantmodi/framelog/releases/download/v#{version}/Framelog-#{version}.dmg"
-  ...
-end
-```
-
-Commit and push:
-```bash
-cd homebrew-framelog
-git add Casks/framelog.rb
-git commit -m "framelog 0.2.0"
-git push
-```
+The workflow only touches those two lines. Any other cask change (a new
+dependency, a new `zap` path) must be made in both the tap and
+`homebrew/framelog.rb` in this repo, which is the template kept in sync with it.
 
 ### 5 — Verify the install
 
