@@ -219,7 +219,9 @@ enum CoreInstallState {
         case .idle: return "Install Core…"
         case .installing: return "Installing…"
         case .success: return "Installed ✓"
-        case .error: return "Install Failed"
+        // Stays until the next attempt: an auto-install that fails leaves no
+        // daemon running, so it must not vanish before anyone sees it.
+        case .error: return "Install Failed — Retry"
         }
     }
     var isInProgress: Bool {
@@ -650,7 +652,6 @@ final class FramelogStatus: ObservableObject {
         guard !coreInstallState.isInProgress else { return }
         guard let binary = FramelogPaths.framelogdBinary else {
             coreInstallState = .error("framelogd not found")
-            resetInstallState()
             return
         }
         coreInstallState = .installing
@@ -669,12 +670,11 @@ final class FramelogStatus: ObservableObject {
                 let ok = proc.terminationStatus == 0
                 await MainActor.run {
                     self.coreInstallState = ok ? .success : .error("exit \(proc.terminationStatus)")
-                    self.resetInstallState()
+                    if ok { self.resetInstallState() }
                 }
             } catch {
                 await MainActor.run {
                     self.coreInstallState = .error(error.localizedDescription)
-                    self.resetInstallState()
                 }
             }
         }
