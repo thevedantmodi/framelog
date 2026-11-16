@@ -572,3 +572,89 @@ func TestRunCommit_StaleSeqIsNoOp(t *testing.T) {
 		t.Error("stale runCommit consumed pending; the live timer would commit an empty set")
 	}
 }
+
+// TestStop_WaitsForInFlightCommit pins the shutdown guarantee: Stop must not
+// return while a debounced commit is still running. Before this guard, Stop
+// only closed fsnotify, so a commit that had already fired kept writing into
+// .git after Stop returned. In tests that raced t.TempDir's RemoveAll cleanup
+// ("unlinkat .../.git/objects: directory not empty", seen as an intermittent
+// CI failure of TestStatusUpdate_EditedOnHash); at daemon shutdown it can
+// leave .git/index.lock behind.
+func TestStop_WaitsForInFlightCommit(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	w := &Watcher{
+		DebounceDuration: time.Millisecond,
+		Logger:           openTestLogger(t),
+		pending:          map[string]bool{},
+		onRunCommit: func() {
+			close(started)
+			<-release
+		},
+	}
+
+	w.scheduleCommit()
+	select {
+	case <-started:
+	case <-time.After(waitTimeout):
+		t.Fatal("debounce timer never fired")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		w.Stop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+		close(release)
+		t.Fatal("Stop returned while a commit was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(waitTimeout):
+		t.Fatal("Stop did not return after the in-flight commit finished")
+	}
+}
+
+// TestStop_CancelsPendingTimerAndBlocksNewOnes checks the other two halves of
+// Stop: a timer that has not fired yet is cancelled (Stop must not hang on
+// it), and events arriving after Stop schedule nothing.
+func TestStop_CancelsPendingTimerAndBlocksNewOnes(t *testing.T) {
+	commits := 0
+	w := &Watcher{
+		DebounceDuration: time.Hour,
+		Logger:           openTestLogger(t),
+		pending:          map[string]bool{},
+		onRunCommit:      func() { commits++ },
+	}
+
+	w.scheduleCommit()
+
+	done := make(chan struct{})
+	go func() {
+		w.Stop()
+		w.Stop() // idempotent
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(waitTimeout):
+		t.Fatal("Stop hung on a timer that had not fired")
+	}
+
+	w.scheduleCommit()
+	w.mu.Lock()
+	armed := w.timer != nil
+	w.mu.Unlock()
+	if armed {
+		t.Error("scheduleCommit armed a timer after Stop")
+	}
+	if commits != 0 {
+		t.Errorf("commit ran %d time(s) after Stop, want 0", commits)
+	}
+}
