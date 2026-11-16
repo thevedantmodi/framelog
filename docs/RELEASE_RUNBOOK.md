@@ -70,7 +70,11 @@ The tag push triggers the release CI workflow
 3. Builds `Framelog.app` with `MARKETING_VERSION=<VERSION>` (unsigned)
 4. Bundles `framelogd` into `Framelog.app/Contents/MacOS/`
 5. Creates `Framelog-<VERSION>.dmg`
-6. Opens a GitHub Release and uploads the DMG
+6. Opens a GitHub Release and uploads the DMG. The notes are the install
+   instructions followed by GitHub's generated "What's Changed" list of PRs
+   merged since the previous release (`--generate-notes`), so give PRs
+   titles that read well as release notes. Edit the release afterwards to
+   add a hand-written summary if you want one.
 7. Updates the Homebrew tap: rewrites `version` and `sha256` in
    `Casks/framelog.rb` in `homebrew-framelog` and pushes (needs the
    `TAP_TOKEN` secret)

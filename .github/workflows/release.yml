@@ -71,8 +71,12 @@ jobs:
           SHA="${{ steps.sha.outputs.SHA256 }}"
           DMG="${{ steps.sha.outputs.DMG }}"
 
+          # --generate-notes appends GitHub's "What's Changed" list (merged
+          # PRs since the previous release); the --notes text below is
+          # prepended to it, so the install instructions stay on top.
           gh release create "v${VERSION}" "$DMG" \
             --title "Framelog ${VERSION}" \
+            --generate-notes \
             --notes "## Install
 
           **From DMG** (easiest): download \`Framelog-${VERSION}.dmg\` below, drag \`Framelog.app\` to \`/Applications\`, open it, then click **Install Core…** in the menu bar.
