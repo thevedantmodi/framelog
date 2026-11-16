@@ -95,13 +95,13 @@ func IsLightroomRunning(pgrepPath string) (bool, error) {
 // Watcher watches OriginalsPath recursively for XMP and image changes, debounces
 // bursts into a single commit, and pushes when on AC power and Lightroom is closed.
 type Watcher struct {
-	GitPath          string
-	ExiftoolPath     string // used to extract XMP from DNG before committing
-	OriginalsPath    string
-	PmsetPath        string
-	PgrepPath        string
-	DB               *sql.DB
-	Logger           *logging.Logger
+	GitPath       string
+	ExiftoolPath  string // used to extract XMP from DNG before committing
+	OriginalsPath string
+	PmsetPath     string
+	PgrepPath     string
+	DB            *sql.DB
+	Logger        *logging.Logger
 	// DebounceDuration controls how long the watcher waits after the last event
 	// before committing. Production code sets this from config.DebounceSeconds.
 	// Tests override to e.g. 50ms to run without real delays.
@@ -109,10 +109,12 @@ type Watcher struct {
 
 	mu         sync.Mutex
 	timer      *time.Timer
-	pending    map[string]bool // distinct changed file paths since last commit
+	pending    map[string]bool      // distinct changed file paths since last commit
 	suppressed map[string]time.Time // ingest-written paths ignored until expiry
-	seq        uint64 // incremented by scheduleCommit; runCommit skips if stale
+	seq        uint64               // incremented by scheduleCommit; runCommit skips if stale
 	fw         *fsnotify.Watcher
+	stopped    bool           // set by Stop; scheduleCommit is a no-op afterwards
+	inflight   sync.WaitGroup // one count per armed timer; Stop waits on it
 
 	// onRunCommit is called at the start of runCommit for test observation only.
 	// Set before calling Run(); the goroutine-start happens-before guarantees
@@ -169,14 +171,28 @@ func (w *Watcher) isSuppressed(path string) bool {
 	return true
 }
 
-// Stop closes the underlying fsnotify watcher, causing Run to return nil.
-// Safe to call from another goroutine; no-op before Run is called.
+// Stop closes the underlying fsnotify watcher, causing Run to return nil,
+// cancels a debounce timer that has not fired yet, and blocks until a commit
+// that is already running has finished. Returning only once git is idle
+// matters at shutdown (exiting mid-commit can leave .git/index.lock behind and
+// block every later commit) and in tests (t.TempDir cleanup otherwise races
+// the commit's writes into .git). Edits whose timer is cancelled stay on disk
+// and are picked up by the next commit, since Commit runs `git add -A`.
+// Safe to call from another goroutine and more than once.
 func (w *Watcher) Stop() {
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.stopped = true
 	if w.fw != nil {
 		w.fw.Close()
 	}
+	if w.timer != nil && w.timer.Stop() {
+		w.inflight.Done() // cancelled before firing: its callback never runs
+	}
+	w.timer = nil
+	w.mu.Unlock()
+
+	// Outside the lock: runCommit takes w.mu itself.
+	w.inflight.Wait()
 }
 
 // Run begins watching OriginalsPath recursively and blocks until Stop is called
@@ -285,15 +301,25 @@ func (w *Watcher) handleEvent(fw *fsnotify.Watcher, event fsnotify.Event) {
 // — two concurrent git commits in the same repo fight over index.lock and one
 // commit is lost. The stale goroutine sees the mismatch and exits instead.
 // Same guard as outgestwatcher.scheduleRun.
+//
+// Each armed timer holds one count on w.inflight, released either when its
+// callback returns or here/in Stop when timer.Stop cancels it before it fires.
 func (w *Watcher) scheduleCommit() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.timer != nil {
-		w.timer.Stop()
+	if w.stopped {
+		return
+	}
+	if w.timer != nil && w.timer.Stop() {
+		w.inflight.Done() // cancelled before firing: its callback never runs
 	}
 	w.seq++
 	seq := w.seq
-	w.timer = time.AfterFunc(w.DebounceDuration, func() { w.runCommit(seq) })
+	w.inflight.Add(1)
+	w.timer = time.AfterFunc(w.DebounceDuration, func() {
+		defer w.inflight.Done()
+		w.runCommit(seq)
+	})
 }
 
 // runCommit snapshots and clears pending, updates DB status for any file whose
