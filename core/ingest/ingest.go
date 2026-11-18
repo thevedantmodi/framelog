@@ -81,6 +81,10 @@ type Pipeline struct {
 	RclonePath    string
 	BackupPath    string // initial value; SetBackupPath overrides at runtime
 
+	// DisableXMP skips writing .xmp sidecars entirely (config XMPSidecars off).
+	// Inverted so a zero-value Pipeline keeps the historical behaviour.
+	DisableXMP bool
+
 	// OnFileWritten, when non-nil, is called with the destination path of every
 	// file this pipeline writes into OriginalsPath (the copied photo and its XMP
 	// sidecar). main wires it to xmpwatcher.Watcher.Suppress so ingest's own
@@ -282,7 +286,7 @@ func (p *Pipeline) ImportFile(srcPath, batchID string) (Result, error) {
 	// internally (see config.EmbeddedXMPExtensions). Writing a sidecar next to
 	// those files causes Lightroom to read the sidecar and ignore the embedded
 	// data, hiding develop edits.
-	if !config.EmbeddedXMPExtensions[ext] {
+	if !p.DisableXMP && !config.EmbeddedXMPExtensions[ext] {
 		if p.OnFileWritten != nil {
 			p.OnFileWritten(strings.TrimSuffix(dest, ext) + ".xmp")
 		}

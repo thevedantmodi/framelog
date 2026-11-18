@@ -165,6 +165,12 @@ value to `~/Library/Application Support/Framelog/framelog_config.json` and
 applies it to the running pipeline immediately — no daemon restart needed. On
 startup, the persisted value takes precedence over `FRAMELOG_BACKUP_PATH`.
 
+**`xmp_sidecars`** (bool in `framelog_config.json`, default off, read at
+startup — no IPC command, restart to apply): the Lightroom workflow switch.
+Off: ingest writes no `.xmp` sidecars and the XMP watcher does not run, so
+nothing is auto-committed to `originals/` and no photo flips to `edited`.
+On: ingest writes sidecars and the watcher versions Lightroom's edits.
+
 `pause` / `resume` are a single global toggle covering ingest **and** outgest
 together — there is no separate "pause ingest only" mode. While paused:
 - `ingest_now` / `outgest_now` return `ingest_paused` / `outgest_paused` instead

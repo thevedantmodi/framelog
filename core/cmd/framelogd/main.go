@@ -402,6 +402,7 @@ func mainRun() error {
 		GitPath:       gitPath,
 		PmsetPath:     pmsetPath,
 		RclonePath:    rclonePath,
+		DisableXMP:    !userCfg.XMPSidecars,
 	}
 	ingestPipeline.SetBackupPath(initialBackupPath)
 	outgestPipeline := &outgest.Pipeline{
@@ -452,21 +453,25 @@ func mainRun() error {
 		Logger:             logger,
 	}
 
-	// --- XMP watcher ---
-	xmpW := &xmpwatcher.Watcher{
-		GitPath:          gitPath,
-		ExiftoolPath:     exiftoolPath,
-		OriginalsPath:    config.Originals,
-		PmsetPath:        pmsetPath,
-		PgrepPath:        pgrepPath,
-		DB:               dbConn,
-		Logger:           logger,
-		DebounceDuration: time.Duration(config.DebounceSeconds) * time.Second,
+	// --- XMP watcher (Lightroom workflow; off unless xmp_sidecars is set) ---
+	var xmpW *xmpwatcher.Watcher
+	if userCfg.XMPSidecars {
+		xmpW = &xmpwatcher.Watcher{
+			GitPath:          gitPath,
+			ExiftoolPath:     exiftoolPath,
+			OriginalsPath:    config.Originals,
+			PmsetPath:        pmsetPath,
+			PgrepPath:        pgrepPath,
+			DB:               dbConn,
+			Logger:           logger,
+			DebounceDuration: time.Duration(config.DebounceSeconds) * time.Second,
+		}
+		// Ingest's own writes into originals/ must not look like Lightroom
+		// edits to the XMP watcher (they would flip fresh imports to "edited").
+		ingestPipeline.OnFileWritten = xmpW.Suppress
+	} else {
+		logger.Log(logging.PrefixCore, "XMP sidecars disabled (xmp_sidecars not set) — no .xmp written, XMP watcher off")
 	}
-
-	// Ingest's own writes into originals/ must not look like Lightroom edits
-	// to the XMP watcher (they would flip fresh imports to status "edited").
-	ingestPipeline.OnFileWritten = xmpW.Suppress
 
 	// --- Outgest watcher ---
 	outgestW := &outgestwatcher.Watcher{
@@ -549,8 +554,13 @@ func run(rc *runConfig, stop <-chan struct{}) error {
 	twStop := make(chan struct{})
 	go rc.triggerWatcher.Run(twStop)
 
-	xmpErrCh := make(chan error, 1)
-	go func() { xmpErrCh <- rc.xmpW.Run() }()
+	// A nil channel blocks forever in the select below, so a disabled XMP
+	// watcher (nil) is simply never reported as dead.
+	var xmpErrCh chan error
+	if rc.xmpW != nil {
+		xmpErrCh = make(chan error, 1)
+		go func() { xmpErrCh <- rc.xmpW.Run() }()
+	}
 
 	outgestErrCh := make(chan error, 1)
 	go func() { outgestErrCh <- rc.outgestW.Run() }()
@@ -581,7 +591,9 @@ func run(rc *runConfig, stop <-chan struct{}) error {
 	}
 
 	close(twStop)
-	rc.xmpW.Stop()
+	if rc.xmpW != nil {
+		rc.xmpW.Stop()
+	}
 	rc.outgestW.Stop()
 
 	if err != nil {

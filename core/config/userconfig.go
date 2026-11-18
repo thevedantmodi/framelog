@@ -15,6 +15,12 @@ type UserConfig struct {
 	// means "never chosen" — use DefaultImportExtensions, so new known
 	// types added in later versions are picked up automatically.
 	ImportTypes []string `json:"import_types,omitempty"`
+	// XMPSidecars turns the Lightroom workflow on: ingest writes a .xmp
+	// sidecar next to every non-embedding original, and the XMP watcher
+	// versions Lightroom's edits in git. Off by default (absent = false):
+	// other tools such as Photomator read those sidecars and misbehave.
+	// Read at daemon startup; edit framelog_config.json and restart.
+	XMPSidecars bool `json:"xmp_sidecars,omitempty"`
 }
 
 // ReadUserConfig loads UserConfig from UserConfigPath. Returns a zero-value
