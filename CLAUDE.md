@@ -175,6 +175,10 @@ than `t.TempDir()` (which produces long paths under the test cache). See
 - The XMP watcher skips `.git/` during its initial walk. Deliberate: watching
   git internals would leak fsnotify watches on every commit the watcher itself
   makes.
+- `xmpwatcher.Watcher.Stop` blocks until a running debounced commit finishes
+  and cancels one that has not fired. Deliberate: exiting mid-commit can leave
+  `.git/index.lock` behind, and in tests the commit otherwise races
+  `t.TempDir` cleanup (a past source of flaky CI).
 - `ErrIngestAlreadyRunning` / `ErrOutgestAlreadyRunning` error strings match
   the wire JSON `"error"` field exactly (`"ingest_already_running"` /
   `"outgest_already_running"`). The IPC handler uses `err.Error()` directly as
