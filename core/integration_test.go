@@ -235,6 +235,7 @@ done
 		ExiftoolPath:  exiftool,
 		GitPath:       git,
 		PmsetPath:     pmset,
+		XMPSync:       true,
 		// RclonePath/BackupPath intentionally empty: backup disabled.
 	}
 

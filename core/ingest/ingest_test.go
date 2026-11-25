@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -179,6 +180,7 @@ func newPipeline(t *testing.T, exiftoolBody string) (*Pipeline, string, string) 
 		ExiftoolPath:  exiftool,
 		GitPath:       git,
 		PmsetPath:     pmset,
+		XMPSync:       true,
 	}, inbox, logPath
 }
 
@@ -402,6 +404,7 @@ func TestRunIngest_EmptyInbox(t *testing.T) {
 		ExiftoolPath:  exiftool,
 		GitPath:       git,
 		PmsetPath:     pmset,
+		XMPSync:       true,
 	}
 
 	counts, err := p.RunIngest()
@@ -487,6 +490,7 @@ func TestRunIngest_EndToEnd_GitPush(t *testing.T) {
 		ExiftoolPath:  exiftool,
 		GitPath:       git,
 		PmsetPath:     pmset,
+		XMPSync:       true,
 	}
 
 	writePhoto(t, inbox, "alpha.raf")
@@ -518,6 +522,60 @@ func TestRunIngest_EndToEnd_GitPush(t *testing.T) {
 	}
 	if strings.TrimSpace(string(remoteOut)) != strings.TrimSpace(string(out)) {
 		t.Errorf("bare remote HEAD = %q, want %q", strings.TrimSpace(string(remoteOut)), got)
+	}
+}
+
+// TestRunIngest_XMPSyncOff: with XMP sync off (the default), ingest imports
+// the photo but writes no .xmp sidecar and never runs git — GitPath points at
+// a fake that records any invocation.
+func TestRunIngest_XMPSyncOff(t *testing.T) {
+	binDir := t.TempDir()
+	inbox := t.TempDir()
+	originals := t.TempDir()
+	gitCalls := filepath.Join(binDir, "git_calls")
+
+	exiftool := writeFakeBin(t, binDir, "exiftool",
+		fakeExiftoolScript(testModel, testDate, testLat, testLon))
+	git := writeFakeBin(t, binDir, "git", `echo "$@" >> "`+gitCalls+`"`)
+	pmset := writeFakeBin(t, binDir, "pmset", `echo "Now drawing from 'AC Power'"`)
+
+	conn := openTestDB(t)
+	logger, _ := openTestLogger(t)
+	t.Cleanup(func() { logger.Close() })
+
+	p := &Pipeline{
+		DB:            conn,
+		Logger:        logger,
+		InboxPath:     inbox,
+		OriginalsPath: originals,
+		ExiftoolPath:  exiftool,
+		GitPath:       git,
+		PmsetPath:     pmset,
+	}
+	var written []string
+	p.OnFileWritten = func(path string) { written = append(written, path) }
+
+	writePhoto(t, inbox, "alpha.raf")
+	counts, err := p.RunIngest()
+	if err != nil || counts.Imported != 1 {
+		t.Fatalf("RunIngest = %+v, %v; want 1 imported", counts, err)
+	}
+
+	var xmps []string
+	filepath.WalkDir(originals, func(path string, d fs.DirEntry, err error) error { //nolint:errcheck
+		if err == nil && strings.EqualFold(filepath.Ext(path), ".xmp") {
+			xmps = append(xmps, path)
+		}
+		return nil
+	})
+	if len(xmps) != 0 {
+		t.Errorf("sidecars written with XMP sync off: %v", xmps)
+	}
+	if len(written) != 1 || filepath.Ext(written[0]) != ".raf" {
+		t.Errorf("OnFileWritten got %v, want only the photo", written)
+	}
+	if b, err := os.ReadFile(gitCalls); err == nil {
+		t.Errorf("git invoked with XMP sync off: %s", b)
 	}
 }
 

@@ -75,7 +75,7 @@ func TestColdStart_DirectoriesAndDB(t *testing.T) {
 	}
 
 	// initWorkspace is what mainRun() calls on every startup.
-	if err := initWorkspace(inbox, originals, processed, gitPath); err != nil {
+	if err := initWorkspace(inbox, originals, processed, gitPath, true); err != nil {
 		t.Fatalf("initWorkspace: %v", err)
 	}
 
@@ -110,7 +110,7 @@ func TestColdStart_DirectoriesAndDB(t *testing.T) {
 
 	// initWorkspace must be idempotent — calling it again on an already-initialized
 	// workspace must not error or re-init the git repo.
-	if err := initWorkspace(inbox, originals, processed, gitPath); err != nil {
+	if err := initWorkspace(inbox, originals, processed, gitPath, true); err != nil {
 		t.Errorf("initWorkspace idempotent call: %v", err)
 	}
 

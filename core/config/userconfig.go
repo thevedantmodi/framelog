@@ -15,6 +15,13 @@ type UserConfig struct {
 	// means "never chosen" — use DefaultImportExtensions, so new known
 	// types added in later versions are picked up automatically.
 	ImportTypes []string `json:"import_types,omitempty"`
+	// XMPSync turns on the Lightroom-era workflow: ingest writes a .xmp
+	// sidecar next to each import, and originals/ is a git repo whose XMP
+	// changes are committed (and pushed) by ingest and the XMP watcher.
+	// Off by default — sidecars confuse apps such as Photomator that read
+	// them over the photo's own metadata. Set with `framelogd xmp-sync`,
+	// read once at daemon startup.
+	XMPSync bool `json:"xmp_sync,omitempty"`
 }
 
 // ReadUserConfig loads UserConfig from UserConfigPath. Returns a zero-value
