@@ -108,9 +108,17 @@ the daemon. `mainRun()` does binary resolution + workspace init + DB open +
 wiring, then calls `run()`. Tests build their own `runConfig` with fake
 binaries and call `run()` directly. Never collapse these two functions.
 
-**`initWorkspace`** creates `inbox/`, `originals/`, `processed/`, and runs
-`git init originals/` on first start. Idempotent — safe on every startup.
-It is called from `mainRun()` after the logger is open so errors are logged.
+**`initWorkspace`** creates `inbox/`, `originals/`, `processed/`, and — only
+with XMP sync on — runs `git init originals/` on first start. Idempotent —
+safe on every startup. It is called from `mainRun()` after the logger is open
+so errors are logged.
+
+**XMP sync is opt-in (`xmp_sync` in user config, default off).** It gates
+ingest's sidecar writes, ingest's git commit/push, the XMP watcher, and the
+git repo setup. Off is the default because sidecars override the photo's own
+metadata in apps like Photomator. `framelogd xmp-sync on|off` sets it
+(restart to apply); `framelogd clean-xmp` deletes existing sidecars, keeping
+`.git/`. See PROTOCOL.md §6.
 
 **Trigger files vs. socket:** The Swift app's "Run Ingest Now" / "Run Outgest
 Now" buttons currently use `.ingest_trigger` / `.outgest_trigger` (v1 IPC).

@@ -81,6 +81,11 @@ type Pipeline struct {
 	RclonePath    string
 	BackupPath    string // initial value; SetBackupPath overrides at runtime
 
+	// XMPSync, when true, writes a .xmp sidecar next to each import and
+	// commits/pushes originals/ after every run (config.UserConfig.XMPSync).
+	// When false neither happens and GitPath/PmsetPath are unused.
+	XMPSync bool
+
 	// OnFileWritten, when non-nil, is called with the destination path of every
 	// file this pipeline writes into OriginalsPath (the copied photo and its XMP
 	// sidecar). main wires it to xmpwatcher.Watcher.Suppress so ingest's own
@@ -281,8 +286,8 @@ func (p *Pipeline) ImportFile(srcPath, batchID string) (Result, error) {
 	// 8. XMP sidecar next to the dest file — skipped for formats that embed XMP
 	// internally (see config.EmbeddedXMPExtensions). Writing a sidecar next to
 	// those files causes Lightroom to read the sidecar and ignore the embedded
-	// data, hiding develop edits.
-	if !config.EmbeddedXMPExtensions[ext] {
+	// data, hiding develop edits. Only with XMP sync on.
+	if p.XMPSync && !config.EmbeddedXMPExtensions[ext] {
 		if p.OnFileWritten != nil {
 			p.OnFileWritten(strings.TrimSuffix(dest, ext) + ".xmp")
 		}
@@ -503,23 +508,8 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 		fmt.Sprintf("Done: %d imported, %d skipped, %d failed",
 			counts.Imported, counts.Skipped, counts.Failed))
 
-	msg := fmt.Sprintf("ingest: %s (%d photos)", batchID[:10], counts.Imported)
-	committed, err := gitops.Commit(p.GitPath, p.OriginalsPath, msg)
-	if err != nil {
-		p.Logger.Log(logging.PrefixGit, fmt.Sprintf("commit error: %v", err))
-	} else if committed {
-		p.Logger.Log(logging.PrefixGit, fmt.Sprintf("commit: %s", msg))
-		onAC, err := gitops.IsOnACPower(p.PmsetPath)
-		if err != nil {
-			p.Logger.Log(logging.PrefixGit, fmt.Sprintf("pmset error: %v", err))
-		} else {
-			pushed, err := gitops.Push(p.GitPath, p.OriginalsPath, onAC)
-			if err != nil {
-				p.Logger.Log(logging.PrefixGit, fmt.Sprintf("push error: %v", err))
-			} else if pushed {
-				p.Logger.Log(logging.PrefixGit, "pushed to remote")
-			}
-		}
+	if p.XMPSync {
+		p.commitAndPush(batchID, counts.Imported)
 	}
 
 	// Backup: runs when something was imported, or when an earlier backup
@@ -536,6 +526,32 @@ func (p *Pipeline) RunIngest() (Counts, error) {
 	}
 
 	return counts, nil
+}
+
+// commitAndPush commits the run's XMP sidecars in originals/ and pushes when
+// on AC power. XMP sync only; errors are logged, never fatal to the run.
+func (p *Pipeline) commitAndPush(batchID string, imported int) {
+	msg := fmt.Sprintf("ingest: %s (%d photos)", batchID[:10], imported)
+	committed, err := gitops.Commit(p.GitPath, p.OriginalsPath, msg)
+	if err != nil {
+		p.Logger.Log(logging.PrefixGit, fmt.Sprintf("commit error: %v", err))
+		return
+	}
+	if !committed {
+		return
+	}
+	p.Logger.Log(logging.PrefixGit, fmt.Sprintf("commit: %s", msg))
+	onAC, err := gitops.IsOnACPower(p.PmsetPath)
+	if err != nil {
+		p.Logger.Log(logging.PrefixGit, fmt.Sprintf("pmset error: %v", err))
+		return
+	}
+	pushed, err := gitops.Push(p.GitPath, p.OriginalsPath, onAC)
+	if err != nil {
+		p.Logger.Log(logging.PrefixGit, fmt.Sprintf("push error: %v", err))
+	} else if pushed {
+		p.Logger.Log(logging.PrefixGit, "pushed to remote")
+	}
 }
 
 // RunBackup copies originals/ to the configured backup drive now, without

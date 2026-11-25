@@ -83,7 +83,8 @@ CREATE TABLE IF NOT EXISTS backup_runs (
 - `status` lifecycle:
   - `raw` — set on ingest insert.
   - `edited` — set by the XMP watcher when it commits a sidecar change for that file's
-    `hash8` prefix (real signal: Lightroom wrote to the file).
+    `hash8` prefix (real signal: Lightroom wrote to the file). XMP sync only (§6) —
+    with it off nothing sets `edited`, so files go `raw` → `published`.
   - `published` — set by outgest when a file with a matching `hash8` prefix moves through
     `processed/`. Matching is by embedded filename stem, not re-hashing.
 
@@ -305,6 +306,24 @@ cannot multiply them.
 
 ## 6. XMP / git behaviour
 
+**Everything in this section is opt-in and off by default.** It is controlled by
+`"xmp_sync"` in `framelog_config.json`, set with `framelogd xmp-sync on|off` (no
+argument prints the current value) and read once at daemon startup — a change needs a
+daemon restart. There is no IPC command for it.
+
+With XMP sync **off** (the default): ingest writes no `.xmp` sidecars, nothing runs
+`git`, the XMP watcher is not started, startup does not `git init originals/`, and
+`git` need not be installed. An existing `originals/.git` is left untouched.
+`framelogd install --remote` is refused.
+
+`framelogd clean-xmp [--dry-run]` deletes every `.xmp` file (any case, regular files
+only, symlinks not followed) under `originals/`, skipping `.git/` so the sidecars stay
+recoverable from history. It deletes Lightroom/Camera Raw sidecars too, not just the
+ones ingest wrote. It is refused while XMP sync is on (the watcher would commit the
+deletions). The backup drive keeps its copies — backup never deletes.
+
+With XMP sync **on**, the rest of this section applies.
+
 **Non-DNG files** (RAF, CR3, ARW, HEIC, HIF, JPG): Lightroom writes a `.xmp` sidecar next to
 the file. The XMP watcher detects the write via fsnotify, waits 10 seconds (debounce to
 collapse burst edits), then runs `git add -A && git commit` in `originals/`.
@@ -368,8 +387,8 @@ Frontend tails this file for the log viewer. No bare `print()` anywhere in the c
 │   │                           parked by ingest, never re-scanned, user-reviewable
 │   └── failed/               ← sources that failed import 3 times (zero-byte,
 │                               exiftool errors); quarantined, never re-scanned
-├── originals/YYYY/MM/DD/     ← imported files + .xmp sidecars; git-tracked
-│   └── .git/                 ← tracks .xmp sidecars only (see gitignore above)
+├── originals/YYYY/MM/DD/     ← imported files (+ .xmp sidecars, git-tracked, with XMP sync on — §6)
+│   └── .git/                 ← XMP sync only: tracks .xmp sidecars (see §6)
 ├── processed/YYYY/MM/        ← Lightroom exports, organised by outgest
 ├── reports/                  ← one plain-text receipt per verified card (§10)
 │   └── YYYYMMDD_HHMMSS_<volume>.txt

@@ -5,6 +5,8 @@
 //	framelogd install  – write the launchd plist and bootstrap the agent
 //	framelogd uninstall – bootout the agent and remove the plist
 //	framelogd --version – print the build version and exit
+//	framelogd xmp-sync [on|off] – show or set XMP sidecar + git sync
+//	framelogd clean-xmp [--dry-run] – delete every .xmp sidecar in originals/
 //
 // install/uninstall are EXPLICIT subcommands — they never fire as a side effect
 // of a bare `framelogd` invocation. Auto-installing a launchd agent as a side
@@ -39,6 +41,7 @@ import (
 	"github.com/thevedantmodi/framelog/core/outgestwatcher"
 	"github.com/thevedantmodi/framelog/core/sdcard"
 	"github.com/thevedantmodi/framelog/core/triggerwatcher"
+	"github.com/thevedantmodi/framelog/core/xmp"
 	"github.com/thevedantmodi/framelog/core/xmpwatcher"
 )
 
@@ -57,12 +60,16 @@ func plistPath() string {
 
 // initWorkspace creates inbox/, originals/, and processed/ if they do not exist,
 // and runs `git init` inside originals/ the first time (when originals/.git is
-// absent). Idempotent — safe to call on every daemon startup.
-func initWorkspace(inbox, originals, processed, gitPath string) error {
+// absent). Idempotent — safe to call on every daemon startup. The git repo
+// is only set up with XMP sync on; with it off an existing repo is left as is.
+func initWorkspace(inbox, originals, processed, gitPath string, xmpSync bool) error {
 	for _, dir := range []string{inbox, originals, processed} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("initWorkspace: mkdir %s: %w", dir, err)
 		}
+	}
+	if !xmpSync {
+		return nil
 	}
 	if _, err := os.Stat(filepath.Join(originals, ".git")); os.IsNotExist(err) {
 		out, err := exec.Command(gitPath, "-C", originals, "init").CombinedOutput()
@@ -123,12 +130,21 @@ func main() {
 		}
 		home, _ := os.UserHomeDir()
 
-		gitPath, err := gitops.FindGit()
+		userCfg, err := config.ReadUserConfig()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "framelogd install: %v\n", err)
+			fmt.Fprintf(os.Stderr, "framelogd install: read config: %v\n", err)
 			os.Exit(1)
 		}
-		if err := initWorkspace(config.Inbox, config.Originals, config.Processed, gitPath); err != nil {
+		if remoteURL != "" && !userCfg.XMPSync {
+			fmt.Fprintln(os.Stderr, "framelogd install: --remote needs XMP sync; run `framelogd xmp-sync on` first")
+			os.Exit(1)
+		}
+		gitPath, gitErr := gitops.FindGit()
+		if gitErr != nil && userCfg.XMPSync {
+			fmt.Fprintf(os.Stderr, "framelogd install: %v\n", gitErr)
+			os.Exit(1)
+		}
+		if err := initWorkspace(config.Inbox, config.Originals, config.Processed, gitPath, userCfg.XMPSync); err != nil {
 			fmt.Fprintf(os.Stderr, "framelogd install: %v\n", err)
 			os.Exit(1)
 		}
@@ -161,10 +177,95 @@ func main() {
 		}
 		fmt.Println("framelogd: uninstalled")
 
+	case "xmp-sync":
+		if err := xmpSyncCmd(args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "framelogd xmp-sync: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "clean-xmp":
+		if err := cleanXMPCmd(args[1:], config.Originals); err != nil {
+			fmt.Fprintf(os.Stderr, "framelogd clean-xmp: %v\n", err)
+			os.Exit(1)
+		}
+
 	default:
-		fmt.Fprintf(os.Stderr, "usage: framelogd [run|install|uninstall|--version]\n")
+		fmt.Fprintf(os.Stderr, "usage: framelogd [run|install|uninstall|xmp-sync [on|off]|clean-xmp [--dry-run]|--version]\n")
 		os.Exit(1)
 	}
+}
+
+// xmpSyncCmd shows (no args) or sets ("on"/"off") config.UserConfig.XMPSync.
+// The daemon reads it at startup, so a change needs a restart.
+func xmpSyncCmd(args []string) error {
+	if len(args) == 0 {
+		cfg, err := config.ReadUserConfig()
+		if err != nil {
+			return err
+		}
+		fmt.Println(onOff(cfg.XMPSync))
+		return nil
+	}
+	var on bool
+	switch args[0] {
+	case "on":
+		on = true
+	case "off":
+	default:
+		return fmt.Errorf("want on or off, got %q", args[0])
+	}
+	if err := config.UpdateUserConfig(func(u *config.UserConfig) { u.XMPSync = on }); err != nil {
+		return err
+	}
+	fmt.Printf("XMP sync %s. Restart the daemon to apply: launchctl kickstart -k gui/%d/%s\n",
+		onOff(on), os.Getuid(), launchd.Label)
+	return nil
+}
+
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
+}
+
+// cleanXMPCmd deletes every .xmp sidecar under originals (keeping .git/, so
+// they stay recoverable). Refused while XMP sync is on: the watcher would
+// commit the deletions and ingest would write new sidecars straight away.
+func cleanXMPCmd(args []string, originals string) error {
+	dryRun := false
+	for _, a := range args {
+		switch a {
+		case "--dry-run", "-n":
+			dryRun = true
+		default:
+			return fmt.Errorf("unknown flag %q (usage: framelogd clean-xmp [--dry-run])", a)
+		}
+	}
+	cfg, err := config.ReadUserConfig()
+	if err != nil {
+		return err
+	}
+	if cfg.XMPSync {
+		return errors.New("XMP sync is on — run `framelogd xmp-sync off` and restart the daemon first")
+	}
+	res, err := xmp.Clean(originals, dryRun)
+	for _, p := range res.Found {
+		rel, relErr := filepath.Rel(originals, p)
+		if relErr != nil {
+			rel = p
+		}
+		fmt.Println(rel)
+	}
+	if err != nil {
+		return fmt.Errorf("%w (%d removed before the error)", err, res.Removed)
+	}
+	if dryRun {
+		fmt.Printf("%d .xmp sidecar(s) would be removed (dry run)\n", len(res.Found))
+	} else {
+		fmt.Printf("%d .xmp sidecar(s) removed; originals/.git still holds them\n", res.Removed)
+	}
+	return nil
 }
 
 // runConfig holds injected dependencies for the daemon loop. Having an explicit
@@ -176,7 +277,7 @@ type runConfig struct {
 	outgestPipeline *outgest.Pipeline
 	ipcServer       *ipc.Server
 	triggerWatcher  *triggerwatcher.Watcher
-	xmpW            *xmpwatcher.Watcher
+	xmpW            *xmpwatcher.Watcher // nil when XMP sync is off
 	outgestW        *outgestwatcher.Watcher
 	sdcardW         *sdcard.Watcher // nil when diskutil not found
 }
@@ -310,10 +411,8 @@ func mainRun() error {
 	if err != nil {
 		return fmt.Errorf("required binary not found: %w", err)
 	}
-	gitPath, err := gitops.FindGit()
-	if err != nil {
-		return fmt.Errorf("required binary not found: %w", err)
-	}
+	// git is required only with XMP sync on — checked once user config is read.
+	gitPath, gitErr := gitops.FindGit()
 
 	// --- Optional binaries (degrade gracefully) ---
 	pmsetPath, _ := gitops.FindPmset()
@@ -341,6 +440,9 @@ func mainRun() error {
 			logger.Log(logging.PrefixCore, fmt.Sprintf("WARN ignoring saved file types, using defaults: %v", err))
 		}
 	}
+	if userCfg.XMPSync && gitErr != nil {
+		return fmt.Errorf("required binary not found (XMP sync is on): %w", gitErr)
+	}
 	initialBackupPath := userCfg.BackupPath
 	if initialBackupPath == "" {
 		initialBackupPath = config.BackupPath // env var fallback
@@ -348,7 +450,11 @@ func mainRun() error {
 
 	logger.Log(logging.PrefixCore, fmt.Sprintf("framelogd %s starting", Version))
 	logger.Log(logging.PrefixCore, fmt.Sprintf("exiftool: %s", exiftoolPath))
-	logger.Log(logging.PrefixCore, fmt.Sprintf("git: %s", gitPath))
+	if userCfg.XMPSync {
+		logger.Log(logging.PrefixCore, fmt.Sprintf("XMP sync on — git: %s", gitPath))
+	} else {
+		logger.Log(logging.PrefixCore, "XMP sync off — no sidecars written, no git commits")
+	}
 
 	// Log optional binary status so the operator can verify degraded-mode decisions
 	// without guessing. Each "not found" case documents the specific capability lost.
@@ -374,7 +480,7 @@ func mainRun() error {
 	}
 
 	// --- Work directories + git repo ---
-	if err := initWorkspace(config.Inbox, config.Originals, config.Processed, gitPath); err != nil {
+	if err := initWorkspace(config.Inbox, config.Originals, config.Processed, gitPath, userCfg.XMPSync); err != nil {
 		return err
 	}
 
@@ -402,6 +508,7 @@ func mainRun() error {
 		GitPath:       gitPath,
 		PmsetPath:     pmsetPath,
 		RclonePath:    rclonePath,
+		XMPSync:       userCfg.XMPSync,
 	}
 	ingestPipeline.SetBackupPath(initialBackupPath)
 	outgestPipeline := &outgest.Pipeline{
@@ -452,21 +559,23 @@ func mainRun() error {
 		Logger:             logger,
 	}
 
-	// --- XMP watcher ---
-	xmpW := &xmpwatcher.Watcher{
-		GitPath:          gitPath,
-		ExiftoolPath:     exiftoolPath,
-		OriginalsPath:    config.Originals,
-		PmsetPath:        pmsetPath,
-		PgrepPath:        pgrepPath,
-		DB:               dbConn,
-		Logger:           logger,
-		DebounceDuration: time.Duration(config.DebounceSeconds) * time.Second,
+	// --- XMP watcher (XMP sync only) ---
+	var xmpW *xmpwatcher.Watcher
+	if userCfg.XMPSync {
+		xmpW = &xmpwatcher.Watcher{
+			GitPath:          gitPath,
+			ExiftoolPath:     exiftoolPath,
+			OriginalsPath:    config.Originals,
+			PmsetPath:        pmsetPath,
+			PgrepPath:        pgrepPath,
+			DB:               dbConn,
+			Logger:           logger,
+			DebounceDuration: time.Duration(config.DebounceSeconds) * time.Second,
+		}
+		// Ingest's own writes into originals/ must not look like Lightroom edits
+		// to the XMP watcher (they would flip fresh imports to status "edited").
+		ingestPipeline.OnFileWritten = xmpW.Suppress
 	}
-
-	// Ingest's own writes into originals/ must not look like Lightroom edits
-	// to the XMP watcher (they would flip fresh imports to status "edited").
-	ingestPipeline.OnFileWritten = xmpW.Suppress
 
 	// --- Outgest watcher ---
 	outgestW := &outgestwatcher.Watcher{
@@ -549,8 +658,13 @@ func run(rc *runConfig, stop <-chan struct{}) error {
 	twStop := make(chan struct{})
 	go rc.triggerWatcher.Run(twStop)
 
-	xmpErrCh := make(chan error, 1)
-	go func() { xmpErrCh <- rc.xmpW.Run() }()
+	// Left nil (never ready) when XMP sync is off, so the select below
+	// simply never picks it.
+	var xmpErrCh chan error
+	if rc.xmpW != nil {
+		xmpErrCh = make(chan error, 1)
+		go func() { xmpErrCh <- rc.xmpW.Run() }()
+	}
 
 	outgestErrCh := make(chan error, 1)
 	go func() { outgestErrCh <- rc.outgestW.Run() }()
@@ -581,7 +695,9 @@ func run(rc *runConfig, stop <-chan struct{}) error {
 	}
 
 	close(twStop)
-	rc.xmpW.Stop()
+	if rc.xmpW != nil {
+		rc.xmpW.Stop()
+	}
 	rc.outgestW.Stop()
 
 	if err != nil {
